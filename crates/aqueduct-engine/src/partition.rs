@@ -185,6 +185,24 @@ pub enum PartitionError {
     /// The core rejected an entry it produced itself: a bug.
     #[error("internal error: {0}")]
     Internal(String),
+    /// A run with this key exists, with another workflow or input.
+    #[error("run `{0}` exists with another workflow or input")]
+    KeyConflict(String),
+    /// A run with this key exists, and the start's policy is [`ReusePolicy::Reject`].
+    #[error("run `{0}` already exists")]
+    AlreadyStarted(String),
+}
+
+/// What starting a key that already has a run does (BRIEF.md section 5.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReusePolicy {
+    /// Return the existing run if it has the same workflow and input (a retried start); otherwise fail
+    /// with [`PartitionError::KeyConflict`]. Makes starts idempotent.
+    #[default]
+    ReturnExisting,
+    /// Fail with [`PartitionError::AlreadyStarted`] whenever the key has a run. A caller that retries
+    /// its own start after a timeout then cannot tell whether its first attempt succeeded.
+    Reject,
 }
 
 /// A partition processor over a log store.
@@ -336,11 +354,34 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         workflow: &str,
         input: Payload,
     ) -> Result<(), PartitionError> {
-        // A finished run may have been unloaded; it still exists, so starting it again is a no-op.
-        let unloaded = !self.runs.contains_key(key)
-            && self.evict_finished
-            && self.state.load_run(key)?.is_some();
-        if !self.runs.contains_key(key) && !unloaded {
+        self.start_with(key, workflow, input, ReusePolicy::ReturnExisting)
+    }
+
+    /// Starts a run, or applies `policy` if the key already has one.
+    pub fn start_with(
+        &mut self,
+        key: &str,
+        workflow: &str,
+        input: Payload,
+        policy: ReusePolicy,
+    ) -> Result<(), PartitionError> {
+        // A finished run may have been unloaded; it still exists.
+        let existing = match self.runs.get(key) {
+            Some(run) => Some(run.state.workflow() == workflow && *run.state.input() == input),
+            None => self
+                .lookup(key)?
+                .map(|state| state.workflow() == workflow && *state.input() == input),
+        };
+        match (existing, policy) {
+            (Some(_), ReusePolicy::Reject) => {
+                return Err(PartitionError::AlreadyStarted(key.to_owned()));
+            }
+            (Some(false), ReusePolicy::ReturnExisting) => {
+                return Err(PartitionError::KeyConflict(key.to_owned()));
+            }
+            _ => {}
+        }
+        if existing.is_none() {
             if self.deciders.get(workflow).is_none() {
                 return Err(PartitionError::UnknownWorkflow(workflow.to_owned()));
             }
