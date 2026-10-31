@@ -83,6 +83,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqueduct-cli"
+version = "0.0.0"
+dependencies = [
+ "aqueduct-codec",
+ "aqueduct-core",
+ "aqueduct-engine",
+ "aqueduct-procedure",
+ "aqueduct-storage",
+ "serde_json",
+]
+
+[[package]]
 name = "aqueduct-codec"
 version = "0.0.0"
 dependencies = [

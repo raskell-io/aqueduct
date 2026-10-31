@@ -1,0 +1,28 @@
+[package]
+name = "aqueduct-cli"
+description = "The aqueduct command line: inspect, verify, export and replay runs in a data directory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "aqueduct"
+path = "src/main.rs"
+
+[dependencies]
+aqueduct-codec.workspace = true
+aqueduct-core.workspace = true
+aqueduct-engine.workspace = true
+aqueduct-procedure.workspace = true
+aqueduct-storage.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
