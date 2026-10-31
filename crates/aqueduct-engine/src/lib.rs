@@ -1,0 +1,13 @@
+//! The Aqueduct engine.
+//!
+//! - [`Partition`] is the sans-I/O partition processor (ADR 0004, ADR 0006). The deterministic
+//!   simulator drives it with a simulated disk; the embedded engine drives it with a file log.
+//! - [`embedded`] runs a partition, step workers and clients inside one process, on a durable file log
+//!   (ADR 0009).
+
+#![forbid(unsafe_code)]
+
+pub mod embedded;
+mod partition;
+
+pub use partition::{Deciders, Outbound, Partition, PartitionError, PartitionRun};

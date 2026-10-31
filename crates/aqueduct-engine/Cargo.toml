@@ -1,0 +1,24 @@
+[package]
+name = "aqueduct-engine"
+description = "Aqueduct engine: the sans-I/O partition processor and the embedded engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aqueduct-codec.workspace = true
+aqueduct-core.workspace = true
+aqueduct-storage.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+aqueduct-procedure.workspace = true
+serde_json = "1"

@@ -77,7 +77,7 @@ struct Harness {
 
 impl Harness {
     fn new(input: Payload) -> (Harness, Vec<Effect>) {
-        let first = start(input);
+        let first = start("test", input);
         let state = RunState::from_journal(&first.entries).expect("valid start");
         (
             Harness {
@@ -329,6 +329,7 @@ fn duplicate_results_are_recorded_once() {
 fn invalid_journals_are_rejected() {
     use aqueduct_core::JournalError;
     let started = Entry::Started {
+        workflow: "test".into(),
         input: Payload::default(),
     };
     let scheduled = |cmd| Entry::StepScheduled {

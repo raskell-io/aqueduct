@@ -36,7 +36,7 @@ record = version:u8  kind:u8  prev:hash  fields
 
 | kind | entry | fields, in order |
 |---:|---|---|
-| 1 | `Started` | `input:bytes` |
+| 1 | `Started` | `workflow:string`, `input:bytes` |
 | 2 | `StepScheduled` | `cmd:cmd`, `name:string`, `input:bytes` |
 | 3 | `StepCompleted` | `cmd:cmd`, `result:bytes` |
 | 4 | `StepFailed` | `cmd:cmd`, `error:string` |

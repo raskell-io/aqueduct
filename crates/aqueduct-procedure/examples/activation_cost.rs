@@ -17,7 +17,7 @@ fn main() {
     println!("{:>8}  {:>14}", "steps", "µs/activation");
     for steps in [1u32, 10, 100, 1000] {
         // Build a journal where every step has completed, so the activation replays all of them.
-        let mut journal = start(Payload::new(steps.to_string().into_bytes())).entries;
+        let mut journal = start("test", Payload::new(steps.to_string().into_bytes())).entries;
         let mut state = RunState::from_journal(&journal).unwrap();
         for _ in 0..steps {
             let decision = state.handle(Event::Decision(procedure.decide(&state.view())));

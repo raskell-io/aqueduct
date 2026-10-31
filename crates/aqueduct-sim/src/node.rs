@@ -1,108 +1,91 @@
-//! A single-partition node: the sans-I/O partition processor of phase 0, driven by the simulator.
-//!
-//! Rules it follows (ADR 0003 and 0004):
-//! - entries are appended to the in-memory journal and the log batch together;
-//! - nothing leaves the node (acknowledgements, dispatches) until the batch holding the entries it
-//!   depends on is synced; after a successful sync, memory equals the durable log;
-//! - a failed sync is fatal: the node crashes and recovers from the log.
+//! The simulated node: the engine's [`Partition`] plus what only a simulation needs (being up or
+//! down, incarnations, handing the disk back on a crash).
 
-use std::collections::{BTreeMap, VecDeque};
-use std::rc::Rc;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
-use aqueduct_core::{
-    CommandIndex, Decider, Effect, Entry, Event, Payload, RunState, StepOutcome, Transition, start,
-};
-use aqueduct_storage::{LogStore, StorageError};
+use aqueduct_core::{CommandIndex, Decider, Payload, StepOutcome};
+use aqueduct_engine::{Deciders, Outbound, Partition, PartitionRun};
+use aqueduct_storage::StorageError;
 
 use crate::disk::SimDisk;
 
-/// A run held in the node's memory.
-pub(crate) struct NodeRun {
-    pub state: RunState,
-    pub journal: Vec<Entry>,
-    chain: ChainWriter,
-}
+/// The single workflow the simulated workload runs.
+pub(crate) const WORKFLOW: &str = "pipeline";
 
-/// A message the node sends once the entries it depends on are durable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Outbound {
-    StartAck {
-        key: String,
-    },
-    Dispatch {
-        key: String,
-        cmd: CommandIndex,
-        name: String,
-        input: Payload,
-    },
-    ResultAck {
-        key: String,
-        cmd: CommandIndex,
-    },
-}
+static NO_RUNS: BTreeMap<String, PartitionRun> = BTreeMap::new();
 
 pub(crate) struct Node {
     pub up: bool,
     pub incarnation: u64,
-    pub disk: SimDisk,
-    pub runs: BTreeMap<String, NodeRun>,
     pub flush_scheduled: bool,
-    batch: Vec<Vec<u8>>,
-    deferred: Vec<Outbound>,
-    /// Only used by the injected bug that acknowledges before syncing.
-    immediate: Vec<Outbound>,
+    partition: Option<Partition<SimDisk>>,
+    stopped_disk: Option<SimDisk>,
+    deciders: Deciders,
     ack_before_sync: bool,
-    decider: Rc<dyn Decider>,
 }
 
 impl Node {
-    pub fn new(disk: SimDisk, ack_before_sync: bool, decider: Rc<dyn Decider>) -> Self {
-        Node {
-            decider,
+    pub fn new(
+        disk: SimDisk,
+        ack_before_sync: bool,
+        decider: Arc<dyn Decider + Send + Sync>,
+    ) -> Result<Self, String> {
+        let mut deciders = Deciders::new();
+        deciders.insert(WORKFLOW, decider);
+        let mut partition = Partition::load(disk, deciders.clone()).map_err(|e| e.to_string())?;
+        partition.inject_ack_before_sync(ack_before_sync);
+        Ok(Node {
             up: true,
             incarnation: 0,
-            disk,
-            runs: BTreeMap::new(),
             flush_scheduled: false,
-            batch: Vec::new(),
-            deferred: Vec::new(),
-            immediate: Vec::new(),
+            partition: Some(partition),
+            stopped_disk: None,
+            deciders,
             ack_before_sync,
+        })
+    }
+
+    fn partition(&mut self) -> Result<&mut Partition<SimDisk>, String> {
+        self.partition
+            .as_mut()
+            .ok_or_else(|| "the node is down".to_owned())
+    }
+
+    pub fn disk(&self) -> &SimDisk {
+        match (&self.partition, &self.stopped_disk) {
+            (Some(partition), _) => partition.log(),
+            (None, Some(disk)) => disk,
+            (None, None) => unreachable_disk(),
         }
+    }
+
+    pub fn disk_mut(&mut self) -> Option<&mut SimDisk> {
+        match (&mut self.partition, &mut self.stopped_disk) {
+            (Some(partition), _) => Some(partition.log_mut()),
+            (None, disk) => disk.as_mut(),
+        }
+    }
+
+    pub fn runs(&self) -> &BTreeMap<String, PartitionRun> {
+        self.partition.as_ref().map_or(&NO_RUNS, Partition::runs)
     }
 
     pub fn needs_flush(&self) -> bool {
-        !self.batch.is_empty() || !self.deferred.is_empty()
+        self.partition.as_ref().is_some_and(Partition::needs_flush)
     }
 
     pub fn take_immediate(&mut self) -> Vec<Outbound> {
-        std::mem::take(&mut self.immediate)
+        self.partition
+            .as_mut()
+            .map(Partition::take_unsynced)
+            .unwrap_or_default()
     }
 
     pub fn on_start(&mut self, key: &str, input: Payload) -> Result<(), String> {
-        if !self.runs.contains_key(key) {
-            let first = start(input);
-            let state = RunState::from_journal(&first.entries)
-                .map_err(|e| format!("start produced an invalid journal: {e}"))?;
-            self.runs.insert(
-                key.to_owned(),
-                NodeRun {
-                    state,
-                    journal: Vec::new(),
-                    chain: ChainWriter::new(key),
-                },
-            );
-            for entry in &first.entries {
-                self.log(key, entry)?;
-            }
-            self.perform(key, first.effects)?;
-        }
-        // Idempotent: a repeated start is acknowledged once the run's start is durable.
-        self.send(Outbound::StartAck {
-            key: key.to_owned(),
-        });
-        Ok(())
+        self.partition()?
+            .start(key, WORKFLOW, input)
+            .map_err(|e| e.to_string())
     }
 
     pub fn on_step_result(
@@ -111,178 +94,61 @@ impl Node {
         cmd: CommandIndex,
         outcome: StepOutcome,
     ) -> Result<(), String> {
-        let Some(run) = self.runs.get(key) else {
-            return Ok(());
-        };
-        let transition = run.state.handle(Event::StepResult { cmd, outcome });
-        let effects = self.append(key, transition)?;
-        self.perform(key, effects)?;
-        self.send(Outbound::ResultAck {
-            key: key.to_owned(),
-            cmd,
-        });
-        Ok(())
+        self.partition()?
+            .step_result(key, cmd, outcome)
+            .map_err(|e| e.to_string())
     }
 
-    /// Re-dispatches every step without a recorded outcome (at-least-once delivery to workers).
     pub fn on_redispatch(&mut self) {
-        let mut dispatches = Vec::new();
-        for (key, run) in &self.runs {
-            for effect in run.state.pending_steps() {
-                if let Effect::DispatchStep { cmd, name, input } = effect {
-                    dispatches.push(Outbound::Dispatch {
-                        key: key.clone(),
-                        cmd,
-                        name,
-                        input,
-                    });
-                }
-            }
-        }
-        for dispatch in dispatches {
-            self.send(dispatch);
+        if let Some(partition) = self.partition.as_mut() {
+            partition.redispatch();
         }
     }
 
-    /// Writes and syncs the batch, then releases the messages that waited for it.
     pub fn flush(&mut self) -> Result<Vec<Outbound>, StorageError> {
-        if !self.batch.is_empty() {
-            self.disk.append(&self.batch)?;
-            self.batch.clear();
-            self.disk.sync()?;
+        match self.partition.as_mut() {
+            Some(partition) => partition.flush(),
+            None => Ok(Vec::new()),
         }
-        Ok(std::mem::take(&mut self.deferred))
     }
 
     pub fn crash(&mut self) {
+        if let Some(partition) = self.partition.take() {
+            let mut disk = partition.into_log();
+            disk.crash();
+            self.stopped_disk = Some(disk);
+        }
         self.up = false;
-        self.runs.clear();
-        self.batch.clear();
-        self.deferred.clear();
-        self.immediate.clear();
         self.flush_scheduled = false;
-        self.disk.crash();
     }
 
     /// Recovers runs from the log, without performing their recovery effects yet.
     pub fn recover(&mut self) -> Result<(), String> {
+        let disk = self.stopped_disk.take().ok_or("no disk to recover from")?;
+        let mut partition =
+            Partition::load(disk, self.deciders.clone()).map_err(|e| e.to_string())?;
+        partition.inject_ack_before_sync(self.ack_before_sync);
+        self.partition = Some(partition);
         self.up = true;
         self.incarnation += 1;
         self.flush_scheduled = false;
-        let records = self
-            .disk
-            .recover()
-            .map_err(|e| format!("log recovery failed: {e}"))?;
-        let mut by_run: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
-        for bytes in &records {
-            let (key, record) = decode_log_record(bytes)
-                .map_err(|e| format!("a framed log record does not decode: {e}"))?;
-            by_run
-                .entry(key.to_owned())
-                .or_default()
-                .push(record.to_vec());
-        }
-        for (key, records) in by_run {
-            let verified = verify_chain(&key, records.iter().map(Vec::as_slice))
-                .map_err(|e| format!("run {key}: hash chain does not verify: {e}"))?;
-            let state = RunState::from_journal(&verified.entries)
-                .map_err(|e| format!("run {key}: recovered journal is invalid: {e}"))?;
-            self.runs.insert(
-                key,
-                NodeRun {
-                    state,
-                    journal: verified.entries,
-                    chain: ChainWriter::resume(verified.head),
-                },
-            );
-        }
         Ok(())
     }
 
     /// Performs the recovery effects of every recovered run.
     pub fn resume(&mut self) -> Result<(), String> {
-        let keys: Vec<String> = self.runs.keys().cloned().collect();
-        for key in keys {
-            let effects = match self.runs.get(&key) {
-                Some(run) => run.state.recovery_effects(),
-                None => continue,
-            };
-            self.perform(&key, effects)?;
-        }
-        Ok(())
+        self.partition()?.resume().map_err(|e| e.to_string())
     }
 
-    /// Invariant: every run's state equals the fold of its journal.
     pub fn check_fold(&self) -> Result<(), String> {
-        for (key, run) in &self.runs {
-            let folded = RunState::from_journal(&run.journal)
-                .map_err(|e| format!("run {key}: in-memory journal is invalid: {e}"))?;
-            if folded != run.state {
-                return Err(format!(
-                    "run {key}: state differs from the fold of its journal"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn send(&mut self, message: Outbound) {
-        if self.ack_before_sync {
-            self.immediate.push(message);
-        } else {
-            self.deferred.push(message);
+        match &self.partition {
+            Some(partition) => partition.check_fold(),
+            None => Ok(()),
         }
     }
+}
 
-    fn log(&mut self, key: &str, entry: &Entry) -> Result<(), String> {
-        let run = self
-            .runs
-            .get_mut(key)
-            .ok_or_else(|| format!("run {key} vanished"))?;
-        let record = run.chain.append(entry);
-        run.journal.push(entry.clone());
-        self.batch.push(encode_log_record(key, &record));
-        Ok(())
-    }
-
-    fn append(&mut self, key: &str, transition: Transition) -> Result<Vec<Effect>, String> {
-        for entry in &transition.entries {
-            let run = self
-                .runs
-                .get_mut(key)
-                .ok_or_else(|| format!("run {key} vanished"))?;
-            run.state
-                .apply(entry)
-                .map_err(|e| format!("run {key}: the core produced an invalid entry: {e}"))?;
-            self.log(key, entry)?;
-        }
-        Ok(transition.effects)
-    }
-
-    fn perform(&mut self, key: &str, effects: Vec<Effect>) -> Result<(), String> {
-        let mut queue: VecDeque<Effect> = effects.into();
-        while let Some(effect) = queue.pop_front() {
-            match effect {
-                Effect::Activate => {
-                    let run = self
-                        .runs
-                        .get(key)
-                        .ok_or_else(|| format!("run {key} vanished"))?;
-                    let commands = self.decider.decide(&run.state.view());
-                    let transition = run.state.handle(Event::Decision(commands));
-                    queue.extend(self.append(key, transition)?);
-                }
-                Effect::DispatchStep { cmd, name, input } => {
-                    self.send(Outbound::Dispatch {
-                        key: key.to_owned(),
-                        cmd,
-                        name,
-                        input,
-                    });
-                }
-                Effect::Finished(_) => {}
-            }
-        }
-        Ok(())
-    }
+#[allow(clippy::panic)]
+fn unreachable_disk() -> ! {
+    panic!("the simulated node always holds its disk, in the partition or while stopped")
 }

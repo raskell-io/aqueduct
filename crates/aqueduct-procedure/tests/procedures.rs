@@ -14,7 +14,7 @@ fn drive(
     input: Value,
     mut execute: impl FnMut(&str, &Value) -> Result<Value, String>,
 ) -> (RunState, Vec<Entry>) {
-    let first = start(Payload::new(input.to_string().into_bytes()));
+    let first = start("test", Payload::new(input.to_string().into_bytes()));
     let mut journal = first.entries;
     let mut state = RunState::from_journal(&journal).unwrap();
     let mut work = first.effects;
@@ -134,7 +134,7 @@ def run(x):
 "#,
     )
     .unwrap();
-    let journal = start(Payload::new(br#""x""#.to_vec())).entries;
+    let journal = start("test", Payload::new(br#""x""#.to_vec())).entries;
     let state = RunState::from_journal(&journal).unwrap();
     let commands = procedure.decide(&state.view());
     assert_eq!(
@@ -253,7 +253,7 @@ fn changing_a_procedure_under_a_running_run_parks_it() {
     // Version 1 scheduled `a`; version 2 schedules `b` first: replay detects the divergence.
     let v1 = Procedure::compile("v1.star", "def run(x):\n    return step('a', x)\n").unwrap();
     let v2 = Procedure::compile("v2.star", "def run(x):\n    return step('b', x)\n").unwrap();
-    let journal = start(Payload::new(b"1".to_vec())).entries;
+    let journal = start("test", Payload::new(b"1".to_vec())).entries;
     let mut state = RunState::from_journal(&journal).unwrap();
     for entry in state
         .handle(Event::Decision(v1.decide(&state.view())))
