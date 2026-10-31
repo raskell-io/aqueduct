@@ -13,6 +13,9 @@
 //!   step (in this spike, a step named `agent:<name>`).
 //! - `escalate(reason, payload = None)` ends the run with an escalation (in this spike, a failure
 //!   whose error starts with `escalated:`).
+//! - `sleep(seconds)` sleeps durably; `wait(signal(name), timeout = seconds)` returns the next signal's
+//!   payload, or `None` when the timeout passes first. `minutes(n)`, `hours(n)` and `days(n)` give
+//!   seconds.
 //!
 //! Replay works by re-execution: each call to `step` is a command with the next command index. If the
 //! journal has an outcome for that index, the call returns it; otherwise the command is issued and the
@@ -269,12 +272,17 @@ struct Activation {
 impl Activation {
     /// Issues the next step command; returns its recorded outcome, if any.
     fn issue(&mut self, name: String, input: Payload) -> anyhow::Result<Option<StepOutcome>> {
+        self.issue_command(Command::ScheduleStep { name, input })
+    }
+
+    /// Issues the next command of any kind; returns its recorded outcome, if any.
+    fn issue_command(&mut self, command: Command) -> anyhow::Result<Option<StepOutcome>> {
         if !self.in_run {
             anyhow::bail!("engine functions may only be called inside `run`");
         }
         let index = self.next;
         self.next += 1;
-        self.commands.push(Command::ScheduleStep { name, input });
+        self.commands.push(command);
         Ok(self.outcomes.get(index).cloned().flatten())
     }
 
@@ -329,6 +337,12 @@ fn with_activation<R>(f: impl FnOnce(&mut Activation) -> anyhow::Result<R>) -> a
 
 fn suspend_or_fail<T>(stop: Stop) -> anyhow::Result<T> {
     Err(with_activation(|act| Ok(act.stop(stop)))?)
+}
+
+fn milliseconds(seconds: i32) -> anyhow::Result<u64> {
+    let seconds =
+        u64::try_from(seconds).map_err(|_| anyhow::anyhow!("durations cannot be negative"))?;
+    Ok(seconds * 1_000)
 }
 
 fn to_payload(value: Value<'_>) -> anyhow::Result<Payload> {
@@ -419,6 +433,65 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
             Some(StepOutcome::Failed(error)) => suspend_or_fail(Stop::StepFailed(error)),
             Some(StepOutcome::Completed(result)) => Ok(eval.heap().alloc(from_payload(&result)?)),
         }
+    }
+
+    /// Sleeps durably for a number of seconds.
+    fn sleep(seconds: i32) -> anyhow::Result<NoneType> {
+        let duration_ms = milliseconds(seconds)?;
+        match with_activation(|act| act.issue_command(Command::Sleep { duration_ms }))? {
+            None => suspend_or_fail(Stop::Suspend),
+            Some(_) => Ok(NoneType),
+        }
+    }
+
+    /// Names a signal to wait for: `wait(signal("approved"), timeout = days(2))`.
+    fn signal<'v>(name: &str, eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
+        Ok(eval.heap().alloc(serde_json::json!({ "__signal__": name })))
+    }
+
+    /// Waits for the next signal with the given name and returns its payload, or `None` if the
+    /// timeout (in seconds) passes first. Without a timeout it waits forever.
+    fn wait<'v>(
+        what: Value<'v>,
+        #[starlark(require = named, default = NoneType)] timeout: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        let what: serde_json::Value = serde_json::from_str(&what.to_json()?)?;
+        let Some(name) = what.get("__signal__").and_then(|n| n.as_str()) else {
+            anyhow::bail!("wait() expects signal(name)");
+        };
+        let timeout_ms = match timeout.unpack_i32() {
+            Some(seconds) => milliseconds(seconds)?,
+            None if timeout.is_none() => 0,
+            None => anyhow::bail!("wait(timeout = ...) expects a number of seconds"),
+        };
+        let command = Command::AwaitSignal {
+            name: name.to_owned(),
+            timeout_ms,
+        };
+        match with_activation(|act| act.issue_command(command))? {
+            None => suspend_or_fail(Stop::Suspend),
+            Some(StepOutcome::Completed(payload)) => Ok(eval.heap().alloc(from_payload(&payload)?)),
+            Some(StepOutcome::Failed(_)) => Ok(Value::new_none()),
+        }
+    }
+
+    /// Seconds in `n` minutes.
+    fn minutes(n: i32) -> anyhow::Result<i32> {
+        n.checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("duration too long"))
+    }
+
+    /// Seconds in `n` hours.
+    fn hours(n: i32) -> anyhow::Result<i32> {
+        n.checked_mul(3_600)
+            .ok_or_else(|| anyhow::anyhow!("duration too long"))
+    }
+
+    /// Seconds in `n` days.
+    fn days(n: i32) -> anyhow::Result<i32> {
+        n.checked_mul(86_400)
+            .ok_or_else(|| anyhow::anyhow!("duration too long"))
     }
 
     /// Ends the run with an escalation.

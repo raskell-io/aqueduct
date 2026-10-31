@@ -20,7 +20,11 @@
 //! them, and syncs once (group commit) before releasing acknowledgements, dispatches and results. A
 //! pool of worker threads executes steps. `start` returns only after the run's start is durable.
 //!
-//! Not yet: retry policies (a failed step is terminal), timers and signals, a materialised state store
+//! Timers fire no earlier than their wake time, by the wall clock; signals are durable when
+//! [`Engine::signal`] returns.
+//!
+//! Not yet: retry policies (a failed step is terminal), a timer index (timers are found by scanning
+//! runs), a materialised state store
 //! (recovery replays the whole log; checkpoints in redb come with ADR 0009's state store).
 
 use std::collections::BTreeMap;
@@ -148,6 +152,7 @@ impl Builder {
             jobs,
             waiters: BTreeMap::new(),
             starts: BTreeMap::new(),
+            signals: BTreeMap::new(),
         };
         let redispatch = self.redispatch;
         let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
@@ -188,6 +193,26 @@ impl Engine {
             key: key.to_owned(),
             workflow: workflow.to_owned(),
             input,
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// Sends a signal to a run. Returns once the signal is durable. Sending again with the same `id`
+    /// (for example, after a timeout) records it once; an empty `id` disables that.
+    pub fn signal(
+        &self,
+        key: &str,
+        name: &str,
+        id: &str,
+        payload: Payload,
+    ) -> Result<(), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Signal {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            id: id.to_owned(),
+            payload,
             reply,
         })?;
         answer.recv().map_err(|_| self.stopped())?
@@ -251,6 +276,13 @@ enum Request {
         key: String,
         reply: Sender<Result<RunResult, EngineError>>,
     },
+    Signal {
+        key: String,
+        name: String,
+        id: String,
+        payload: Payload,
+        reply: Sender<Result<(), EngineError>>,
+    },
     StepResult {
         key: String,
         cmd: CommandIndex,
@@ -271,21 +303,38 @@ struct Processor {
     jobs: Sender<Job>,
     waiters: BTreeMap<String, Vec<Sender<Result<RunResult, EngineError>>>>,
     starts: BTreeMap<String, Vec<Sender<Result<(), EngineError>>>>,
+    signals: BTreeMap<String, Vec<Sender<Result<(), EngineError>>>>,
 }
 
 impl Processor {
     fn run(mut self, inbox: &Receiver<Request>, redispatch: Duration) -> Result<(), String> {
         // Recovery may have produced entries and dispatches: make them durable and send them.
+        self.partition.set_time(now_ms());
+        self.partition
+            .fire_due_timers()
+            .map_err(|e| e.to_string())?;
         self.flush()?;
+        let mut next_redispatch = now_ms().saturating_add(millis(redispatch));
         loop {
-            let first = match inbox.recv_timeout(redispatch) {
+            let now = now_ms();
+            let wake = self
+                .partition
+                .next_timer()
+                .map_or(next_redispatch, |t| t.min(next_redispatch));
+            let first = match inbox.recv_timeout(Duration::from_millis(wake.saturating_sub(now))) {
                 Ok(request) => Some(request),
-                Err(RecvTimeoutError::Timeout) => {
-                    self.partition.redispatch();
-                    None
-                }
+                Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             };
+            let now = now_ms();
+            self.partition.set_time(now);
+            if now >= next_redispatch {
+                self.partition.redispatch();
+                next_redispatch = now.saturating_add(millis(redispatch));
+            }
+            self.partition
+                .fire_due_timers()
+                .map_err(|e| e.to_string())?;
             // Group commit: take everything that is waiting, then sync once.
             for request in first.into_iter().chain(inbox.try_iter()) {
                 if !self.handle(request)? {
@@ -320,6 +369,19 @@ impl Processor {
                     self.waiters.entry(key).or_default().push(reply);
                 }
             }
+            Request::Signal {
+                key,
+                name,
+                id,
+                payload,
+                reply,
+            } => match self.partition.signal(&key, &name, &id, payload) {
+                Ok(()) => self.signals.entry(key).or_default().push(reply),
+                Err(PartitionError::UnknownRun(key)) => {
+                    let _ = reply.send(Err(EngineError::UnknownRun(key)));
+                }
+                Err(error) => return Err(error.to_string()),
+            },
             Request::StepResult { key, cmd, outcome } => {
                 self.partition
                     .step_result(&key, cmd, outcome)
@@ -364,6 +426,14 @@ impl Processor {
                         input,
                     });
                 }
+                Outbound::Signaled { key } => {
+                    // One acknowledgement per signal, in the order they were sent.
+                    if let Some(replies) = self.signals.get_mut(&key)
+                        && !replies.is_empty()
+                    {
+                        let _ = replies.remove(0).send(Ok(()));
+                    }
+                }
                 Outbound::ResultRecorded { .. } | Outbound::Finished { .. } => {}
             }
         }
@@ -397,6 +467,17 @@ impl Processor {
             }
         }
     }
+}
+
+/// The engine's clock: milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn worker(

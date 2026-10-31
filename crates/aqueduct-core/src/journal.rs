@@ -72,6 +72,42 @@ pub enum Entry {
         /// A description of the failure.
         error: String,
     },
+    /// The run started a durable timer (sleep).
+    TimerStarted {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The requested duration, in milliseconds.
+        duration_ms: u64,
+        /// When it fires: milliseconds since the Unix epoch, by the engine's clock at the activation.
+        wake_at: u64,
+    },
+    /// The run started waiting for a signal, optionally with a timeout.
+    SignalAwaited {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The signal's name.
+        name: String,
+        /// The timeout in milliseconds; 0 means no timeout.
+        timeout_ms: u64,
+        /// When the timeout fires (milliseconds since the Unix epoch); 0 means never.
+        wake_at: u64,
+    },
+    /// A timer fired: a sleep ended, or a signal wait timed out.
+    TimerFired {
+        /// The command whose timer fired.
+        cmd: CommandIndex,
+    },
+    /// A signal arrived. It completes the oldest waiting command for its name, or is kept until one
+    /// waits for it.
+    SignalReceived {
+        /// The signal's name.
+        name: String,
+        /// The sender's id for this signal; a second signal with the same id is not recorded. Empty
+        /// means no deduplication.
+        id: String,
+        /// The signal's payload.
+        payload: Payload,
+    },
     /// The run completed with an output.
     RunCompleted {
         /// The run's output.

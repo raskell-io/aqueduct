@@ -96,6 +96,11 @@ pub enum Outbound {
         /// The command.
         cmd: CommandIndex,
     },
+    /// A signal was recorded (or dropped because the run had ended).
+    Signaled {
+        /// The run key.
+        key: String,
+    },
     /// A run reached a terminal status.
     Finished {
         /// The run key.
@@ -111,6 +116,9 @@ pub enum PartitionError {
     /// The workflow is not registered.
     #[error("unknown workflow `{0}`")]
     UnknownWorkflow(String),
+    /// No run with this key exists.
+    #[error("no run `{0}`")]
+    UnknownRun(String),
     /// Storage failed. Fatal: drop the partition and recover from the log.
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -131,6 +139,7 @@ pub struct Partition<L: LogStore> {
     deferred: Vec<Outbound>,
     immediate: Vec<Outbound>,
     ack_before_sync: bool,
+    now_ms: u64,
 }
 
 impl<L: LogStore> std::fmt::Debug for Partition<L> {
@@ -188,6 +197,7 @@ impl<L: LogStore> Partition<L> {
             deferred: Vec::new(),
             immediate: Vec::new(),
             ack_before_sync: false,
+            now_ms: 0,
         })
     }
 
@@ -237,6 +247,72 @@ impl<L: LogStore> Partition<L> {
         Ok(())
     }
 
+    /// Sets the partition's clock (milliseconds since the Unix epoch). New timers wake relative to it,
+    /// and [`Partition::fire_due_timers`] fires timers whose wake time has been reached.
+    pub fn set_time(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    /// Sends a signal to a run. A signal whose non-empty `id` the run has already recorded is dropped,
+    /// as are signals to a run that has ended; both are still acknowledged.
+    pub fn signal(
+        &mut self,
+        key: &str,
+        name: &str,
+        id: &str,
+        payload: Payload,
+    ) -> Result<(), PartitionError> {
+        let run = self
+            .runs
+            .get(key)
+            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        let event = Event::Signal {
+            name: name.to_owned(),
+            id: id.to_owned(),
+            payload,
+        };
+        let transition = run.state.handle_at(event, self.now_ms);
+        let effects = self.append(key, transition)?;
+        self.perform(key, effects)?;
+        self.send(Outbound::Signaled {
+            key: key.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Fires every timer whose wake time is at or before the partition's clock. Timers never fire early.
+    pub fn fire_due_timers(&mut self) -> Result<(), PartitionError> {
+        let due: Vec<(String, CommandIndex)> = self
+            .runs
+            .iter()
+            .flat_map(|(key, run)| {
+                run.state
+                    .timers()
+                    .into_iter()
+                    .filter(|(_, wake_at)| *wake_at <= self.now_ms)
+                    .map(move |(cmd, _)| (key.clone(), cmd))
+            })
+            .collect();
+        for (key, cmd) in due {
+            let Some(run) = self.runs.get(&key) else {
+                continue;
+            };
+            let transition = run.state.handle_at(Event::TimerFired { cmd }, self.now_ms);
+            let effects = self.append(&key, transition)?;
+            self.perform(&key, effects)?;
+        }
+        Ok(())
+    }
+
+    /// The earliest wake time of any timer that has not fired.
+    pub fn next_timer(&self) -> Option<u64> {
+        self.runs
+            .values()
+            .flat_map(|run| run.state.timers())
+            .map(|(_, wake_at)| wake_at)
+            .min()
+    }
+
     /// Records a step result (at most once per command).
     pub fn step_result(
         &mut self,
@@ -247,7 +323,9 @@ impl<L: LogStore> Partition<L> {
         let Some(run) = self.runs.get(key) else {
             return Ok(());
         };
-        let transition = run.state.handle(Event::StepResult { cmd, outcome });
+        let transition = run
+            .state
+            .handle_at(Event::StepResult { cmd, outcome }, self.now_ms);
         let effects = self.append(key, transition)?;
         self.perform(key, effects)?;
         self.send(Outbound::ResultRecorded {
@@ -394,7 +472,7 @@ impl<L: LogStore> Partition<L> {
                         continue;
                     };
                     let commands = decider.decide(&run.state.view());
-                    let transition = run.state.handle(Event::Decision(commands));
+                    let transition = run.state.handle_at(Event::Decision(commands), self.now_ms);
                     queue.extend(self.append(key, transition)?);
                 }
                 Effect::DispatchStep { cmd, name, input } => {

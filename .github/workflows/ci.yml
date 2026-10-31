@@ -36,6 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask sim --seeds 10000
       - run: cargo xtask sim --seeds 2000 --workload starlark
+      - run: cargo xtask sim --seeds 2000 --workload timers
 
   crash:
     name: crash harness

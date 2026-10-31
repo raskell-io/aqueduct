@@ -27,6 +27,31 @@ fn entry() -> impl Strategy<Value = Entry> {
         payload().prop_map(|output| Entry::RunCompleted { output }),
         ".{0,12}".prop_map(|error| Entry::RunFailed { error }),
         ".{0,12}".prop_map(|reason| Entry::Parked { reason }),
+        (any::<u32>(), any::<u64>(), any::<u64>()).prop_map(|(cmd, duration_ms, wake_at)| {
+            Entry::TimerStarted {
+                cmd: CommandIndex(cmd),
+                duration_ms,
+                wake_at,
+            }
+        }),
+        (any::<u32>(), ".{0,12}", any::<u64>(), any::<u64>()).prop_map(
+            |(cmd, name, timeout_ms, wake_at)| {
+                Entry::SignalAwaited {
+                    cmd: CommandIndex(cmd),
+                    name,
+                    timeout_ms,
+                    wake_at,
+                }
+            }
+        ),
+        any::<u32>().prop_map(|cmd| Entry::TimerFired {
+            cmd: CommandIndex(cmd)
+        }),
+        (".{0,12}", ".{0,12}", payload()).prop_map(|(name, id, payload)| Entry::SignalReceived {
+            name,
+            id,
+            payload
+        }),
     ]
 }
 

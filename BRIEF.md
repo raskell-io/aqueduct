@@ -431,7 +431,8 @@ Replay is not only crash recovery. The engine supports four modes, sharing one i
 - Timers fire **no earlier** than their wake time, measured by the partition leader's clock anchored to the
   journaled wall-clock time of `TimerStarted`, and eventually after it, subject to availability. Clock
   assumptions per mode are stated in `docs/guarantees.md`.
-- Signals to a run are delivered **exactly once, in a total order** per run.
+- Signals to a run are delivered **exactly once per signal id, in a total order** per run. The sender
+  chooses the id; retried sends with the same id are recorded once.
 - Virtual object handlers run **one at a time per key**; state changes commit atomically with the handler
   result.
 - Starting a run with an existing key follows the configured reuse policy (reject, return existing, allow

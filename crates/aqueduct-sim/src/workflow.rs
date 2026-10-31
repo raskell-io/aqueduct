@@ -111,6 +111,18 @@ def run(input):
     return step("validate", merged)
 "##;
 
+/// A procedure that sleeps one simulated second, then waits for the `go` signal.
+pub const STARLARK_TIMERS: &str = r##"
+def run(input):
+    extracted = step("extract", input)
+    sleep(1)
+    go = wait(signal("go"))
+    return step("validate", extracted + "#" + go)
+"##;
+
+/// The payload of the `go` signal the simulated client sends to every run.
+pub const GO: &[u8] = b"\"go\"";
+
 /// Step bodies for the Starlark pipeline: the same rules as [`execute`], on JSON strings.
 pub fn execute_json(name: &str, input: &Payload) -> StepOutcome {
     let Ok(serde_json::Value::String(text)) = serde_json::from_slice(input.as_bytes()) else {
@@ -130,6 +142,8 @@ pub fn execute_json(name: &str, input: &Payload) -> StepOutcome {
 /// Which decider and step bodies the simulated world runs.
 pub struct Workload {
     pub kind: WorkloadKind,
+    /// Whether runs wait for a `go` signal from the client.
+    pub signals: bool,
     pub decider: Arc<dyn Decider + Send + Sync>,
     pub execute: fn(&str, &Payload) -> StepOutcome,
 }
@@ -139,11 +153,22 @@ impl Workload {
         Ok(match kind {
             WorkloadKind::Pipeline => Workload {
                 kind,
+                signals: false,
                 decider: Arc::new(Pipeline),
                 execute,
             },
+            WorkloadKind::StarlarkTimers => Workload {
+                kind,
+                signals: true,
+                decider: Arc::new(
+                    Procedure::compile("timers.star", STARLARK_TIMERS)
+                        .map_err(|e| e.to_string())?,
+                ),
+                execute: execute_json,
+            },
             WorkloadKind::StarlarkPipeline => Workload {
                 kind,
+                signals: false,
                 decider: Arc::new(
                     Procedure::compile("pipeline.star", STARLARK_PIPELINE)
                         .map_err(|e| e.to_string())?,
@@ -160,7 +185,7 @@ impl Workload {
             WorkloadKind::Pipeline => {
                 Payload::new((0..len).map(|_| rng.below(256) as u8).collect::<Vec<u8>>())
             }
-            WorkloadKind::StarlarkPipeline => {
+            WorkloadKind::StarlarkPipeline | WorkloadKind::StarlarkTimers => {
                 let text: String = (0..len)
                     .map(|_| char::from(b'a' + rng.below(26) as u8))
                     .collect();
@@ -178,14 +203,29 @@ pub fn reference(
     let first = start(crate::node::WORKFLOW, input.clone());
     let mut state = RunState::from_journal(&first.entries).map_err(|e| e.to_string())?;
     let mut work = first.effects;
-    while let Some(effect) = work.pop() {
-        let event = match effect {
-            Effect::Activate => Event::Decision(workload.decider.decide(&state.view())),
-            Effect::DispatchStep { cmd, name, input } => Event::StepResult {
+    let mut signalled = false;
+    loop {
+        let event = match work.pop() {
+            Some(Effect::Activate) => Event::Decision(workload.decider.decide(&state.view())),
+            Some(Effect::DispatchStep { cmd, name, input }) => Event::StepResult {
                 cmd,
                 outcome: (workload.execute)(&name, &input),
             },
-            Effect::Finished(_) => continue,
+            Some(Effect::Finished(_)) => continue,
+            None if state.status().is_terminal() => break,
+            // Nothing to do but wait: let time pass (fire timers), or deliver the client's signal.
+            None => match state.timers().first() {
+                Some(&(cmd, _)) => Event::TimerFired { cmd },
+                None if workload.signals && !signalled => {
+                    signalled = true;
+                    Event::Signal {
+                        name: "go".into(),
+                        id: "go".into(),
+                        payload: Payload::new(GO.to_vec()),
+                    }
+                }
+                None => return Err("the reference run is stuck".into()),
+            },
         };
         let transition = state.handle(event);
         for entry in &transition.entries {
