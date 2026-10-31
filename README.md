@@ -91,6 +91,24 @@ let approved = match select(decision, ctx.sleep(Duration::from_secs(86_400))).aw
 Complete it from code with `engine.complete_awakeable(&id, payload)`, or from the command line while
 the engine is stopped: `aqueduct complete-awakeable approval-data 'expense:42#0' true`.
 
+Undoing work is a **saga**: each step registers a compensation, and a failure undoes the completed steps
+in reverse order ([`order_saga.rs`](crates/aqueduct/examples/order_saga.rs),
+[ADR 0017](docs/adr/0017-sagas.md)):
+
+```rust
+let mut saga = ctx.saga();
+let shipped = async {
+    saga.step::<(), _, _>("reserve_stock", &item, "release_stock", &item).await?;
+    saga.step::<String, _, _>("charge_card", &id, "refund_card", &id).await?;
+    ctx.step::<String, _>("book_shipment", &address).await
+}
+.await;
+match shipped {
+    Ok(tracking) => Ok(tracking),
+    Err(error) => Err(saga.abort(error).await), // refund, then release
+}
+```
+
 The same engine runs **procedures**: hermetic Starlark scripts that an agent can write and a person can
 review ([ADR 0008](docs/adr/0008-procedure-language-starlark.md)):
 

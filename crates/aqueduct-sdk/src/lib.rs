@@ -271,6 +271,14 @@ impl WorkflowContext {
         )
     }
 
+    /// Starts a [`Saga`]: steps with compensations.
+    pub fn saga(&self) -> Saga {
+        Saga {
+            ctx: self.clone(),
+            compensations: Vec::new(),
+        }
+    }
+
     /// Creates an awakeable: a wait that whoever holds its id completes from outside, for example a
     /// person following a link, or a webhook. Returns the id to hand out and a future of the payload it
     /// is completed with (`Engine::complete_awakeable` in the embedded engine). Completing it twice
@@ -349,6 +357,104 @@ impl WorkflowContext {
                 None => Poll::Pending,
             }
         })
+    }
+}
+
+/// A saga: steps that each register a compensation, undone in reverse order when the workflow gives up.
+///
+/// Compensations are ordinary steps, so they are journaled, retried by their retry policy and replayed
+/// like any other step; give them a generous policy, since a saga cannot undo an undo. Create one with
+/// [`WorkflowContext::saga`].
+///
+/// ```
+/// use aqueduct_sdk::{WorkflowContext, WorkflowError};
+///
+/// async fn order(ctx: WorkflowContext, id: String) -> Result<String, WorkflowError> {
+///     let mut saga = ctx.saga();
+///     let result = async {
+///         saga.step::<(), _, _>("reserve_stock", &id, "release_stock", &id).await?;
+///         saga.step::<String, _, _>("charge_card", &id, "refund_card", &id).await?;
+///         ctx.step::<String, _>("book_shipment", &id).await
+///     }
+///     .await;
+///     match result {
+///         Ok(tracking) => Ok(tracking),
+///         // Refund, then release: the reverse of the order they were done in.
+///         Err(error) => Err(saga.abort(error).await),
+///     }
+/// }
+/// ```
+pub struct Saga {
+    ctx: WorkflowContext,
+    compensations: Vec<(String, serde_json::Value)>,
+}
+
+impl Saga {
+    /// Runs a step and, once it has succeeded, registers `compensation` (a step) with its input. A step
+    /// that may have had an effect even when it fails should register its compensation first, with
+    /// [`Saga::compensate_with`].
+    pub async fn step<T, I, C>(
+        &mut self,
+        name: &str,
+        input: &I,
+        compensation: &str,
+        compensation_input: &C,
+    ) -> Result<T, WorkflowError>
+    where
+        T: DeserializeOwned,
+        I: Serialize + ?Sized,
+        C: Serialize + ?Sized,
+    {
+        let undo = serde_json::to_value(compensation_input)
+            .map_err(|e| WorkflowError::Payload(e.to_string()))?;
+        let output = self.ctx.step(name, input).await?;
+        self.compensations.push((compensation.to_owned(), undo));
+        Ok(output)
+    }
+
+    /// Registers a compensation (a step) to run if the saga is undone.
+    pub fn compensate_with<C: Serialize + ?Sized>(
+        &mut self,
+        compensation: &str,
+        input: &C,
+    ) -> Result<(), WorkflowError> {
+        let undo =
+            serde_json::to_value(input).map_err(|e| WorkflowError::Payload(e.to_string()))?;
+        self.compensations.push((compensation.to_owned(), undo));
+        Ok(())
+    }
+
+    /// The compensations registered so far, in the order they were registered.
+    pub fn compensations(&self) -> impl Iterator<Item = &str> {
+        self.compensations.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Runs every registered compensation, last first, one after the other. A compensation that fails
+    /// does not stop the others; the error names every one that failed.
+    pub async fn compensate(self) -> Result<(), WorkflowError> {
+        let mut failed = Vec::new();
+        for (name, input) in self.compensations.into_iter().rev() {
+            if let Err(error) = self.ctx.step::<serde_json::Value, _>(&name, &input).await {
+                failed.push(error.to_string());
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkflowError::Failed(format!(
+                "compensation failed: {}",
+                failed.join("; ")
+            )))
+        }
+    }
+
+    /// Undoes the saga and returns the error to fail the workflow with: `error`, or, if a compensation
+    /// failed too, both.
+    pub async fn abort(self, error: WorkflowError) -> WorkflowError {
+        match self.compensate().await {
+            Ok(()) => error,
+            Err(undo) => WorkflowError::Failed(format!("{error}; {undo}")),
+        }
     }
 }
 

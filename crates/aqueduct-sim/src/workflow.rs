@@ -115,7 +115,7 @@ def run(input):
 /// [`STARLARK_PIPELINE`], replayed by re-running the `async fn` on every activation. It first stamps
 /// the run with a recorded UUID, passed to a step: a value used before it was durable, then recorded
 /// again differently after a crash, shows up as one command dispatched with two inputs. Then it races
-/// two steps with `select_all`.
+/// two steps with `select_all`, and undoes `merge` with a saga when validation fails.
 pub async fn rust_pipeline(
     ctx: aqueduct_sdk::WorkflowContext,
     input: String,
@@ -136,8 +136,14 @@ pub async fn rust_pipeline(
         ctx.step::<String, _>("map_b", &extracted),
     )
     .await;
-    let merged: String = ctx.step("merge", &format!("{}#{}", a?, b?)).await?;
-    ctx.step("validate", &merged).await
+    // A saga: `merge` is undone by `unmerge` when validation fails.
+    let mut saga = ctx.saga();
+    let joined = format!("{}#{}", a?, b?);
+    let merged: String = saga.step("merge", &joined, "unmerge", &joined).await?;
+    match ctx.step("validate", &merged).await {
+        Ok(valid) => Ok(valid),
+        Err(error) => Err(saga.abort(error).await),
+    }
 }
 
 /// A procedure that sleeps one simulated second, then waits for the `go` signal.
