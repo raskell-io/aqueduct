@@ -29,6 +29,9 @@ pub enum StorageError {
     /// Stored data is damaged somewhere a crash cannot explain (not at the tail of the log).
     #[error("corrupt log: {0}")]
     Corrupt(String),
+    /// Another process (or another handle in this one) has the log open.
+    #[error("the log at {0} is in use (is the engine running?)")]
+    Locked(String),
     /// The log was used before [`LogStore::recover`].
     #[error("the log must be recovered before it is written")]
     NotRecovered,

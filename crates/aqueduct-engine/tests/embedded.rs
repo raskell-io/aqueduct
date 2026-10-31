@@ -216,3 +216,24 @@ fn finished_runs_leave_memory_and_stay_queryable() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_second_engine_on_the_same_directory_is_refused() {
+    let dir = temp_dir();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first = open_engine(&dir, Arc::clone(&calls), Duration::ZERO);
+    first.start("r", "greet", json("\"ada\"")).unwrap();
+    let second = Engine::builder(&dir).open();
+    assert!(
+        matches!(&second, Err(EngineError::Open(message)) if message.contains("in use")),
+        "{:?}",
+        second.err()
+    );
+    // The first engine is unharmed, and the directory opens again once it is closed.
+    first.wait("r", Duration::from_secs(10)).unwrap();
+    drop(first);
+    let reopened = open_engine(&dir, calls, Duration::ZERO);
+    assert!(reopened.wait("r", Duration::from_secs(10)).is_ok());
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
