@@ -1,5 +1,12 @@
 //! The workload: a small pipeline with concurrent steps and a failure path, plus its reference model.
 
+use std::rc::Rc;
+
+use aqueduct_procedure::Procedure;
+
+use crate::WorkloadKind;
+use crate::rng::Rng;
+
 use aqueduct_core::{
     Command, CommandIndex, Decider, Effect, Event, Payload, RunState, RunView, Status, StepOutcome,
     start,
@@ -95,17 +102,88 @@ pub fn execute(name: &str, input: &Payload) -> StepOutcome {
     }
 }
 
+/// The same pipeline as [`Pipeline`], written as a Starlark procedure. Payloads are JSON strings.
+pub const STARLARK_PIPELINE: &str = r##"
+def run(input):
+    extracted = step("extract", input)
+    a, b = parallel([["map_a", extracted], ["map_b", extracted]])
+    merged = step("merge", a + "#" + b)
+    return step("validate", merged)
+"##;
+
+/// Step bodies for the Starlark pipeline: the same rules as [`execute`], on JSON strings.
+pub fn execute_json(name: &str, input: &Payload) -> StepOutcome {
+    let Ok(serde_json::Value::String(text)) = serde_json::from_slice(input.as_bytes()) else {
+        return StepOutcome::Failed(format!("{name}: input is not a JSON string"));
+    };
+    match execute(name, &Payload::new(text.into_bytes())) {
+        StepOutcome::Completed(result) => {
+            let text = String::from_utf8_lossy(result.as_bytes()).into_owned();
+            StepOutcome::Completed(Payload::new(
+                serde_json::Value::String(text).to_string().into_bytes(),
+            ))
+        }
+        failed => failed,
+    }
+}
+
+/// Which decider and step bodies the simulated world runs.
+pub struct Workload {
+    pub kind: WorkloadKind,
+    pub decider: Rc<dyn Decider>,
+    pub execute: fn(&str, &Payload) -> StepOutcome,
+}
+
+impl Workload {
+    pub fn new(kind: WorkloadKind) -> Result<Workload, String> {
+        Ok(match kind {
+            WorkloadKind::Pipeline => Workload {
+                kind,
+                decider: Rc::new(Pipeline),
+                execute,
+            },
+            WorkloadKind::StarlarkPipeline => Workload {
+                kind,
+                decider: Rc::new(
+                    Procedure::compile("pipeline.star", STARLARK_PIPELINE)
+                        .map_err(|e| e.to_string())?,
+                ),
+                execute: execute_json,
+            },
+        })
+    }
+
+    /// A random run input: up to five bytes, or for Starlark, a JSON string of up to five letters.
+    pub fn input(&self, rng: &mut Rng) -> Payload {
+        let len = rng.below(6);
+        match self.kind {
+            WorkloadKind::Pipeline => {
+                Payload::new((0..len).map(|_| rng.below(256) as u8).collect::<Vec<u8>>())
+            }
+            WorkloadKind::StarlarkPipeline => {
+                let text: String = (0..len)
+                    .map(|_| char::from(b'a' + rng.below(26) as u8))
+                    .collect();
+                Payload::new(serde_json::Value::String(text).to_string().into_bytes())
+            }
+        }
+    }
+}
+
 /// The expected end of a run with this input, computed by sequential execution without faults.
-pub fn reference(input: &Payload) -> Result<(Status, Option<Payload>, Option<String>), String> {
+pub fn reference(
+    workload: &Workload,
+    input: &Payload,
+) -> Result<(Status, Option<Payload>, Option<String>), String> {
     let first = start(input.clone());
     let mut state = RunState::from_journal(&first.entries).map_err(|e| e.to_string())?;
     let mut work = first.effects;
     while let Some(effect) = work.pop() {
         let event = match effect {
-            Effect::Activate => Event::Decision(Pipeline.decide(&state.view())),
+            Effect::Activate => Event::Decision(workload.decider.decide(&state.view())),
             Effect::DispatchStep { cmd, name, input } => Event::StepResult {
                 cmd,
-                outcome: execute(&name, &input),
+                outcome: (workload.execute)(&name, &input),
             },
             Effect::Finished(_) => continue,
         };

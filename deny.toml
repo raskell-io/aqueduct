@@ -5,6 +5,14 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# Unmaintained (not vulnerable) crates that come in through `starlark`, accepted by the owner on
+# 2026-10-31 (ADR 0008). Revisit when upgrading starlark. Vulnerability advisories are never ignored.
+ignore = [
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill, unmaintained, via starlark -> pagable -> postcard -> heapless" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative, unmaintained, via starlark" },
+    { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained, via starlark" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash, unmaintained, via starlark_map" },
+]
 
 [licenses]
 allow = [
@@ -18,6 +26,17 @@ allow = [
 ]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"
+
+# BSL-1.0 is the Boost Software License (permissive, OSI-approved), not the Business Source License.
+# Allowed only for these Windows-only crates that starlark pulls in through rustyline, accepted by the
+# owner on 2026-10-31 (ADR 0008).
+[[licenses.exceptions]]
+crate = "clipboard-win"
+allow = ["BSL-1.0"]
+
+[[licenses.exceptions]]
+crate = "error-code"
+allow = ["BSL-1.0"]
 
 [licenses.private]
 ignore = false

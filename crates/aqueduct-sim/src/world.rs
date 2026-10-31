@@ -9,7 +9,7 @@ use aqueduct_storage::frame;
 use crate::disk::SimDisk;
 use crate::node::{Node, Outbound};
 use crate::rng::Rng;
-use crate::workflow;
+use crate::workflow::{self, Workload};
 use crate::{Config, Failure, Report};
 
 #[derive(Clone, Debug)]
@@ -98,18 +98,20 @@ struct World<'c> {
     worker_pending: BTreeMap<(String, CommandIndex), StepOutcome>,
     executions: BTreeMap<(String, CommandIndex), u64>,
     report: Report,
+    workload: Workload,
 }
 
 pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     let mut rng = Rng::new(seed);
     let mut disk = SimDisk::new(rng.fork(), config.sync_fail_ppm, config.torn_ppm);
     disk.skip_truncation = config.bugs.skip_tail_truncation;
+    let workload = Workload::new(config.workload).map_err(|message| Failure {
+        seed,
+        time: 0,
+        message,
+    })?;
     let wanted = (0..config.runs)
-        .map(|i| {
-            let len = rng.below(6);
-            let input: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
-            (format!("run-{i}"), Payload::new(input))
-        })
+        .map(|i| (format!("run-{i}"), workload.input(&mut rng)))
         .collect();
     let mut world = World {
         config,
@@ -119,7 +121,8 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         seq: 0,
         queue: BTreeMap::new(),
         faults: true,
-        node: Node::new(disk, config.bugs.ack_before_sync),
+        node: Node::new(disk, config.bugs.ack_before_sync, workload.decider.clone()),
+        workload,
         crash_pending: false,
         pre_crash: BTreeMap::new(),
         wanted,
@@ -271,7 +274,7 @@ impl World<'_> {
                     self.worker_pending.clear();
                 }
                 *self.executions.entry((key.clone(), cmd)).or_default() += 1;
-                let outcome = workflow::execute(&name, &input);
+                let outcome = (self.workload.execute)(&name, &input);
                 self.worker_pending
                     .insert((key.clone(), cmd), outcome.clone());
                 self.send(Ev::NodeStepResult { key, cmd, outcome });
@@ -421,7 +424,7 @@ impl World<'_> {
                     state.error().unwrap_or_default()
                 ));
             }
-            let expected = workflow::reference(input)?;
+            let expected = workflow::reference(&self.workload, input)?;
             let actual = (
                 state.status(),
                 state.output().cloned(),

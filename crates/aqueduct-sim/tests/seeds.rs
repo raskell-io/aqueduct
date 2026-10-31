@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use aqueduct_sim::{Bugs, Config, run_seed};
+use aqueduct_sim::{Bugs, Config, WorkloadKind, run_seed};
 
 #[test]
 fn a_thousand_seeds_hold_every_invariant() {
@@ -90,4 +90,24 @@ fn missing_redispatch_is_caught() {
         .find_map(|seed| run_seed(seed, &config).err())
         .expect("the simulator should catch runs that never finish");
     assert!(failure.message.contains("liveness"), "{}", failure.message);
+}
+
+#[test]
+fn the_starlark_pipeline_holds_every_invariant() {
+    // The same pipeline as a Starlark procedure, replayed by re-execution on every activation.
+    let config = Config {
+        workload: WorkloadKind::StarlarkPipeline,
+        ..Config::default()
+    };
+    let mut completed = 0;
+    let mut failed = 0;
+    for seed in 0..300 {
+        let report = run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
+        completed += report.completed;
+        failed += report.failed;
+    }
+    assert!(
+        completed > 500 && failed > 200,
+        "completed {completed}, failed {failed}"
+    );
 }

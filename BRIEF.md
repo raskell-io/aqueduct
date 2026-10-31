@@ -73,9 +73,10 @@ procedures.
 
 ### 1.2 Two ways to describe work, one engine
 
-- **Procedures** (declarative, section 4.4): data that an agent can write, a schema can validate, the
-  engine interprets deterministically, and a person can review in one sitting. Determinism is guaranteed by
-  construction. This is the primary authoring path for agents and the main polyglot path.
+- **Procedures** (section 4.4): hermetic Starlark scripts that an agent can write, the engine interprets
+  deterministically, and a person can review in one sitting. Determinism is guaranteed by construction,
+  because the interpreter has no source of non-determinism. This is the primary authoring path for agents
+  and the main polyglot path.
 - **Code workflows** (Rust SDK, section 4.2): ordinary async Rust for engineers who need full expressive
   power. Determinism is checked by replay, not guaranteed.
 
@@ -89,7 +90,7 @@ step can call a code workflow and vice versa.
 | Deployment to start | server cluster plus database | server binary | library plus PostgreSQL | **library with an embedded store, no database** |
 | Grows into | large cluster | replicated cluster | PostgreSQL-backed fleet | **replicated cluster, same core** |
 | License | MIT | BSL 1.1 (server) | MIT | **Apache-2.0 OR MIT** |
-| Agent-authored procedures | no | no | no | **declarative procedures, provenance, approval** |
+| Agent-authored procedures | no | no | no | **hermetic Starlark procedures, provenance, approval** |
 | Testing story | replay tests | | | **deterministic simulation of the whole engine in CI** |
 
 Other neighbours to track: Obelisk (Rust, WASM components, deterministic workflows), Resonate (durable
@@ -163,7 +164,7 @@ The litmus test for "anyone can use it": a developer who has never heard of dura
 
 ### 4.1 Vocabulary
 
-- **Procedure**: a declarative definition of a process, interpreted by the engine (section 4.4).
+- **Procedure**: a hermetic Starlark script describing a process, interpreted by the engine (section 4.4).
 - **Workflow**: a durable async function in code (Rust SDK), identified by a type name.
 - **Run**: one execution of a procedure or workflow, identified by a **run key** chosen by the caller (or
   generated). Starting the same key twice follows an id reuse policy. Has a journal, a status, and a pinned
@@ -291,62 +292,62 @@ Procedures express the same with a `compensate` field per step.
 
 ### 4.4 Procedures
 
-A procedure is a versioned document that the engine interprets. Illustrative shape (the format is decided
-by ADR in phase 2 and frozen only with the owner's approval):
+A procedure is a hermetic **Starlark** script that defines `run(input)` (ADR 0008). Starlark is a
+deterministic dialect of Python with a written specification and implementations in Go, Java and Rust;
+the engine interprets it as a decider (ADR 0004). The format is frozen only with the owner's approval.
 
-```yaml
-procedure: claims/water-damage-photo-evidence
-version: 3
-input_schema: schemas/WaterDamageClaim.json
-origin:
-  explored_by: agent/claims-explorer
-  cases_studied: 37
-  replay: { against: 412, divergences: 0, report: replay/2026-10-11.json }
-approval:
-  by: claims-process-owner
-  at: 2026-10-12T09:14:00Z
-  signature: ...
-steps:
-  - id: classify_documents
-    kind: agent                     # bounded judgement, journaled
-    prompt: prompts/classify-documents.md
-    budget: { tokens: 20000 }
-    output_schema: schemas/DocumentClassification.json
-  - id: check_coverage
-    kind: step                      # a registered step implementation (any language)
-    use: coverage.water_damage@v7
-  - id: request_missing_photos
-    when: steps.classify_documents.missing_photos
-    kind: step
-    use: notify.customer
-    with: { template: claims/missing-photos }
-  - id: wait_for_customer
-    kind: wait
-    for: signal.photos_received
-    timeout: 14d
-    on_timeout: escalate
-  - id: settle_or_escalate
-    kind: decide
-    escalate_if: input.amount > 5000 || steps.classify_documents.confidence < 0.8
-    otherwise: { kind: call, procedure: claims/settle@v2 }
+```python
+# procedures/claims/water_damage_photo_evidence.star
+PROCEDURE = {
+    "name": "claims/water-damage-photo-evidence",
+    "version": 3,
+    "origin": {"explored_by": "agent/claims-explorer", "cases_studied": 37},
+}
+
+def run(claim):
+    docs = agent("classify_documents", claim["documents"],
+                 prompt = "prompts/classify-documents.md",
+                 output_schema = {"$ref": "schemas/DocumentClassification.json"},
+                 budget_tokens = 20000)                       # bounded judgement, journaled
+
+    coverage = step("coverage.water_damage@v7", claim)        # a registered step (any language)
+    if not coverage["covered"]:
+        fail("not covered: " + coverage["reason"])
+
+    if docs["missing_photos"]:
+        step("notify.customer", {"template": "claims/missing-photos", "to": claim["customer"]})
+        photos = wait(signal("photos_received"), timeout = days(14))
+        if photos == None:
+            escalate("no-photos", claim)
+
+    if claim["amount"] > 5000 or docs["confidence"] < 0.8:
+        escalate("manual-review", claim)
+    return call("claims/settle@v2", {"claim": claim["id"], "coverage": coverage})
 ```
+
+The phase 0 spike (`crates/aqueduct-procedure`) implements `step`, `parallel`, `agent` and `escalate`;
+`wait`, `signal`, `call`, timers and sagas arrive as the core supports them. Approvals and replay evidence
+live in a signed record next to the script, not in it.
 
 Requirements:
 
-- **Deterministic by construction.** The interpreter is part of the pure core's world: same journal, same
-  decisions. No wall clock, randomness or I/O except through steps.
-- **Not a programming language.** Expressions use a small, non-Turing-complete, side-effect-free language
-  with bounded evaluation cost. Evaluate **CEL** (Common Expression Language: a standard, used in
-  Kubernetes, Apache-2.0) and record the decision; check the Rust implementation's maturity and license.
-  Avoid growing YAML into a general language (the failure mode of CI systems and state-machine DSLs).
-- **Typed.** Inputs, step outputs and agent step outputs have schemas (JSON Schema); a procedure is
-  type-checked against them before it can be registered.
-- **Statically analysable.** Reachability, unbounded waits, missing timeouts, unhandled escalations and
-  steps without idempotency are reported before deployment.
+- **Deterministic by construction.** The interpreter is hermetic: no `load`, clock, randomness, file system
+  or network. The only effects are engine functions, which are journaled. Replay re-executes `run` against
+  the journal; changing a procedure under a running run is detected and parks it.
+- **Expressive, but bounded.** Full branching, loops over finite collections, functions and computation.
+  Every activation runs under a statement budget, a heap limit, a call stack limit and (in production) a
+  wall-clock watchdog; exceeding any of them parks the run.
+- **Failures are explicit.** A failed step fails the run unless called with `fallible = True`; `fail(...)`
+  fails it deliberately; any other script error is a bug and parks the run.
+- **Typed at the edges.** Inputs, step outputs and agent step outputs have JSON Schemas, checked at run time
+  and, where possible, by a lint before registration.
+- **Linted, then proven.** Static checks on the syntax tree (unbounded waits, missing timeouts, unhandled
+  escalations, recursion) run before registration; counterfactual replay against past runs (section 5.2)
+  carries the rest of the proof.
 - **Short and readable.** A process owner must be able to review a version in one sitting. Diffs between
   versions are first-class (`aqueduct procedure diff v2 v3`).
 - **Composable.** Procedures call procedures and code workflows; code workflows call procedures.
-- **Serialisation:** YAML and JSON accepted, one canonical form for hashing and signing.
+- **Hashing and signing** use the script's exact bytes plus its metadata record.
 
 ### 4.5 Versioning and lifecycle
 
@@ -739,7 +740,7 @@ aqueduct/
 ```
 
 Expected later, as phases require them: `aqueduct-macros`, `aqueduct-engine` (partition processor
-runtime, invoker, timer service, outboxes), `aqueduct-procedure` (format, type checker, interpreter),
+runtime, invoker, timer service, outboxes), `aqueduct-procedure` (Starlark interpreter; spike in phase 0),
 `aqueduct-protocol` (protobuf, prost, tonic), `aqueduct-server`, `aqueduct-cli`, `aqueduct-mcp`,
 `aqueduct-otel`, `aqueduct-ai`, `aqueduct-raft`; and top-level `conformance/`, `examples/`, `benches/`,
 `proto/`, `console/`, `xtask/`, plus `docs/guide/`, `docs/protocol.md`, `docs/guarantees.md`,
@@ -799,8 +800,8 @@ machine.
 
 ### Phase 2: procedures and agents
 
-- Procedure format, schema typing, static analysis and the deterministic interpreter (ADR on format and
-  expression language; CEL evaluated first).
+- Procedures in Starlark (ADR 0008): the full set of engine functions, schema checks, lints, a supported
+  termination mechanism (upstream fuel API or a recursion check), the watchdog, and AST caching.
 - Procedures and code workflows calling each other; child runs; queries and updates; `patched`.
 - Agent steps in the core; `aqueduct-ai` with at least two provider adapters behind one trait.
 - Replay modes: counterfactual replay with diff reports; model-drift replay.
@@ -876,7 +877,8 @@ ingress, the approval path and the cluster transport.
 6. How much of the push endpoint and procedure formats to align with existing ecosystems (for example the
    CNCF Serverless Workflow specification), so that users can migrate in?
 7. Async runtime strategy for deterministic simulation (section 10.1).
-8. Procedure format and expression language (CEL or alternatives).
+8. Procedure language: settled as Starlark (ADR 0008). Open: termination mechanism in starlark-rust, and
+   removing its `rustyline` dependency upstream (BSL-1.0 is allowed for it by exception meanwhile).
 9. Hash function and signature scheme for the history hash chain and approvals.
 10. Longevity commitment for the history format: how many years, how many format versions.
 11. License policy for CDLA-Permissive-2.0 and MPL-2.0 dependencies.
@@ -897,7 +899,8 @@ ingress, the approval path and the cluster transport.
 - turmoil: https://github.com/tokio-rs/turmoil
 - redb: https://github.com/cberner/redb
 - fjall: https://github.com/fjall-rs/fjall
-- Common Expression Language: https://cel.dev
+- Starlark specification: https://github.com/bazelbuild/starlark/blob/master/spec.md
+- starlark-rust: https://github.com/facebook/starlark-rust
 - CNCF Serverless Workflow: https://serverlessworkflow.io
 - Anthropic, Building effective agents: https://www.anthropic.com/engineering/building-effective-agents
 - EU AI Act, Article 12, record-keeping: https://artificialintelligenceact.eu/article/12/

@@ -1,0 +1,21 @@
+[package]
+name = "aqueduct-procedure"
+description = "Aqueduct procedures: hermetic Starlark scripts interpreted as deterministic deciders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aqueduct-core.workspace = true
+starlark = "0.14"
+anyhow = "1"
+serde_json = "1"
+thiserror.workspace = true

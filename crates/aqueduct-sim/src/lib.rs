@@ -26,6 +26,16 @@ mod world;
 
 pub use rng::Rng;
 
+/// The decider and step bodies a simulated world runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkloadKind {
+    /// The pipeline as a native Rust decider.
+    #[default]
+    Pipeline,
+    /// The same pipeline as a Starlark procedure (`aqueduct-procedure`).
+    StarlarkPipeline,
+}
+
 /// Deliberately injected bugs, used to check that the simulator catches them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bugs {
@@ -72,6 +82,8 @@ pub struct Config {
     pub worker_resend: u64,
     /// Injected bugs.
     pub bugs: Bugs,
+    /// The workload.
+    pub workload: WorkloadKind,
 }
 
 impl Default for Config {
@@ -93,6 +105,7 @@ impl Default for Config {
             client_retry: 80,
             worker_resend: 60,
             bugs: Bugs::default(),
+            workload: WorkloadKind::default(),
         }
     }
 }

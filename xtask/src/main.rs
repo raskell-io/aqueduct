@@ -14,7 +14,7 @@ fn main() -> ExitCode {
         Some("sim") => sim::run(&args[1..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <task>\n\ntasks:\n  fsync [dir]                    measure fsync latency and group commit throughput\n  sim --seed N | --seeds N [--from S]   run the deterministic simulator"
+                "usage: cargo xtask <task>\n\ntasks:\n  fsync [dir]                    measure fsync latency and group commit throughput\n  sim --seed N | --seeds N [--from S] [--workload native|starlark]   run the simulator"
             );
             return ExitCode::from(2);
         }

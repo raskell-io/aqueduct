@@ -7,6 +7,7 @@
 //! - a failed sync is fatal: the node crashes and recovers from the log.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::rc::Rc;
 
 use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
 use aqueduct_core::{
@@ -15,7 +16,6 @@ use aqueduct_core::{
 use aqueduct_storage::{LogStore, StorageError};
 
 use crate::disk::SimDisk;
-use crate::workflow::Pipeline;
 
 /// A run held in the node's memory.
 pub(crate) struct NodeRun {
@@ -53,11 +53,13 @@ pub(crate) struct Node {
     /// Only used by the injected bug that acknowledges before syncing.
     immediate: Vec<Outbound>,
     ack_before_sync: bool,
+    decider: Rc<dyn Decider>,
 }
 
 impl Node {
-    pub fn new(disk: SimDisk, ack_before_sync: bool) -> Self {
+    pub fn new(disk: SimDisk, ack_before_sync: bool, decider: Rc<dyn Decider>) -> Self {
         Node {
+            decider,
             up: true,
             incarnation: 0,
             disk,
@@ -266,7 +268,7 @@ impl Node {
                         .runs
                         .get(key)
                         .ok_or_else(|| format!("run {key} vanished"))?;
-                    let commands = Pipeline.decide(&run.state.view());
+                    let commands = self.decider.decide(&run.state.view());
                     let transition = run.state.handle(Event::Decision(commands));
                     queue.extend(self.append(key, transition)?);
                 }

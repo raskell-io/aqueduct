@@ -372,7 +372,9 @@ impl RunState {
                     }
                     steps_seen += 1;
                 }
-                Command::CompleteRun { .. } | Command::FailRun { .. } if position + 1 != total => {
+                Command::CompleteRun { .. } | Command::FailRun { .. } | Command::Park { .. }
+                    if position + 1 != total =>
+                {
                     return Transition::park(format!(
                         "the logic issued a terminal command at position {position} that is not its last command"
                     ));
@@ -383,6 +385,9 @@ impl RunState {
                     }
                     transition.entries.push(Entry::RunCompleted { output });
                     transition.effects.push(Effect::Finished(Status::Completed));
+                }
+                Command::Park { reason } => {
+                    return Transition::park(reason);
                 }
                 Command::FailRun { error } => {
                     if steps_seen < known {
