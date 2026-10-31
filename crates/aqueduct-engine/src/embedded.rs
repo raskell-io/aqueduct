@@ -30,8 +30,10 @@
 //! changed to `state.redb` (ADR 0009); recovery loads it and replays only the log after it, and log
 //! segments it covers are deleted.
 //!
-//! Not yet: a timer index (timers are found by scanning
-//! runs), unloading finished runs from memory
+//! Finished runs leave memory once a checkpoint holds them; `wait`, repeated starts and signals read them
+//! back from `state.redb`. Timers are kept in an index ordered by wake time.
+//!
+//! Not yet: loading only active runs at startup (recovery still folds every run in the checkpoint)
 //! (recovery replays the whole log; checkpoints in redb come with ADR 0009's state store).
 
 use std::collections::BTreeMap;
@@ -81,6 +83,17 @@ pub struct RunResult {
     pub output: Option<Payload>,
     /// The error or parking reason, if the run failed or was parked.
     pub error: Option<String>,
+}
+
+/// A snapshot of the engine's size, for operations and tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineStats {
+    /// Runs held in memory (active runs, and finished runs not yet in a checkpoint).
+    pub runs_in_memory: usize,
+    /// Timers that have not fired.
+    pub pending_timers: usize,
+    /// The LSN the next log record will get.
+    pub log_lsn: u64,
 }
 
 /// Errors from the embedded engine.
@@ -193,6 +206,7 @@ impl Builder {
             .map_err(|e| EngineError::Open(e.to_string()))?;
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(self.default_retry);
+        partition.set_evict_finished(true);
         for (step, policy) in &self.retry_policies {
             partition.set_retry_policy(step, *policy);
         }
@@ -300,6 +314,13 @@ impl Engine {
         }
     }
 
+    /// The engine's current size.
+    pub fn stats(&self) -> Result<EngineStats, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Stats { reply })?;
+        answer.recv().map_err(|_| self.stopped())
+    }
+
     /// Stops the engine and waits for its threads. Reports a fatal error, if one stopped it earlier.
     pub fn shutdown(mut self) -> Result<(), EngineError> {
         self.stop()
@@ -360,6 +381,9 @@ enum Request {
         key: String,
         cmd: CommandIndex,
         error: String,
+    },
+    Stats {
+        reply: Sender<EngineStats>,
     },
     Shutdown,
 }
@@ -450,11 +474,20 @@ impl Processor {
                 Err(error) => return Err(error.to_string()),
             },
             Request::Wait { key, reply } => {
-                if self.partition.run(&key).is_none() {
-                    let _ = reply.send(Err(EngineError::UnknownRun(key)));
-                } else {
+                if self.partition.run(&key).is_some() {
                     // Answered after the next flush, once the run's end is durable.
                     self.waiters.entry(key).or_default().push(reply);
+                } else {
+                    // Not in memory: an unloaded finished run (durable in a checkpoint), or no run.
+                    let answer = match self.partition.lookup(&key).map_err(|e| e.to_string())? {
+                        Some(state) => Ok(RunResult {
+                            status: state.status(),
+                            output: state.output().cloned(),
+                            error: state.error().map(str::to_owned),
+                        }),
+                        None => Err(EngineError::UnknownRun(key)),
+                    };
+                    let _ = reply.send(answer);
                 }
             }
             Request::Signal {
@@ -479,6 +512,13 @@ impl Processor {
                 self.partition
                     .step_attempt_failed(&key, cmd, error)
                     .map_err(|e| e.to_string())?;
+            }
+            Request::Stats { reply } => {
+                let _ = reply.send(EngineStats {
+                    runs_in_memory: self.partition.runs().len(),
+                    pending_timers: self.partition.pending_timers(),
+                    log_lsn: self.partition.log().next_lsn(),
+                });
             }
             Request::Shutdown => return Ok(false),
         }

@@ -144,3 +144,75 @@ fn a_run_interrupted_by_a_restart_finishes_after_reopening() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn finished_runs_leave_memory_and_stay_queryable() {
+    let dir = temp_dir();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let greet = Arc::new(Procedure::compile("greet.star", GREET).unwrap());
+    let open = |calls: Arc<AtomicUsize>| {
+        Engine::builder(&dir)
+            .workflow(
+                "greet",
+                Arc::clone(&greet) as Arc<dyn aqueduct_core::Decider + Send + Sync>,
+            )
+            .step("lookup_name", move |user: &Payload| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                StepOutcome::Completed(json(&format!("\"{}\"", text(user).to_uppercase())))
+            })
+            .step("greet_en", |name: &Payload| {
+                StepOutcome::Completed(json(&format!("\"hello {}\"", text(name))))
+            })
+            .step("greet_de", |name: &Payload| {
+                StepOutcome::Completed(json(&format!("\"hallo {}\"", text(name))))
+            })
+            .checkpoint_every(1)
+            .open()
+            .unwrap()
+    };
+    let engine = open(Arc::clone(&calls));
+    for n in 0..20 {
+        engine
+            .start(&format!("u-{n}"), "greet", json(&format!("\"u{n}\"")))
+            .unwrap();
+    }
+    for n in 0..20 {
+        assert_eq!(
+            engine
+                .wait(&format!("u-{n}"), Duration::from_secs(10))
+                .unwrap()
+                .status,
+            Status::Completed
+        );
+    }
+    // With a checkpoint after every record, finished runs have left memory; they are still answered,
+    // starting them again is still a no-op, and signals to them are still acknowledged.
+    std::thread::sleep(Duration::from_millis(50));
+    let stats = engine.stats().unwrap();
+    assert!(
+        stats.runs_in_memory < 20,
+        "finished runs left memory: {stats:?}"
+    );
+    assert_eq!(
+        engine.wait("u-3", Duration::from_secs(1)).unwrap().output,
+        Some(json(r#"{"en":"hello U3","de":"hallo U3"}"#))
+    );
+    engine
+        .start("u-3", "greet", json("\"someone else\""))
+        .unwrap();
+    engine.signal("u-3", "anything", "s-1", json("1")).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 20);
+    engine.shutdown().unwrap();
+
+    let engine = open(Arc::clone(&calls));
+    assert_eq!(
+        engine.wait("u-19", Duration::from_secs(1)).unwrap().status,
+        Status::Completed
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        20,
+        "nothing ran again after reopening"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
