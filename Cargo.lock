@@ -74,6 +74,7 @@ dependencies = [
  "aqueduct-engine",
  "aqueduct-procedure",
  "aqueduct-sdk",
+ "serde_json",
 ]
 
 [[package]]
