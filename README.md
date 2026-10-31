@@ -1,21 +1,21 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/brand/aqueduct-lockup-light.svg">
-    <img alt="Aqueduct" src="docs/brand/aqueduct-lockup-dark.svg" width="420">
+    <img alt="aqueduct" src="docs/brand/aqueduct-lockup-dark.svg" width="480">
   </picture>
+</h1>
+
+<p align="center">
+  <strong>A deterministic engine for procedures that agents write and people approve.</strong><br>
+  It starts as a library inside your binary, grows into a replicated cluster without changing your code,
+  and every run leaves a history you can replay and audit.
 </p>
 
-# Aqueduct
-
-**A deterministic engine for procedures that agents write and people approve.** Aqueduct starts as a
-library inside your binary, grows into a replicated cluster without changing your code, and every run
-leaves a history you can replay and audit.
-
-> **Status: early phase 1.** Not usable as a library yet. The repository holds the
-> [build brief](BRIEF.md), the [architecture decision records](docs/adr/), the
-> [history format](docs/history-format.md), the pure core state machine, Starlark procedures, a
-> deterministic simulator, a durable file log and a first embedded engine that survives `kill -9`. Do not
-> depend on it.
+> **Status: phase 1.** An embedded engine you can try, not yet one to depend on: APIs and the history
+> format will still change. It runs [Starlark procedures](docs/adr/0008-procedure-language-starlark.md)
+> and [Rust workflows](docs/adr/0014-rust-sdk.md) with durable timers, exactly-once signals, journaled
+> retries and checkpoints, survives `kill -9`, and is tested by a deterministic simulator on every change.
+> See the [build brief](BRIEF.md) and the [decision records](docs/adr/).
 
 ## Try the simulator
 
@@ -67,10 +67,19 @@ one journal format and one set of guarantees.
 
 See [BRIEF.md](BRIEF.md) for the full design and the phased plan.
 
-## Why "Aqueduct"
+## The name and the mark
 
 An aqueduct carries water from wild sources across terrain nobody can change, on a gentle, constant
 gradient, and some have done so for two thousand years. See [ADR 0002](docs/adr/0002-project-name.md).
+
+<img align="right" src="docs/brand/aqueduct-icon.svg" width="96" alt="">
+
+The mark is a fractal arch: one arch carrying two, each carrying two, standing on a line of water. It is
+the Pont du Gard reduced to its idea, a structure that carries, repeated at every scale, which is also
+how Aqueduct is meant to work: steps inside procedures, procedures inside larger ones, the same loop at
+every scale. The water is what the structure exists to carry. The wordmark is set in lowercase
+[Syne](https://gitlab.com/bonjour-monde/fonderie/syne-typeface). Every file, the palette and the rules for
+using them are in the [brand guide](docs/brand/README.md); `python3 scripts/brand.py` regenerates them.
 
 ## License
 
