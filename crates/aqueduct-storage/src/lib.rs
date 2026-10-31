@@ -10,7 +10,7 @@ mod file_log;
 pub mod frame;
 mod state;
 
-pub use file_log::{FileLog, FileLogOptions};
+pub use file_log::{Durability, FileLog, FileLogOptions};
 pub use state::{Checkpoint, NoStateStore, RedbStateStore, StateStore};
 
 /// A storage failure.

@@ -110,6 +110,9 @@ fn open(dir: &str, seed: u64) -> Result<Engine, String> {
             }
         });
     }
+    if std::env::var_os("AQUEDUCT_CRASH_DURABILITY").is_some_and(|v| v == "os") {
+        builder = builder.durability(aqueduct_storage::Durability::Os);
+    }
     if std::env::var_os("AQUEDUCT_CRASH_BUG").is_some_and(|v| v == "ack-before-sync") {
         builder = builder.inject_ack_before_sync();
     }
@@ -120,6 +123,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut kills = 50u64;
     let mut seed = 1u64;
     let mut startup = false;
+    let mut durability = "fsync";
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = || -> Result<u64, String> {
@@ -132,9 +136,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--kills" => kills = value()?,
             "--seed" => seed = value()?,
             "--startup" => startup = true,
+            // Durability::Os: a killed process loses nothing the OS has, so the same checks hold.
+            "--os" => durability = "os",
             other => {
                 return Err(format!(
-                    "unknown argument {other}; use --kills N [--seed S] [--startup]"
+                    "unknown argument {other}; use --kills N [--seed S] [--startup] [--os]"
                 ));
             }
         }
@@ -153,6 +159,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     for _ in 0..kills {
         let first = acknowledged.map_or(0, |a| a + 1).to_string();
         let mut child = Command::new(&exe)
+            .env("AQUEDUCT_CRASH_DURABILITY", durability)
             .args([
                 "crash-engine-child",
                 &dir_arg,
@@ -190,6 +197,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Err("no run was ever acknowledged; the engine did not get going".into());
     };
     let output = Command::new(&exe)
+        .env("AQUEDUCT_CRASH_DURABILITY", durability)
         .args(["crash-engine-child", &dir_arg, "drain", &last.to_string()])
         .output()
         .map_err(|e| format!("cannot start the final engine: {e}"))?;
