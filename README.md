@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/aqueduct-lockup-light.svg">
+    <img alt="Aqueduct" src="docs/brand/aqueduct-lockup-dark.svg" width="420">
+  </picture>
+</p>
+
 # Aqueduct
 
 **A deterministic engine for procedures that agents write and people approve.** Aqueduct starts as a
