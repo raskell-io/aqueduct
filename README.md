@@ -20,6 +20,19 @@ cargo xtask crash-engine        # SIGKILL the embedded engine mid-run; every ack
 cargo xtask fsync               # measure fsync latency and group commit throughput on this machine
 ```
 
+## Inspect a data directory
+
+With the engine stopped, the `aqueduct` command line reads an embedded engine's data directory:
+
+```sh
+cargo run -p aqueduct-cli -- runs ./data                     # every run: workflow, status, journal length
+cargo run -p aqueduct-cli -- describe ./data order-1         # status, input, output, each command and its attempts
+cargo run -p aqueduct-cli -- journal ./data order-1          # the journal, entry by entry
+cargo run -p aqueduct-cli -- verify ./data                   # check every hash chain, print each run's head
+cargo run -p aqueduct-cli -- export ./data order-1           # the journal as JSON Lines
+cargo run -p aqueduct-cli -- replay ./data order-1 new.star  # would this procedure version diverge from the run?
+```
+
 ## The idea
 
 Agents are good at exploring: unfamiliar systems, ambiguous documents, cases nobody has seen before.
