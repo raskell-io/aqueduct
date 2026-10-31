@@ -48,6 +48,15 @@ enum Ev {
     Restart,
     ClientRetry,
     WorkerResend,
+    NodeSignal {
+        key: String,
+    },
+    ClientSignalAck {
+        key: String,
+    },
+    TimerTick {
+        incarnation: u64,
+    },
 }
 
 impl Ev {
@@ -64,6 +73,9 @@ impl Ev {
             Ev::Restart => 9,
             Ev::ClientRetry => 10,
             Ev::WorkerResend => 11,
+            Ev::NodeSignal { .. } => 12,
+            Ev::ClientSignalAck { .. } => 13,
+            Ev::TimerTick { .. } => 14,
         }
     }
 
@@ -75,6 +87,8 @@ impl Ev {
                 | Ev::ClientStartAck { .. }
                 | Ev::WorkerDispatch { .. }
                 | Ev::WorkerResultAck { .. }
+                | Ev::NodeSignal { .. }
+                | Ev::ClientSignalAck { .. }
         )
     }
 }
@@ -96,6 +110,10 @@ struct World<'c> {
     acked_starts: BTreeSet<String>,
     /// Results the worker saw acknowledged. Must be recorded (or the run ended without them).
     acked_results: BTreeSet<(String, CommandIndex)>,
+    /// Runs whose `go` signal the client saw acknowledged.
+    acked_signals: BTreeSet<String>,
+    /// Timer firings already checked against their wake time.
+    checked_timers: BTreeSet<(String, CommandIndex)>,
     /// Results the worker holds and resends until acknowledged.
     worker_pending: BTreeMap<(String, CommandIndex), StepOutcome>,
     executions: BTreeMap<(String, CommandIndex), u64>,
@@ -103,12 +121,16 @@ struct World<'c> {
     workload: Workload,
 }
 
+/// How often the node checks for due timers, in simulated milliseconds.
+const TIMER_TICK: u64 = 25;
+
 pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     let mut rng = Rng::new(seed);
     let mut disk = SimDisk::new(rng.fork(), config.sync_fail_ppm, config.torn_ppm);
     disk.skip_truncation = config.bugs.skip_tail_truncation;
     let workload = Workload::new(config.workload).map_err(|message| Failure {
         seed,
+        workload: config.workload,
         time: 0,
         message,
     })?;
@@ -126,6 +148,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         node: Node::new(disk, config.bugs.ack_before_sync, workload.decider.clone()).map_err(
             |message| Failure {
                 seed,
+                workload: config.workload,
                 time: 0,
                 message,
             },
@@ -136,6 +159,8 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         wanted,
         acked_starts: BTreeSet::new(),
         acked_results: BTreeSet::new(),
+        acked_signals: BTreeSet::new(),
+        checked_timers: BTreeSet::new(),
         worker_pending: BTreeMap::new(),
         executions: BTreeMap::new(),
         report: Report {
@@ -145,6 +170,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     };
     world.run().map_err(|message| Failure {
         seed,
+        workload: config.workload,
         time: world.now,
         message,
     })
@@ -158,12 +184,14 @@ impl World<'_> {
             Ev::Redispatch { incarnation: 0 },
         );
         self.schedule(self.config.worker_resend, Ev::WorkerResend);
+        self.schedule(TIMER_TICK, Ev::TimerTick { incarnation: 0 });
 
         loop {
             let Some(((time, _), ev)) = self.queue.pop_first() else {
                 return Err("the event queue ran dry".into());
             };
             self.now = time;
+            self.node.set_time(time);
             self.report.events += 1;
             self.report.trace = mix(mix(self.report.trace, time), ev.code());
 
@@ -193,6 +221,7 @@ impl World<'_> {
                 self.schedule(delay, Ev::Crash);
             }
             self.node.check_fold()?;
+            self.check_timers()?;
 
             if !self.faults && self.quiescent() {
                 self.final_checks()?;
@@ -259,6 +288,22 @@ impl World<'_> {
             Ev::ClientStartAck { key } => {
                 self.acked_starts.insert(key);
             }
+            Ev::ClientSignalAck { key } => {
+                self.acked_signals.insert(key);
+            }
+            Ev::NodeSignal { key } => {
+                if self.node.up {
+                    self.node.on_signal(&key)?;
+                    self.after_node_event();
+                }
+            }
+            Ev::TimerTick { incarnation } => {
+                if self.node.up && incarnation == self.node.incarnation {
+                    self.node.fire_due_timers()?;
+                    self.after_node_event();
+                    self.schedule(TIMER_TICK, Ev::TimerTick { incarnation });
+                }
+            }
             Ev::ClientRetry => {
                 let missing: Vec<(String, Payload)> = self
                     .wanted
@@ -266,10 +311,27 @@ impl World<'_> {
                     .filter(|(key, _)| !self.acked_starts.contains(key))
                     .cloned()
                     .collect();
-                if !missing.is_empty() {
-                    for (key, input) in missing {
-                        self.send(Ev::NodeStart { key, input });
+                // Signal runs whose start was acknowledged, retrying until the signal is acknowledged.
+                let unsignalled: Vec<String> = if self.workload.signals {
+                    self.acked_starts
+                        .difference(&self.acked_signals)
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let pending = !missing.is_empty()
+                    || !unsignalled.is_empty()
+                    || (self.workload.signals && self.acked_signals.len() < self.wanted.len());
+                for (key, input) in missing {
+                    self.send(Ev::NodeStart { key, input });
+                }
+                for key in unsignalled {
+                    if self.rng.chance(400_000) {
+                        self.send(Ev::NodeSignal { key });
                     }
+                }
+                if pending {
                     self.schedule(self.config.client_retry, Ev::ClientRetry);
                 }
             }
@@ -323,6 +385,7 @@ impl World<'_> {
         for message in outbound {
             let ev = match message {
                 Outbound::Started { key } => Ev::ClientStartAck { key },
+                Outbound::Signaled { key } => Ev::ClientSignalAck { key },
                 Outbound::Dispatch {
                     key,
                     cmd,
@@ -372,6 +435,8 @@ impl World<'_> {
 
         self.node.resume()?;
         let incarnation = self.node.incarnation;
+        self.schedule(TIMER_TICK, Ev::TimerTick { incarnation });
+        let incarnation = self.node.incarnation;
         self.schedule(
             self.config.redispatch_interval,
             Ev::Redispatch { incarnation },
@@ -385,6 +450,19 @@ impl World<'_> {
         for key in &self.acked_starts {
             if !self.node.runs().contains_key(key) {
                 return Err(format!("lost acknowledged start of {key}"));
+            }
+        }
+        for key in &self.acked_signals {
+            let Some(run) = self.node.runs().get(key) else {
+                return Err(format!("lost run {key} with an acknowledged signal"));
+            };
+            let has = |f: fn(&aqueduct_core::Entry) -> bool| run.journal().iter().any(f);
+            let received = has(|e| matches!(e, aqueduct_core::Entry::SignalReceived { .. }));
+            let waited = has(|e| matches!(e, aqueduct_core::Entry::SignalAwaited { .. }));
+            // A signal to a run that ended without waiting for one is dropped, as specified.
+            let ended_first = run.state().status().is_terminal() && !waited;
+            if !received && !ended_first {
+                return Err(format!("lost the acknowledged signal to {key}"));
             }
         }
         for (key, cmd) in &self.acked_results {
@@ -406,10 +484,46 @@ impl World<'_> {
         Ok(())
     }
 
+    /// Invariant: timers never fire early. Checked when a firing is first seen, right after the event
+    /// that appended it, so the simulated clock is the time it fired.
+    fn check_timers(&mut self) -> Result<(), String> {
+        for (key, run) in self.node.runs() {
+            for entry in run.journal() {
+                let aqueduct_core::Entry::TimerFired { cmd } = entry else {
+                    continue;
+                };
+                if !self.checked_timers.insert((key.clone(), *cmd)) {
+                    continue;
+                }
+                let wake_at = run.journal().iter().find_map(|e| match e {
+                    aqueduct_core::Entry::TimerStarted {
+                        cmd: c, wake_at, ..
+                    }
+                    | aqueduct_core::Entry::SignalAwaited {
+                        cmd: c, wake_at, ..
+                    } if c == cmd => Some(*wake_at),
+                    _ => None,
+                });
+                match wake_at {
+                    Some(wake_at) if wake_at <= self.now => {}
+                    Some(wake_at) => {
+                        return Err(format!(
+                            "run {key}: timer {cmd} fired at {} before its wake time {wake_at}",
+                            self.now
+                        ));
+                    }
+                    None => return Err(format!("run {key}: timer {cmd} fired without a timer")),
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn quiescent(&self) -> bool {
         self.node.up
             && !self.node.needs_flush()
             && self.acked_starts.len() == self.wanted.len()
+            && (!self.workload.signals || self.acked_signals.len() == self.wanted.len())
             && self.wanted.iter().all(|(key, _)| {
                 self.node
                     .runs()
@@ -420,6 +534,20 @@ impl World<'_> {
 
     fn final_checks(&mut self) -> Result<(), String> {
         self.check_acknowledged()?;
+
+        // Signals were delivered exactly once, despite retries and duplicated messages.
+        for (key, run) in self.node.runs() {
+            let count = |f: fn(&aqueduct_core::Entry) -> bool| {
+                run.journal().iter().filter(|e| f(e)).count()
+            };
+            let received = count(|e| matches!(e, aqueduct_core::Entry::SignalReceived { .. }));
+            let waited = count(|e| matches!(e, aqueduct_core::Entry::SignalAwaited { .. }));
+            if received > 1 || received < waited {
+                return Err(format!(
+                    "run {key} recorded {received} signals and waited for {waited}"
+                ));
+            }
+        }
 
         // Every run ended as the sequential reference says it should.
         for (key, input) in &self.wanted {

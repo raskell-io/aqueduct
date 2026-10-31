@@ -82,6 +82,13 @@ impl Node {
             .unwrap_or_default()
     }
 
+    /// Gives the partition the simulated clock.
+    pub fn set_time(&mut self, now: u64) {
+        if let Some(partition) = self.partition.as_mut() {
+            partition.set_time(now);
+        }
+    }
+
     pub fn on_start(&mut self, key: &str, input: Payload) -> Result<(), String> {
         self.partition()?
             .start(key, WORKFLOW, input)
@@ -97,6 +104,24 @@ impl Node {
         self.partition()?
             .step_result(key, cmd, outcome)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn on_signal(&mut self, key: &str) -> Result<(), String> {
+        let id = format!("go-{key}");
+        match self
+            .partition()?
+            .signal(key, "go", &id, Payload::new(crate::workflow::GO.to_vec()))
+        {
+            Ok(()) | Err(aqueduct_engine::PartitionError::UnknownRun(_)) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn fire_due_timers(&mut self) -> Result<(), String> {
+        match self.partition.as_mut() {
+            Some(partition) => partition.fire_due_timers().map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
     }
 
     pub fn on_redispatch(&mut self) {

@@ -25,9 +25,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 workload = match iter.next().map(String::as_str) {
                     Some("native") => WorkloadKind::Pipeline,
                     Some("starlark") => WorkloadKind::StarlarkPipeline,
+                    Some("timers") => WorkloadKind::StarlarkTimers,
                     other => {
                         return Err(format!(
-                            "--workload must be native or starlark, not {other:?}"
+                            "--workload must be native, starlark or timers, not {other:?}"
                         ));
                     }
                 }

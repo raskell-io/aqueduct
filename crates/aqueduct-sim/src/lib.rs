@@ -34,6 +34,9 @@ pub enum WorkloadKind {
     Pipeline,
     /// The same pipeline as a Starlark procedure (`aqueduct-procedure`).
     StarlarkPipeline,
+    /// A Starlark procedure that sleeps and waits for a signal: exercises durable timers and
+    /// exactly-once signals under faults.
+    StarlarkTimers,
 }
 
 /// Deliberately injected bugs, used to check that the simulator catches them.
@@ -148,6 +151,8 @@ pub struct Report {
 pub struct Failure {
     /// The seed that reproduces it.
     pub seed: u64,
+    /// The workload it ran.
+    pub workload: WorkloadKind,
     /// Simulated time of the failure.
     pub time: u64,
     /// What went wrong.
@@ -156,9 +161,14 @@ pub struct Failure {
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let workload = match self.workload {
+            WorkloadKind::Pipeline => "native",
+            WorkloadKind::StarlarkPipeline => "starlark",
+            WorkloadKind::StarlarkTimers => "timers",
+        };
         write!(
             f,
-            "seed {} failed at time {}: {}\nreproduce with: cargo xtask sim --seed {}",
+            "seed {} failed at time {}: {}\nreproduce with: cargo xtask sim --seed {} --workload {workload}",
             self.seed, self.time, self.message, self.seed
         )
     }

@@ -71,4 +71,7 @@ mod run;
 
 pub use decider::{Command, Decider, RunView};
 pub use journal::{CommandIndex, Entry, IdempotencyKey, Payload, StepOutcome};
-pub use run::{Effect, Event, JournalError, RunState, ScheduledStep, Status, Transition, start};
+pub use run::{
+    CommandKind, Effect, Event, JournalError, RunState, ScheduledStep, Status, TIMED_OUT,
+    Transition, start,
+};

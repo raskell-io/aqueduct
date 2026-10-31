@@ -13,6 +13,18 @@ pub enum Command {
         /// The step's input.
         input: Payload,
     },
+    /// Sleep durably.
+    Sleep {
+        /// How long, in milliseconds.
+        duration_ms: u64,
+    },
+    /// Wait for the next signal with this name, or until the timeout.
+    AwaitSignal {
+        /// The signal's name.
+        name: String,
+        /// The timeout in milliseconds; 0 waits forever.
+        timeout_ms: u64,
+    },
     /// Complete the run. Must be the last command.
     CompleteRun {
         /// The run's output.

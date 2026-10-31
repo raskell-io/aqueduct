@@ -43,6 +43,15 @@ record = version:u8  kind:u8  prev:hash  fields
 | 5 | `RunCompleted` | `output:bytes` |
 | 6 | `RunFailed` | `error:string` |
 | 7 | `Parked` | `reason:string` |
+| 8 | `TimerStarted` | `cmd:cmd`, `duration_ms:varint`, `wake_at:varint` |
+| 9 | `SignalAwaited` | `cmd:cmd`, `name:string`, `timeout_ms:varint`, `wake_at:varint` |
+| 10 | `TimerFired` | `cmd:cmd` |
+| 11 | `SignalReceived` | `name:string`, `id:string`, `payload:bytes` |
+
+Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
+issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
+its sender; a run never records two signals with the same non-empty id, which makes retried sends
+exactly-once.
 
 Payload fields (`input`, `result`, `output`) are opaque to this format. Their encoding is declared by the
 SDK's codec.
@@ -64,8 +73,12 @@ codecs.
 A decoded history is a valid journal if:
 
 1. The first entry is `Started`, and it occurs only once.
-2. `StepScheduled` command indexes are 0, 1, 2, ... in order, without gaps.
-3. `StepCompleted` and `StepFailed` refer to a scheduled command, at most once per command.
+2. `StepScheduled`, `TimerStarted` and `SignalAwaited` share one sequence of command indexes: 0, 1, 2, ...
+   in order, without gaps.
+3. Each command has at most one outcome. `StepCompleted` and `StepFailed` complete a step. `TimerFired`
+   completes a sleep (outcome `null`) or times out a signal wait that has a timeout. A `SignalReceived`
+   completes the oldest signal wait with the same name that has no outcome yet; if there is none, the
+   signal is kept, and the next `SignalAwaited` with that name takes the oldest kept signal at once.
 4. Nothing follows `RunCompleted`, `RunFailed` or `Parked` (in version 0; operator resume of parked runs is
    specified in a later version).
 

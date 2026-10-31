@@ -46,6 +46,10 @@ mod kind {
     pub const RUN_COMPLETED: u8 = 5;
     pub const RUN_FAILED: u8 = 6;
     pub const PARKED: u8 = 7;
+    pub const TIMER_STARTED: u8 = 8;
+    pub const SIGNAL_AWAITED: u8 = 9;
+    pub const TIMER_FIRED: u8 = 10;
+    pub const SIGNAL_RECEIVED: u8 = 11;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -130,6 +134,10 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::RunCompleted { .. } => kind::RUN_COMPLETED,
         Entry::RunFailed { .. } => kind::RUN_FAILED,
         Entry::Parked { .. } => kind::PARKED,
+        Entry::TimerStarted { .. } => kind::TIMER_STARTED,
+        Entry::SignalAwaited { .. } => kind::SIGNAL_AWAITED,
+        Entry::TimerFired { .. } => kind::TIMER_FIRED,
+        Entry::SignalReceived { .. } => kind::SIGNAL_RECEIVED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -154,6 +162,32 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::RunCompleted { output } => put_bytes(&mut out, output.as_bytes()),
         Entry::RunFailed { error } => put_bytes(&mut out, error.as_bytes()),
         Entry::Parked { reason } => put_bytes(&mut out, reason.as_bytes()),
+        Entry::TimerStarted {
+            cmd,
+            duration_ms,
+            wake_at,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_varint(&mut out, *duration_ms);
+            put_varint(&mut out, *wake_at);
+        }
+        Entry::SignalAwaited {
+            cmd,
+            name,
+            timeout_ms,
+            wake_at,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, name.as_bytes());
+            put_varint(&mut out, *timeout_ms);
+            put_varint(&mut out, *wake_at);
+        }
+        Entry::TimerFired { cmd } => put_varint(&mut out, u64::from(cmd.0)),
+        Entry::SignalReceived { name, id, payload } => {
+            put_bytes(&mut out, name.as_bytes());
+            put_bytes(&mut out, id.as_bytes());
+            put_bytes(&mut out, payload.as_bytes());
+        }
     }
     out
 }
@@ -193,6 +227,23 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         },
         kind::PARKED => Entry::Parked {
             reason: reader.string()?,
+        },
+        kind::TIMER_STARTED => Entry::TimerStarted {
+            cmd: reader.cmd()?,
+            duration_ms: reader.varint()?,
+            wake_at: reader.varint()?,
+        },
+        kind::SIGNAL_AWAITED => Entry::SignalAwaited {
+            cmd: reader.cmd()?,
+            name: reader.string()?,
+            timeout_ms: reader.varint()?,
+            wake_at: reader.varint()?,
+        },
+        kind::TIMER_FIRED => Entry::TimerFired { cmd: reader.cmd()? },
+        kind::SIGNAL_RECEIVED => Entry::SignalReceived {
+            name: reader.string()?,
+            id: reader.string()?,
+            payload: reader.payload()?,
         },
         other => return Err(DecodeError::UnknownKind(other)),
     };

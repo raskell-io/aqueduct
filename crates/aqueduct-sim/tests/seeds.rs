@@ -111,3 +111,16 @@ fn the_starlark_pipeline_holds_every_invariant() {
         "completed {completed}, failed {failed}"
     );
 }
+
+#[test]
+fn timers_and_signals_hold_every_invariant() {
+    // Durable sleeps, timers that never fire early, and signals retried by the client and duplicated by
+    // the network but recorded exactly once.
+    let config = Config {
+        workload: WorkloadKind::StarlarkTimers,
+        ..Config::default()
+    };
+    for seed in 0..300 {
+        run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
+    }
+}
