@@ -2071,6 +2071,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "aqueduct-sim",
+ "aqueduct-storage",
 ]
 
 [[package]]
