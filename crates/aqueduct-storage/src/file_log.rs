@@ -11,6 +11,9 @@
 //!   which a crash during a write can explain; it is truncated. Damage anywhere else, and missing records,
 //!   are reported as [`StorageError::Corrupt`] and never repaired silently. Bit rot in the middle of the
 //!   last segment cannot be told apart from a torn tail.
+//! - One writer at a time: [`FileLog::open`] takes an exclusive lock on `LOCK` in the directory and holds
+//!   it until the log is dropped (the operating system releases it if the process dies). Without it, a
+//!   second opener would truncate what looks like a torn tail but is the first writer's write in progress.
 //! - [`LogStore::trim`] deletes whole segments before an LSN that a checkpoint covers; the current
 //!   segment is never deleted.
 
@@ -45,6 +48,8 @@ pub struct FileLog {
     pending: Vec<u8>,
     pending_records: u64,
     next_lsn: u64,
+    /// Held for the log's lifetime: the exclusive lock on `LOCK`.
+    _lock: File,
 }
 
 #[derive(Debug)]
@@ -54,11 +59,25 @@ struct Segment {
 }
 
 impl FileLog {
-    /// Opens (or creates) a log in `dir`. Call [`LogStore::recover_from`] before appending.
+    /// Opens (or creates) a log in `dir`, locking it for this handle. Call [`LogStore::recover_from`]
+    /// before appending. Fails with [`StorageError::Locked`] while another handle has it open.
     pub fn open(dir: impl Into<PathBuf>, options: FileLogOptions) -> Result<FileLog, StorageError> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("LOCK"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(StorageError::Locked(dir.display().to_string()));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
         Ok(FileLog {
+            _lock: lock,
             dir,
             options,
             current: None,
@@ -293,8 +312,22 @@ mod tests {
         // Appending after recovery continues the same log.
         log.append(&[record(100)]).unwrap();
         log.sync().unwrap();
+        drop(log);
         let mut log = FileLog::open(&dir, options).unwrap();
         assert_eq!(log.recover().unwrap().len(), 101);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_handle_cannot_open_a_log_in_use() {
+        let dir = temp_dir();
+        let first = FileLog::open(&dir, FileLogOptions::default()).unwrap();
+        assert!(matches!(
+            FileLog::open(&dir, FileLogOptions::default()),
+            Err(StorageError::Locked(_))
+        ));
+        drop(first);
+        FileLog::open(&dir, FileLogOptions::default()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -318,6 +351,7 @@ mod tests {
         assert_eq!(log.recover().unwrap(), vec![record(1), record(2)]);
         log.append(&[record(4)]).unwrap();
         log.sync().unwrap();
+        drop(log);
         let mut log = FileLog::open(&dir, FileLogOptions::default()).unwrap();
         assert_eq!(
             log.recover().unwrap(),
@@ -369,6 +403,7 @@ mod tests {
         let tail = log.recover_from(40).unwrap();
         assert_eq!(tail, (40..60).map(record).collect::<Vec<_>>());
         assert_eq!(log.next_lsn(), 60);
+        drop(log);
         // Asking for trimmed records, or for more than the log holds, is an error.
         assert!(matches!(
             FileLog::open(&dir, options).unwrap().recover_from(0),
