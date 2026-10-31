@@ -1,17 +1,20 @@
 # Brand
 
-The mark is an aqueduct in three tiers of arches, like the
-[Pont du Gard](https://en.wikipedia.org/wiki/Pont_du_Gard): two great arches, four above them, eight at
-the top, so that each arch carries two above it. A straight channel of water runs along the top: the canal,
-the procedure that carries what was found. A river winds through the lowest arches: the rugged world that
-agents explore. It is the essay *The River and the Canal* in one picture.
+The mark is a fractal arch: one arch carrying two, each carrying two, the line thinning as the arches get
+smaller, all standing on a line of water. Each pair shares its parent's piers, as in a real arcade. It is the
+Pont du Gard reduced to its idea (a structure that carries, repeated at every scale), and the thread that runs
+through the essay *The River and the Canal*: the same loop at every scale. The line of water underneath is
+what the structure exists to carry.
+
+The wordmark is "aqueduct" in lowercase Syne.
 
 | File | Use |
 |---|---|
-| `aqueduct-icon.svg` | the icon: the mark on a dark tile, rounded |
+| `aqueduct-icon.svg` | the icon: the mark on a night tile, rounded |
 | `aqueduct-icon-square.svg` | the same, square, for home-screen icons (the OS rounds them) |
 | `aqueduct-mark-light.svg`, `aqueduct-mark-dark.svg` | the mark alone: light for dark backgrounds, dark for light ones |
-| `aqueduct-wordmark-light.svg`, `aqueduct-wordmark-dark.svg` | "aqueduct" in Geist, as paths |
+| `aqueduct-mark-mono-light.svg`, `aqueduct-mark-mono-dark.svg` | the mark in one colour, for print, stamps and embroidery |
+| `aqueduct-wordmark-light.svg`, `aqueduct-wordmark-dark.svg` | "aqueduct" in Syne Bold, as paths |
 | `aqueduct-lockup-light.svg`, `aqueduct-lockup-dark.svg` | the mark and the wordmark together |
 | `aqueduct-168.png` | the icon at 168 px, for project cards |
 | `aqueduct-180.png`, `aqueduct-192.png`, `aqueduct-512.png` | square icons for home screens and stores |
@@ -20,21 +23,32 @@ agents explore. It is the essay *The River and the Canal* in one picture.
 
 | Token | Hex | Role |
 |---|---|---|
-| Night | `#0f1419` | the tile; the mark and the wordmark on light backgrounds |
-| Stone | `#e8d6ae` | limestone: the mark and the wordmark on dark backgrounds |
-| Channel | `#5db4e8` | the water carried along the top |
-| River | `#2f7fbf` | the river below |
+| Night | `#0b0f14` | the tile; the mark and wordmark on light backgrounds |
+| Bone | `#f2efe8` | the mark and wordmark on dark backgrounds |
+| Water | `#5ee7df` → `#3b82f6` | the line of water, a left-to-right gradient: the brand's signature |
+
+The mark always works in one colour too (the `mono` files): the water line then takes the colour of the
+arches.
 
 ## Type
 
-Geist (SIL Open Font License, by Vercel), bundled in `fonts/` with its licence. The wordmark is set in
-lowercase at weight 540 and converted to paths, so it needs no font where it is shown.
+[Syne](https://gitlab.com/bonjour-monde/fonderie/syne-typeface) (SIL Open Font License, by Bonjour Monde),
+bundled in `fonts/` with its licence. The wordmark is set in lowercase at weight 700 with tracking of
+−0.02 em, and converted to paths, so it needs no font where it is shown.
+
+In the lockup the mark is 1.65 x-heights tall, centred on the x-height, and set a third of its width away
+from the word.
+
+## Small sizes
+
+The mark has three levels of arches. At 16 px the smallest arches merge into texture while the silhouette
+(the great arch on its line of water) stays clear.
 
 ## Regenerating
 
 ```sh
-python3 scripts/brand.py     # needs fontTools (pip install fonttools brotli) and ImageMagick
+python3 scripts/brand.py     # needs fontTools (pip install fonttools) and Google Chrome for the PNGs
 ```
 
-The marks are drawn in code, so changing a colour, the number of arches or the proportions is a change to
+The marks are drawn in code, so a colour, a line weight or the number of levels is a change to
 `scripts/brand.py`, and every file follows.
