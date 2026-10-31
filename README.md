@@ -17,29 +17,6 @@
 > retries and checkpoints, survives `kill -9`, and is tested by a deterministic simulator on every change.
 > See the [build brief](BRIEF.md) and the [decision records](docs/adr/).
 
-## Try the simulator
-
-```sh
-cargo xtask sim --seeds 10000   # every seed injects crashes, torn writes, fsync failures and lossy networks
-cargo xtask sim --seed 42       # reproduce one seed exactly
-cargo xtask crash --kills 1000  # SIGKILL a log writer at random moments; no acknowledged record may be lost
-cargo xtask crash-engine        # SIGKILL the embedded engine mid-run; every acknowledged run must end correctly
-cargo xtask fsync               # measure fsync latency and group commit throughput on this machine
-```
-
-## Inspect a data directory
-
-With the engine stopped, the `aqueduct` command line reads an embedded engine's data directory:
-
-```sh
-cargo run -p aqueduct-cli -- runs ./data                     # every run: workflow, status, journal length
-cargo run -p aqueduct-cli -- describe ./data order-1         # status, input, output, each command and its attempts
-cargo run -p aqueduct-cli -- journal ./data order-1          # the journal, entry by entry
-cargo run -p aqueduct-cli -- verify ./data                   # check every hash chain, print each run's head
-cargo run -p aqueduct-cli -- export ./data order-1           # the journal as JSON Lines
-cargo run -p aqueduct-cli -- replay ./data order-1 new.star  # would this procedure version diverge from the run?
-```
-
 ## The idea
 
 Agents are good at exploring: unfamiliar systems, ambiguous documents, cases nobody has seen before.
@@ -57,15 +34,107 @@ record anyone can check afterwards. Aqueduct is built for the hand-over between 
 Engineers who need full expressive power write **code workflows** in Rust instead; both share one engine,
 one journal format and one set of guarantees.
 
-## Planned guarantees
+## Quick start
 
-- Acknowledged work is never lost; a step's result is recorded exactly once.
-- Procedures are deterministic by construction; code workflows are checked by replay.
-- Histories are tamper-evident, exportable and specified independently of the code.
-- The same semantics embedded, on a single server and in a cluster.
-- The whole engine is tested by deterministic simulation with fault injection in CI.
+Aqueduct is not on crates.io yet; depend on the repository:
 
-See [BRIEF.md](BRIEF.md) for the full design and the phased plan.
+```toml
+[dependencies]
+aqueduct = { git = "https://github.com/raskell-io/aqueduct" }
+```
+
+A workflow is an ordinary `async fn`. Everything it does with the world goes through its context, so the
+engine can journal it and replay it after a crash:
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use aqueduct::embedded::{Attempt, Engine};
+use aqueduct::{Payload, WorkflowContext, WorkflowError, workflow};
+
+async fn onboard(ctx: WorkflowContext, user: String) -> Result<String, WorkflowError> {
+    let account: String = ctx.step("create_account", &user).await?; // runs at least once, recorded once
+    ctx.sleep(Duration::from_secs(5)).await;                         // durable: survives restarts
+    ctx.step("send_welcome", &account).await
+}
+
+let engine = Engine::builder("./quickstart-data")
+    .workflow("onboard", Arc::new(workflow(onboard)))
+    .step("create_account", |user: &Payload| Attempt::Completed(/* ... */))
+    .step("send_welcome", |account: &Payload| Attempt::Completed(/* ... */))
+    .open()?;
+engine.start("onboard:ada", "onboard", Payload::new(br#""ada""#.to_vec()))?; // idempotent per key
+let result = engine.wait("onboard:ada", Duration::from_secs(60))?;
+```
+
+The complete program is [`crates/aqueduct/examples/quickstart.rs`](crates/aqueduct/examples/quickstart.rs).
+Run it, kill it during the sleep, and run it again: the run continues where it stopped, and the sleep ends
+at its original time.
+
+```sh
+cargo run -p aqueduct --example quickstart
+```
+
+The same engine runs **procedures**: hermetic Starlark scripts that an agent can write and a person can
+review ([ADR 0008](docs/adr/0008-procedure-language-starlark.md)):
+
+```python
+def run(claim):
+    docs = agent("classify_documents", claim["documents"], prompt = "prompts/classify.md", budget_tokens = 20000)
+    if docs["missing_photos"]:
+        step("notify.customer", {"template": "missing-photos", "to": claim["customer"]})
+        photos = wait(signal("photos_received"), timeout = days(14))
+        if photos == None:
+            escalate("no-photos", claim)
+    return step("claims.settle", claim)
+```
+
+Register it with `.workflow("claims", Arc::new(aqueduct::Procedure::compile("claims.star", source)?))`.
+
+## Guarantees
+
+What holds today, for the embedded engine, and how it is checked:
+
+- **Acknowledged work is never lost.** A start, a signal or a step result is acknowledged only after it is
+  durable. Checked by the simulator (crashes, torn writes, failed fsyncs) and by killing the engine with
+  `kill -9` at random moments, including during its first start.
+- **A step's result is recorded exactly once**, although a step may run more than once (at least once
+  execution), so steps with side effects should be idempotent.
+- **Determinism:** procedures are deterministic by construction; Rust workflows are checked by replay, and
+  a run whose code changed under it is parked, never silently corrupted.
+- **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
+  once per signal id.** **Retries** follow a policy with journaled backoff.
+- **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the
+  code ([history format](docs/history-format.md)).
+
+Planned: the same semantics on a single server and in a replicated cluster, agent steps with budgets, and
+the procedure lifecycle (proposal, replay against past cases, approval, retirement). The full design and
+phased plan are in [BRIEF.md](BRIEF.md).
+
+## Testing it yourself
+
+```sh
+cargo xtask sim --seeds 10000                    # deterministic simulation: crashes, torn writes, fsync failures, lossy networks
+cargo xtask sim --seeds 2000 --workload timers   # workloads: native, starlark, timers, rust
+cargo xtask sim --seed 42 --workload rust        # reproduce one seed exactly
+cargo xtask crash --kills 1000                   # SIGKILL a log writer; no acknowledged record may be lost
+cargo xtask crash-engine --kills 200             # SIGKILL the engine mid-run; every acknowledged run must end correctly
+cargo xtask crash-engine --startup --kills 300   # SIGKILL brand-new engines while they create their files
+cargo xtask fsync                                # fsync latency and group commit throughput on this machine
+```
+
+## Inspecting a data directory
+
+With the engine stopped, the `aqueduct` command line reads its data directory:
+
+```sh
+cargo run -p aqueduct-cli -- runs ./quickstart-data                   # every run: workflow, status, journal length
+cargo run -p aqueduct-cli -- describe ./quickstart-data onboard:ada   # status, input, output, each command and its attempts
+cargo run -p aqueduct-cli -- journal ./quickstart-data onboard:ada    # the journal, entry by entry
+cargo run -p aqueduct-cli -- verify ./quickstart-data                 # check every hash chain, print each run's head
+cargo run -p aqueduct-cli -- export ./quickstart-data onboard:ada     # the journal as JSON Lines
+cargo run -p aqueduct-cli -- replay ./data claim-7 claims-v2.star     # would this procedure version diverge from the run?
+```
 
 ## The name and the mark
 

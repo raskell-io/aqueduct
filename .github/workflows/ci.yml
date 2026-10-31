@@ -26,6 +26,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test --workspace --doc
+      - run: cargo run --release -p aqueduct --example quickstart
 
   sim:
     name: simulation
