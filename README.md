@@ -56,4 +56,7 @@ your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this
 project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
-additional terms or conditions. See [CONTRIBUTING.md](CONTRIBUTING.md).
+additional terms or conditions. Contributions require signing the [Contributor License Agreement](CLA.md);
+see [CONTRIBUTING.md](CONTRIBUTING.md). The name is covered by the [trademark policy](TRADEMARKS.md),
+and the [history format specification](docs/history-format.md) is licensed under CC-BY-4.0 so that anyone
+can implement it.
