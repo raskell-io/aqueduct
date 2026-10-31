@@ -26,6 +26,11 @@ impl Status {
 /// The error of a signal wait whose timeout fired.
 pub const TIMED_OUT: &str = "timed out";
 
+/// The error of a command that a cancellation completed: `cancelled: <reason>`.
+pub fn cancelled_error(reason: &str) -> String {
+    format!("cancelled: {reason}")
+}
+
 /// What kind of command a scheduled command is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandKind {
@@ -64,6 +69,8 @@ pub struct ScheduledStep {
     pub failed_attempts: u32,
     /// When the next attempt is due, while a retry is pending (milliseconds since the Unix epoch).
     pub retry_at: Option<u64>,
+    /// Whether a cancellation completed this command (its outcome is then a failure).
+    pub cancelled: bool,
 }
 
 impl ScheduledStep {
@@ -109,6 +116,11 @@ pub enum Event {
     TimerFired {
         /// The command whose timer is due.
         cmd: CommandIndex,
+    },
+    /// Someone asked the run to stop. Only the first cancellation counts.
+    Cancel {
+        /// Why.
+        reason: String,
     },
     /// A signal was sent to the run.
     Signal {
@@ -213,6 +225,9 @@ pub enum JournalError {
     /// A completion does not fit the kind of its command (for example, a timer for a step).
     #[error("completion of the wrong kind for command {0}")]
     InvalidCompletion(CommandIndex),
+    /// `CancelRequested` occurs more than once.
+    #[error("the run is cancelled more than once")]
+    DuplicateCancel,
 }
 
 /// The state of one run: by definition, the fold of its journal.
@@ -228,6 +243,10 @@ pub struct RunState {
     output: Option<Payload>,
     error: Option<String>,
     entries: usize,
+    /// The cancellation's reason, once one is recorded.
+    cancel: Option<String>,
+    /// A cancellation found no pending command; the next waiting command takes it.
+    pending_cancel: bool,
 }
 
 impl RunState {
@@ -248,6 +267,8 @@ impl RunState {
             output: None,
             error: None,
             entries: 1,
+            cancel: None,
+            pending_cancel: false,
         };
         for entry in rest {
             state.apply(entry)?;
@@ -267,6 +288,23 @@ impl RunState {
             Entry::Started { .. } => return Err(JournalError::DuplicateStart),
             Entry::StepScheduled { cmd, name, input } => {
                 self.push_command(*cmd, name, input.clone(), CommandKind::Step)?;
+            }
+            Entry::CancelRequested { reason } => {
+                if self.cancel.is_some() {
+                    return Err(JournalError::DuplicateCancel);
+                }
+                let pending: Vec<CommandIndex> = self
+                    .steps
+                    .iter()
+                    .zip(0u32..)
+                    .filter(|(step, _)| step.outcome.is_none())
+                    .map(|(_, index)| CommandIndex(index))
+                    .collect();
+                self.pending_cancel = pending.is_empty();
+                self.cancel = Some(reason.clone());
+                for cmd in pending {
+                    self.cancel_command(cmd)?;
+                }
             }
             Entry::TimerStarted {
                 cmd,
@@ -290,7 +328,12 @@ impl RunState {
                     wake_at: *wake_at,
                 };
                 self.push_command(*cmd, name, Payload::default(), kind)?;
-                if let Some(position) = self.buffered_signals.iter().position(|(n, _)| n == name) {
+                let cancelled = self.command(*cmd)?.cancelled;
+                if let Some(position) = self
+                    .buffered_signals
+                    .iter()
+                    .position(|(n, _)| n == name && !cancelled)
+                {
                     let (_, payload) = self.buffered_signals.remove(position);
                     self.record(*cmd, StepOutcome::Completed(payload))?;
                 }
@@ -392,6 +435,15 @@ impl RunState {
                 retry_after_ms,
             } => self.handle_attempt_failed(cmd, error, retry_after_ms, now_ms),
             Event::Signal { name, id, payload } => self.handle_signal(name, id, payload),
+            Event::Cancel { reason } => {
+                if self.cancel.is_some() {
+                    return Transition::none();
+                }
+                Transition {
+                    entries: vec![Entry::CancelRequested { reason }],
+                    effects: vec![Effect::Activate],
+                }
+            }
         }
     }
 
@@ -492,6 +544,11 @@ impl RunState {
         self.error.as_deref()
     }
 
+    /// The cancellation's reason, if the run was cancelled.
+    pub fn cancel_reason(&self) -> Option<&str> {
+        self.cancel.as_deref()
+    }
+
     /// The number of journal entries applied.
     pub fn len(&self) -> usize {
         self.entries
@@ -529,7 +586,22 @@ impl RunState {
             outcome: None,
             failed_attempts: 0,
             retry_at: None,
+            cancelled: false,
         });
+        // A cancellation that found nothing pending is taken by the next command that waits.
+        if self.pending_cancel && kind != CommandKind::Recorded {
+            self.pending_cancel = false;
+            self.cancel_command(cmd)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_command(&mut self, cmd: CommandIndex) -> Result<(), JournalError> {
+        let reason = cancelled_error(self.cancel.as_deref().unwrap_or_default());
+        self.record(cmd, StepOutcome::Failed(reason))?;
+        let index = self.index(cmd)?;
+        self.steps[index].cancelled = true;
+        self.steps[index].retry_at = None;
         Ok(())
     }
 
@@ -681,6 +753,8 @@ impl RunState {
         let total = commands.len();
         let mut transition = Transition::none();
         let mut steps_seen = 0usize;
+        // A cancellation waiting for the next command: that command is recorded but never started.
+        let mut cancel_next = self.pending_cancel;
         // Signals already received that new waits in this decision will take, by name.
         let mut buffered: Vec<&str> = self
             .buffered_signals
@@ -721,6 +795,7 @@ impl RunState {
                     outcome: None,
                     failed_attempts: 0,
                     retry_at: None,
+                    cancelled: false,
                 };
                 if let Some(recorded) = self.steps.get(steps_seen) {
                     if !same_command(recorded, &issued) {
@@ -740,6 +815,39 @@ impl RunState {
                         return Transition::park("too many commands in one run".into());
                     };
                     let cmd = CommandIndex(index);
+                    if cancel_next && issued.kind != CommandKind::Recorded {
+                        cancel_next = false;
+                        transition.entries.push(match issued.kind {
+                            CommandKind::Step => Entry::StepScheduled {
+                                cmd,
+                                name: issued.name,
+                                input: issued.input,
+                            },
+                            CommandKind::Sleep {
+                                duration_ms,
+                                wake_at,
+                            } => Entry::TimerStarted {
+                                cmd,
+                                duration_ms,
+                                wake_at,
+                            },
+                            CommandKind::Signal {
+                                timeout_ms,
+                                wake_at,
+                            } => Entry::SignalAwaited {
+                                cmd,
+                                name: issued.name,
+                                timeout_ms,
+                                wake_at,
+                            },
+                            CommandKind::Recorded => continue,
+                        });
+                        if !transition.effects.contains(&Effect::Activate) {
+                            transition.effects.push(Effect::Activate);
+                        }
+                        steps_seen += 1;
+                        continue;
+                    }
                     match issued.kind {
                         CommandKind::Step => {
                             transition.entries.push(Entry::StepScheduled {

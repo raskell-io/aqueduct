@@ -129,3 +129,37 @@ fn a_sleep_survives_a_restart_and_wakes_at_its_original_time() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_cancelled_procedure_fails_with_the_reason() {
+    let source = r#"
+def run(input):
+    sleep(60)
+    return step("never", input)
+"#;
+    let dir = std::env::temp_dir().join(format!("aqueduct-cancel-proc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine = aqueduct_engine::embedded::Engine::builder(&dir)
+        .workflow(
+            "p",
+            std::sync::Arc::new(aqueduct_procedure::Procedure::compile("p.star", source).unwrap()),
+        )
+        .open()
+        .unwrap();
+    engine
+        .start("r", "p", aqueduct_core::Payload::new(*b"1"))
+        .unwrap();
+    engine.cancel("r", "no longer needed").unwrap();
+    let done = engine
+        .wait("r", std::time::Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(
+        (done.status, done.error.as_deref()),
+        (
+            aqueduct_core::Status::Failed,
+            Some("cancelled: no longer needed")
+        )
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

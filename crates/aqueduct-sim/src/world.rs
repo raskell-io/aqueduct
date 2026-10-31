@@ -54,6 +54,12 @@ enum Ev {
     ClientSignalAck {
         key: String,
     },
+    NodeCancel {
+        key: String,
+    },
+    ClientCancelAck {
+        key: String,
+    },
     TimerTick {
         incarnation: u64,
     },
@@ -98,6 +104,8 @@ impl Ev {
             Ev::NodeAttemptFailed { .. } => 15,
             Ev::WorkerAttemptAck { .. } => 16,
             Ev::CheckpointTick { .. } => 17,
+            Ev::NodeCancel { .. } => 18,
+            Ev::ClientCancelAck { .. } => 19,
         }
     }
 
@@ -111,6 +119,8 @@ impl Ev {
                 | Ev::WorkerResultAck { .. }
                 | Ev::NodeSignal { .. }
                 | Ev::ClientSignalAck { .. }
+                | Ev::NodeCancel { .. }
+                | Ev::ClientCancelAck { .. }
                 | Ev::NodeAttemptFailed { .. }
                 | Ev::WorkerAttemptAck { .. }
         )
@@ -136,6 +146,9 @@ struct World<'c> {
     acked_results: BTreeSet<(String, CommandIndex)>,
     /// Runs whose `go` signal the client saw acknowledged.
     acked_signals: BTreeSet<String>,
+    /// Runs the client cancels, and those whose cancellation it saw acknowledged (never lost).
+    to_cancel: BTreeSet<String>,
+    acked_cancels: BTreeSet<String>,
     /// Timer firings (run, journal position) already checked against their wake time.
     checked_timers: BTreeSet<(String, usize)>,
     /// Results the worker holds and resends until acknowledged.
@@ -196,6 +209,8 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         acked_starts: BTreeSet::new(),
         acked_results: BTreeSet::new(),
         acked_signals: BTreeSet::new(),
+        to_cancel: BTreeSet::new(),
+        acked_cancels: BTreeSet::new(),
         checked_timers: BTreeSet::new(),
         worker_pending: BTreeMap::new(),
         executions: BTreeMap::new(),
@@ -206,6 +221,12 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         },
     };
     world.node.forget_dirty_runs = config.bugs.checkpoint_forgets_recovered_runs;
+    if config.cancel_every > 0 {
+        world.to_cancel = (0..config.runs)
+            .filter(|i| i % config.cancel_every == config.cancel_every - 1)
+            .map(|i| format!("run-{i}"))
+            .collect();
+    }
     world.run().map_err(|message| Failure {
         seed,
         workload: config.workload,
@@ -349,6 +370,15 @@ impl World<'_> {
                     self.after_node_event();
                 }
             }
+            Ev::ClientCancelAck { key } => {
+                self.acked_cancels.insert(key);
+            }
+            Ev::NodeCancel { key } => {
+                if self.node.up {
+                    self.node.on_cancel(&key)?;
+                    self.after_node_event();
+                }
+            }
             Ev::CheckpointTick { incarnation } => {
                 if self.node.up && incarnation == self.node.incarnation {
                     if self.node.checkpoint()? {
@@ -380,8 +410,18 @@ impl World<'_> {
                 } else {
                     Vec::new()
                 };
+                // Cancel some runs once started, at a random moment, until acknowledged.
+                let uncancelled: Vec<String> = self
+                    .to_cancel
+                    .iter()
+                    .filter(|key| {
+                        self.acked_starts.contains(*key) && !self.acked_cancels.contains(*key)
+                    })
+                    .cloned()
+                    .collect();
                 let pending = !missing.is_empty()
                     || !unsignalled.is_empty()
+                    || self.acked_cancels.len() < self.to_cancel.len()
                     || (self.workload.signals && self.acked_signals.len() < self.wanted.len());
                 for (key, input) in missing {
                     self.send(Ev::NodeStart { key, input });
@@ -389,6 +429,11 @@ impl World<'_> {
                 for key in unsignalled {
                     if self.rng.chance(400_000) {
                         self.send(Ev::NodeSignal { key });
+                    }
+                }
+                for key in uncancelled {
+                    if self.rng.chance(300_000) {
+                        self.send(Ev::NodeCancel { key });
                     }
                 }
                 if pending {
@@ -476,6 +521,7 @@ impl World<'_> {
             let ev = match message {
                 Outbound::Started { key } => Ev::ClientStartAck { key },
                 Outbound::Signaled { key } => Ev::ClientSignalAck { key },
+                Outbound::Cancelled { key } => Ev::ClientCancelAck { key },
                 Outbound::Dispatch {
                     key,
                     cmd,
@@ -542,6 +588,15 @@ impl World<'_> {
         for key in &self.acked_starts {
             if !self.node.runs().contains_key(key) {
                 return Err(format!("lost acknowledged start of {key}"));
+            }
+        }
+        for key in &self.acked_cancels {
+            let Some(run) = self.node.runs().get(key) else {
+                return Err(format!("lost run {key} with an acknowledged cancellation"));
+            };
+            // A cancellation of a run that had already ended is dropped, as specified.
+            if run.state().cancel_reason().is_none() && !run.state().status().is_terminal() {
+                return Err(format!("lost acknowledged cancellation of {key}"));
             }
         }
         for key in &self.acked_signals {
@@ -622,6 +677,7 @@ impl World<'_> {
             && !self.node.needs_flush()
             && self.acked_starts.len() == self.wanted.len()
             && (!self.workload.signals || self.acked_signals.len() == self.wanted.len())
+            && self.acked_cancels.len() == self.to_cancel.len()
             && self.wanted.iter().all(|(key, _)| {
                 self.node
                     .runs()
@@ -639,7 +695,15 @@ impl World<'_> {
                 run.journal().iter().filter(|e| f(e)).count()
             };
             let received = count(|e| matches!(e, aqueduct_core::Entry::SignalReceived { .. }));
-            let waited = count(|e| matches!(e, aqueduct_core::Entry::SignalAwaited { .. }));
+            // A wait that a cancellation completed takes no signal.
+            let waited = run
+                .state()
+                .steps()
+                .iter()
+                .filter(|s| {
+                    matches!(s.kind, aqueduct_core::CommandKind::Signal { .. }) && !s.cancelled
+                })
+                .count();
             if received > 1 || received < waited {
                 return Err(format!(
                     "run {key} recorded {received} signals and waited for {waited}"
@@ -680,12 +744,36 @@ impl World<'_> {
                     state.error().unwrap_or_default()
                 ));
             }
-            let expected = workflow::reference(&self.workload, input)?;
             let actual = (
                 state.status(),
                 state.output().cloned(),
                 state.error().map(str::to_owned),
             );
+            let expected = workflow::reference(&self.workload, input)?;
+            // A run cancelled while it was running fails with the reason, after undoing its work, unless
+            // the cancellation only reached what the run no longer depended on (a compensation, which is
+            // issued again); then it ends as the reference says.
+            if state.cancel_reason().is_some() {
+                if !self.to_cancel.contains(key) {
+                    return Err(format!("run {key} was cancelled, but nobody cancelled it"));
+                }
+                let cancelled = (
+                    Status::Failed,
+                    None,
+                    Some(aqueduct_core::cancelled_error(workflow::CANCEL_REASON)),
+                );
+                if actual != cancelled && actual != expected {
+                    return Err(format!(
+                        "cancelled run {key} ended as {actual:?}, expected {cancelled:?} or {expected:?}"
+                    ));
+                }
+                match state.status() {
+                    _ if actual == cancelled => self.report.cancelled += 1,
+                    Status::Completed => self.report.completed += 1,
+                    _ => self.report.failed += 1,
+                }
+                continue;
+            }
             if actual != expected {
                 return Err(format!(
                     "run {key} ended as {actual:?}, the reference says {expected:?}"

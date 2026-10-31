@@ -25,8 +25,9 @@ commands:
                                       send a signal; with an id, sending it again records it once
   complete-awakeable <dir> <id> <json>
                                       complete an awakeable with a payload
+  cancel <dir> <key> [<reason>]       ask a run to stop: what it waits for fails as cancelled
 
-Signals and completions are durable when the command returns; the run continues when the engine
+Signals, completions and cancellations are durable when the command returns; the run continues when the engine
 next opens the directory.
 ";
 
@@ -73,6 +74,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
                     1,
                 )
             })
+        }
+        Some("cancel") => {
+            let key = arg(2, "run key")?;
+            let reason = args
+                .get(3)
+                .map_or("cancelled from the command line", String::as_str);
+            let mut partition = load(Path::new(arg(1, "data directory")?))?;
+            partition.cancel(key, reason).map_err(|e| e.to_string())?;
+            partition.flush().map_err(|e| e.to_string())?;
+            Ok(format!("cancellation of {key} recorded\n"))
         }
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     }
@@ -309,6 +320,7 @@ fn describe_entry(entry: &Entry) -> String {
         Entry::RunCompleted { output } => format!("run completed with {}", text(output)),
         Entry::RunFailed { error } => format!("run failed: {error}"),
         Entry::Parked { reason } => format!("run parked: {reason}"),
+        Entry::CancelRequested { reason } => format!("cancel requested: {reason}"),
     }
 }
 
@@ -377,6 +389,7 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         }
         Entry::RunFailed { error } => json!({"kind": "RunFailed", "error": error}),
         Entry::Parked { reason } => json!({"kind": "Parked", "reason": reason}),
+        Entry::CancelRequested { reason } => json!({"kind": "CancelRequested", "reason": reason}),
     }
 }
 

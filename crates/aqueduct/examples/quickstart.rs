@@ -10,7 +10,7 @@ use aqueduct::{Payload, WorkflowContext, WorkflowError, workflow};
 /// A workflow is an ordinary async function. Everything it does with the world goes through `ctx`.
 async fn onboard(ctx: WorkflowContext, user: String) -> Result<String, WorkflowError> {
     let account: String = ctx.step("create_account", &user).await?; // runs at least once, recorded once
-    ctx.sleep(Duration::from_secs(5)).await; // durable: a restart does not start it again
+    ctx.sleep(Duration::from_secs(5)).await?; // durable: a restart does not start it again
     let note: String = ctx.step("send_welcome", &account).await?;
     Ok(note)
 }

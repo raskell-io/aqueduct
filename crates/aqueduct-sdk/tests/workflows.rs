@@ -47,7 +47,7 @@ async fn ship(ctx: WorkflowContext, order: Order) -> Result<Shipped, WorkflowErr
     if !approved {
         return Err(WorkflowError::failed("not approved"));
     }
-    ctx.sleep(Duration::from_millis(300)).await;
+    ctx.sleep(Duration::from_millis(300)).await?;
     let (label, _) = join(
         ctx.step::<String, _>("label", &order.id),
         ctx.step::<(), _>("notify", &order.id),
@@ -389,7 +389,7 @@ mod select_and_awakeables {
             .await
             {
                 Either::Left(done) => done,
-                Either::Right(()) => Ok("gave up".into()),
+                Either::Right(slept) => slept.map(|()| "gave up".into()),
             }
         }
         let decider = workflow(bounded);
@@ -413,7 +413,7 @@ mod select_and_awakeables {
             let _: () = ctx.step("send_link", &(user, id)).await?;
             match select(decision, ctx.sleep(Duration::from_secs(30))).await {
                 Either::Left(decision) => decision,
-                Either::Right(()) => Ok("expired".into()),
+                Either::Right(slept) => slept.map(|()| "expired".into()),
             }
         }
         let links: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -561,4 +561,123 @@ mod sagas {
             "{error}"
         );
     }
+}
+
+#[test]
+fn a_cancelled_run_undoes_its_work_and_fails() {
+    use std::sync::Mutex;
+
+    async fn booking(ctx: WorkflowContext, _: ()) -> Result<String, WorkflowError> {
+        let mut saga = ctx.saga();
+        let result = async {
+            saga.step::<(), _, _>("hold_room", &"r-1", "release_room", &"r-1")
+                .await?;
+            ctx.sleep(Duration::from_secs(30)).await?; // the guest has 30 seconds to confirm
+            ctx.step::<String, _>("confirm", &"r-1").await
+        }
+        .await;
+        match result {
+            Ok(done) => Ok(done),
+            Err(error) => Err(saga.abort(error).await),
+        }
+    }
+    let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let dir = std::env::temp_dir().join(format!("aqueduct-sdk-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (c1, c2, c3) = (Arc::clone(&calls), Arc::clone(&calls), Arc::clone(&calls));
+    let engine = Engine::builder(&dir)
+        .workflow("booking", Arc::new(workflow(booking)))
+        .step("hold_room", move |_: &Payload| {
+            c1.lock().unwrap().push("hold".into());
+            StepOutcome::Completed(json("null"))
+        })
+        .step("release_room", move |_: &Payload| {
+            c2.lock().unwrap().push("release".into());
+            StepOutcome::Completed(json("null"))
+        })
+        .step("confirm", move |_: &Payload| {
+            c3.lock().unwrap().push("confirm".into());
+            StepOutcome::Completed(json("\"confirmed\""))
+        })
+        .open()
+        .unwrap();
+    engine.start("b-1", "booking", json("null")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while calls.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50)); // into the sleep
+    let started = Instant::now();
+    engine.cancel("b-1", "guest left").unwrap();
+    engine.cancel("b-1", "again").unwrap(); // acknowledged, ignored
+    let done = engine.wait("b-1", Duration::from_secs(10)).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the sleep did not run out"
+    );
+    assert_eq!(done.status, Status::Failed);
+    assert_eq!(done.error.as_deref(), Some("cancelled: guest left"));
+    assert_eq!(*calls.lock().unwrap(), ["hold", "release"]);
+    assert!(matches!(
+        engine.cancel("nobody", "x"),
+        Err(aqueduct_engine::embedded::EngineError::UnknownRun(_))
+    ));
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_cancellation_does_not_skip_a_compensation() {
+    use aqueduct_core::CommandIndex;
+
+    async fn undo_on_failure(ctx: WorkflowContext, _: ()) -> Result<(), WorkflowError> {
+        let mut saga = ctx.saga();
+        saga.step::<(), _, _>("do", &1, "undo", &1).await?;
+        match ctx.step::<(), _>("check", &2).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(saga.abort(error).await),
+        }
+    }
+    let decider = workflow(undo_on_failure);
+    let mut state = RunState::from_journal(&start("w", json("null")).entries).unwrap();
+    let mut handle = |state: &mut RunState, event: Event| {
+        let transition = state.handle(event);
+        for entry in &transition.entries {
+            state.apply(entry).unwrap();
+        }
+        transition.effects
+    };
+    let activate = |state: &mut RunState,
+                    handle: &mut dyn FnMut(&mut RunState, Event) -> Vec<_>| {
+        let commands = decider.decide(&state.view());
+        handle(state, Event::Decision(commands))
+    };
+    let done = |cmd, outcome| Event::StepResult {
+        cmd: CommandIndex(cmd),
+        outcome,
+    };
+    activate(&mut state, &mut handle);
+    handle(&mut state, done(0, StepOutcome::Completed(json("null"))));
+    activate(&mut state, &mut handle);
+    handle(&mut state, done(1, StepOutcome::Failed("bad".into())));
+    activate(&mut state, &mut handle); // issues `undo` (command 2)
+    // The cancellation arrives while `undo` runs: it is cancelled, then issued again and dispatched.
+    handle(
+        &mut state,
+        Event::Cancel {
+            reason: "stop".into(),
+        },
+    );
+    let effects = activate(&mut state, &mut handle);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, aqueduct_core::Effect::DispatchStep { cmd: CommandIndex(3), name, .. } if name == "undo")),
+        "{effects:?}"
+    );
+    handle(&mut state, done(3, StepOutcome::Completed(json("null"))));
+    activate(&mut state, &mut handle);
+    assert_eq!(state.status(), Status::Failed);
+    assert_eq!(state.error(), Some("step `check` failed: bad"));
 }

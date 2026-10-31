@@ -209,8 +209,14 @@ impl Procedure {
 
 impl Decider for Procedure {
     fn decide(&self, view: &RunView<'_>) -> Vec<Command> {
+        let outcomes: Vec<Option<StepOutcome>> = view.outcomes().map(|o| o.cloned()).collect();
+        let cancelled = (0..outcomes.len())
+            .map(|index| view.cancelled(aqueduct_core::CommandIndex(index as u32)))
+            .collect();
         let installed = Installed::new(Activation {
-            outcomes: view.outcomes().map(|o| o.cloned()).collect(),
+            outcomes,
+            cancelled,
+            cancel_reason: view.cancel_reason().unwrap_or_default().to_owned(),
             ..Activation::default()
         });
         let result = self.activate(view.input());
@@ -219,7 +225,9 @@ impl Decider for Procedure {
         let terminal = match (result, activation.stop) {
             (Ok(output), _) => Some(Command::CompleteRun { output }),
             (Err(_), Some(Stop::Suspend)) => None,
-            (Err(_), Some(Stop::StepFailed(error))) => Some(Command::FailRun { error }),
+            (Err(_), Some(Stop::StepFailed(error) | Stop::Cancelled(error))) => {
+                Some(Command::FailRun { error })
+            }
             (Err(_), Some(Stop::Escalate(reason))) => Some(Command::FailRun {
                 error: format!("escalated: {reason}"),
             }),
@@ -242,6 +250,8 @@ enum Stop {
     StepFailed(String),
     /// The script escalated.
     Escalate(String),
+    /// The run was cancelled while the script waited for this call. Procedures cannot catch it.
+    Cancelled(String),
 }
 
 #[derive(Debug)]
@@ -263,6 +273,11 @@ fn classify(error: starlark::Error) -> ScriptError {
 #[derive(Debug, Default)]
 struct Activation {
     outcomes: Vec<Option<StepOutcome>>,
+    /// Which commands a cancellation completed.
+    cancelled: Vec<bool>,
+    cancel_reason: String,
+    /// The script reached a command that a cancellation completed.
+    cancel_hit: bool,
     commands: Vec<Command>,
     next: usize,
     stop: Option<Stop>,
@@ -283,14 +298,27 @@ impl Activation {
         let index = self.next;
         self.next += 1;
         self.commands.push(command);
+        if self.cancelled.get(index).copied().unwrap_or(false) {
+            // Looks pending to the script, so the rest of a `parallel` is still issued; when the
+            // script would wait, the run stops as cancelled instead (see `stop`).
+            self.cancel_hit = true;
+            return Ok(None);
+        }
         Ok(self.outcomes.get(index).cloned().flatten())
     }
 
     fn stop(&mut self, stop: Stop) -> anyhow::Error {
+        let stop = match stop {
+            Stop::Suspend if self.cancel_hit => {
+                Stop::Cancelled(aqueduct_core::cancelled_error(&self.cancel_reason))
+            }
+            other => other,
+        };
         let message = match &stop {
             Stop::Suspend => "suspended: waiting for a step".to_owned(),
             Stop::StepFailed(error) => format!("step failed: {error}"),
             Stop::Escalate(reason) => format!("escalated: {reason}"),
+            Stop::Cancelled(error) => error.clone(),
         };
         self.stop = Some(stop);
         anyhow::anyhow!(message)

@@ -54,7 +54,7 @@ use aqueduct::{Payload, WorkflowContext, WorkflowError, workflow};
 
 async fn onboard(ctx: WorkflowContext, user: String) -> Result<String, WorkflowError> {
     let account: String = ctx.step("create_account", &user).await?; // runs at least once, recorded once
-    ctx.sleep(Duration::from_secs(5)).await;                         // durable: survives restarts
+    ctx.sleep(Duration::from_secs(5)).await?;                        // durable: survives restarts
     ctx.step("send_welcome", &account).await
 }
 
@@ -84,7 +84,7 @@ let (id, decision) = ctx.awakeable::<bool>();
 ctx.step::<(), _>("ask_approver", &id).await?;            // hand the id to a person or a webhook
 let approved = match select(decision, ctx.sleep(Duration::from_secs(86_400))).await {
     Either::Left(decision) => decision?,
-    Either::Right(()) => false,                              // nobody answered within a day
+    Either::Right(slept) => slept.map(|()| false)?,        // nobody answered within a day
 };
 ```
 
@@ -108,6 +108,10 @@ match shipped {
     Err(error) => Err(saga.abort(error).await), // refund, then release
 }
 ```
+
+**Cancelling** a run (`engine.cancel(key, reason)`, or `aqueduct cancel` on a stopped engine's data
+directory) makes whatever it is waiting for fail with `WorkflowError::Cancelled`, so the same saga undoes
+the work and the run fails with the reason ([ADR 0018](docs/adr/0018-cancellation.md)).
 
 The same engine runs **procedures**: hermetic Starlark scripts that an agent can write and a person can
 review ([ADR 0008](docs/adr/0008-procedure-language-starlark.md)):

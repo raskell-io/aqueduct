@@ -156,6 +156,16 @@ impl Node {
         }
     }
 
+    pub fn on_cancel(&mut self, key: &str) -> Result<(), String> {
+        match self
+            .partition()?
+            .cancel(key, crate::workflow::CANCEL_REASON)
+        {
+            Ok(()) | Err(aqueduct_engine::PartitionError::UnknownRun(_)) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     pub fn fire_due_timers(&mut self) -> Result<(), String> {
         match self.partition.as_mut() {
             Some(partition) => partition.fire_due_timers().map_err(|e| e.to_string()),

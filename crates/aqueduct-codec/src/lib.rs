@@ -52,6 +52,7 @@ mod kind {
     pub const SIGNAL_RECEIVED: u8 = 11;
     pub const STEP_RETRY_SCHEDULED: u8 = 12;
     pub const VALUE_RECORDED: u8 = 13;
+    pub const CANCEL_REQUESTED: u8 = 14;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -142,6 +143,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::SignalReceived { .. } => kind::SIGNAL_RECEIVED,
         Entry::StepRetryScheduled { .. } => kind::STEP_RETRY_SCHEDULED,
         Entry::ValueRecorded { .. } => kind::VALUE_RECORDED,
+        Entry::CancelRequested { .. } => kind::CANCEL_REQUESTED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -165,7 +167,9 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         }
         Entry::RunCompleted { output } => put_bytes(&mut out, output.as_bytes()),
         Entry::RunFailed { error } => put_bytes(&mut out, error.as_bytes()),
-        Entry::Parked { reason } => put_bytes(&mut out, reason.as_bytes()),
+        Entry::Parked { reason } | Entry::CancelRequested { reason } => {
+            put_bytes(&mut out, reason.as_bytes());
+        }
         Entry::TimerStarted {
             cmd,
             duration_ms,
@@ -275,6 +279,9 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
             cmd: reader.cmd()?,
             name: reader.string()?,
             value: reader.payload()?,
+        },
+        kind::CANCEL_REQUESTED => Entry::CancelRequested {
+            reason: reader.string()?,
         },
         other => return Err(DecodeError::UnknownKind(other)),
     };

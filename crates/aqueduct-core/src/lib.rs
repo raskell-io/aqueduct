@@ -75,5 +75,5 @@ pub use decider::{Command, Decider, Env, RunView};
 pub use journal::{CommandIndex, Entry, IdempotencyKey, Payload, StepOutcome};
 pub use run::{
     CommandKind, Effect, Event, JournalError, RunState, ScheduledStep, Status, TIMED_OUT,
-    Transition, start,
+    Transition, cancelled_error, start,
 };

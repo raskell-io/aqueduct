@@ -27,6 +27,7 @@ fn entry() -> impl Strategy<Value = Entry> {
         payload().prop_map(|output| Entry::RunCompleted { output }),
         ".{0,12}".prop_map(|error| Entry::RunFailed { error }),
         ".{0,12}".prop_map(|reason| Entry::Parked { reason }),
+        ".{0,12}".prop_map(|reason| Entry::CancelRequested { reason }),
         (any::<u32>(), any::<u64>(), any::<u64>()).prop_map(|(cmd, duration_ms, wake_at)| {
             Entry::TimerStarted {
                 cmd: CommandIndex(cmd),

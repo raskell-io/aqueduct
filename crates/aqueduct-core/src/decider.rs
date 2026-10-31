@@ -103,6 +103,19 @@ impl<'a> RunView<'a> {
         self.state.steps().iter().map(|step| step.outcome.as_ref())
     }
 
+    /// Whether a cancellation completed this command (its outcome is then a failure).
+    pub fn cancelled(&self, cmd: CommandIndex) -> bool {
+        usize::try_from(cmd.0)
+            .ok()
+            .and_then(|index| self.state.steps().get(index))
+            .is_some_and(|step| step.cancelled)
+    }
+
+    /// The reason the run was cancelled, if it was.
+    pub fn cancel_reason(&self) -> Option<&'a str> {
+        self.state.cancel_reason()
+    }
+
     /// Commands in the order their outcomes were recorded. Logic that depends on this order must be
     /// aware that it differs between runs with the same input.
     pub fn completion_order(&self) -> &'a [CommandIndex] {
