@@ -27,6 +27,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test --workspace --doc
       - run: cargo run --release -p aqueduct --example quickstart
+      - run: cargo run --release -p aqueduct --example approval -- --auto
 
   sim:
     name: simulation

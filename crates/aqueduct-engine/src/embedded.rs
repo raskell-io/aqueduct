@@ -111,6 +111,9 @@ pub enum EngineError {
     /// The engine stopped, for example after a storage failure. Reopen it to recover.
     #[error("the engine has stopped: {0}")]
     Stopped(String),
+    /// The id is not an awakeable id (`<run key>#<command index>`).
+    #[error("`{0}` is not an awakeable id")]
+    InvalidAwakeable(String),
     /// Opening or recovering the engine failed.
     #[error("cannot open the engine: {0}")]
     Open(String),
@@ -298,6 +301,14 @@ impl Engine {
             reply,
         })?;
         answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// Completes an awakeable with a payload, given the id the workflow handed out. Returns once the
+    /// completion is durable; completing it again records the first payload only.
+    pub fn complete_awakeable(&self, id: &str, payload: Payload) -> Result<(), EngineError> {
+        let (key, name) = aqueduct_core::parse_awakeable_id(id)
+            .ok_or_else(|| EngineError::InvalidAwakeable(id.to_owned()))?;
+        self.signal(key, &name, id, payload)
     }
 
     /// Waits until a run has finished and its end is durable.

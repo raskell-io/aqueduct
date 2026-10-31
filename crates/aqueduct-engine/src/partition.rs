@@ -771,7 +771,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     let Some(decider) = self.deciders.get(run.state.workflow()) else {
                         continue;
                     };
-                    let commands = decider.decide(&run.state.view_at(env));
+                    let commands = decider.decide(&run.state.view_at(key, env));
                     let transition = run.state.handle_at(Event::Decision(commands), self.now_ms);
                     queue.extend(self.append(key, transition)?);
                 }

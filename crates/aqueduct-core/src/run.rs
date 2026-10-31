@@ -448,12 +448,13 @@ impl RunState {
     /// The view a decider sees, with an empty [`Env`] (for replay and tests: values already in the
     /// journal do not need one).
     pub fn view(&self) -> RunView<'_> {
-        RunView::new(self, Env::default())
+        RunView::new(self, "", Env::default())
     }
 
-    /// The view a decider sees in an activation, with the engine's clock and seed for new values.
-    pub fn view_at(&self, env: Env) -> RunView<'_> {
-        RunView::new(self, env)
+    /// The view a decider sees in an activation of the run with this key, with the engine's clock and
+    /// seed for new values.
+    pub fn view_at<'a>(&'a self, key: &'a str, env: Env) -> RunView<'a> {
+        RunView::new(self, key, env)
     }
 
     /// The name of the workflow or procedure the run executes.

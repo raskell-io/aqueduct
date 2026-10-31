@@ -1,7 +1,7 @@
 //! The `aqueduct` command line, working on an embedded engine's data directory.
 //!
-//! The engine must not be running: the state store is locked by its owner, and recovery may truncate a
-//! torn tail of the log. Every command returns its output as text, so it can be tested directly.
+//! The engine must not be running: the log and the state store are locked by their owner, and
+//! recovery may truncate a torn tail of the log. Every command returns its output as text, so it can be tested directly.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +21,13 @@ commands:
   verify <dir>                        verify every run's hash chain and print its head
   export <dir> <key>                  a run's journal as JSON Lines (one object per entry)
   replay <dir> <key> <procedure.star> replay a run against a procedure and report divergence
+  signal <dir> <key> <name> <json> [<id>]
+                                      send a signal; with an id, sending it again records it once
+  complete-awakeable <dir> <id> <json>
+                                      complete an awakeable with a payload
+
+Signals and completions are durable when the command returns; the run continues when the engine
+next opens the directory.
 ";
 
 /// Runs a command and returns its output.
@@ -41,8 +48,51 @@ pub fn run(args: &[String]) -> Result<String, String> {
             arg(2, "run key")?,
             Path::new(arg(3, "procedure file")?),
         ),
+        Some("signal") => signal(
+            Path::new(arg(1, "data directory")?),
+            arg(2, "run key")?,
+            arg(3, "signal name")?,
+            arg(4, "JSON payload")?,
+            args.get(5).map_or("", String::as_str),
+        ),
+        Some("complete-awakeable") => {
+            let id = arg(2, "awakeable id")?;
+            let (key, name) = aqueduct_core::parse_awakeable_id(id)
+                .ok_or_else(|| format!("`{id}` is not an awakeable id (<run key>#<command>)"))?;
+            signal(
+                Path::new(arg(1, "data directory")?),
+                key,
+                &name,
+                arg(3, "JSON payload")?,
+                id,
+            )
+            .map(|sent| {
+                sent.replacen(
+                    &format!("signal {name} sent to {key}"),
+                    &format!("awakeable {id} completed"),
+                    1,
+                )
+            })
+        }
         Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
     }
+}
+
+/// Records a signal durably. The payload must be JSON (ADR 0010).
+fn signal(dir: &Path, key: &str, name: &str, json: &str, id: &str) -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|e| format!("the payload is not JSON ({e}); quote strings, as in '\"yes\"'"))?;
+    let mut partition = load(dir)?;
+    partition
+        .signal(key, name, id, Payload::new(json.as_bytes().to_vec()))
+        .map_err(|e| e.to_string())?;
+    partition.flush().map_err(|e| e.to_string())?;
+    let state = partition
+        .runs()
+        .get(key)
+        .map(|run| format!("{:?}", run.state().status()).to_lowercase())
+        .unwrap_or_else(|| "finished".to_owned());
+    Ok(format!("signal {name} sent to {key} ({state})\n"))
 }
 
 /// Loads every run in a data directory: the last checkpoint and the log after it.

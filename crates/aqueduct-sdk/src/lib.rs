@@ -1,11 +1,13 @@
 //! The Aqueduct Rust SDK: durable workflows as ordinary `async fn`s (BRIEF.md section 4.2, ADR 0014).
 //!
 //! A workflow receives a [`WorkflowContext`] and its input, and talks to the world only through the
-//! context: [`WorkflowContext::step`], [`WorkflowContext::sleep`] and [`WorkflowContext::wait_signal`].
+//! context: [`WorkflowContext::step`], [`WorkflowContext::sleep`], [`WorkflowContext::wait_signal`] and
+//! [`WorkflowContext::awakeable`].
 //! [`workflow`] turns it into a [`Decider`] the engine runs: every activation runs the function from the
 //! start; each context call gets the next command index the first time it is polled, resolves at once
 //! if the journal holds its outcome, and is issued as a command otherwise. Concurrent calls (with
-//! [`join`] or [`join_all`]) are issued together.
+//! [`join`] or [`join_all`]) are issued together; [`select`] and [`select_all`] wait for the first to
+//! finish, in the order the journal recorded them (ADR 0016).
 //!
 //! ```
 //! use aqueduct_core::{Command, Decider, Payload, RunState, start};
@@ -74,8 +76,26 @@ impl WorkflowError {
 #[derive(Default)]
 struct Activation {
     outcomes: Vec<Option<StepOutcome>>,
+    /// Each command's position in the journal's completion order, if it has an outcome.
+    ranks: Vec<Option<usize>>,
     commands: Vec<Command>,
     env: Env,
+    key: String,
+    /// The latest completion (by rank) among the calls resolved since [`select`] last reset it; `None`
+    /// when none was. Values recorded in this activation rank after everything in the journal.
+    resolved: Option<usize>,
+}
+
+impl Activation {
+    fn resolve(&mut self, index: usize) {
+        let rank = self
+            .ranks
+            .get(index)
+            .copied()
+            .flatten()
+            .unwrap_or(usize::MAX);
+        self.resolved = Some(self.resolved.map_or(rank, |r| r.max(rank)));
+    }
 }
 
 /// SplitMix64's output function: spreads a seed's bits.
@@ -92,12 +112,12 @@ pub struct WorkflowContext {
 }
 
 impl WorkflowContext {
-    /// Issues the next command, or returns its recorded outcome.
-    fn issue(&self, command: Command) -> Option<StepOutcome> {
+    /// Issues the next command; returns its index and its recorded outcome, if any.
+    fn issue(&self, command: Command) -> (usize, Option<StepOutcome>) {
         let mut activation = self.activation.borrow_mut();
         let index = activation.commands.len();
         activation.commands.push(command);
-        activation.outcomes.get(index).cloned().flatten()
+        (index, activation.outcomes.get(index).cloned().flatten())
     }
 
     /// Records a value from outside the workflow: the journaled value when there is one, otherwise
@@ -120,11 +140,11 @@ impl WorkflowContext {
         };
         // Not recorded yet (or the journal diverges here, which the engine reports by parking).
         let value = recorded.unwrap_or_else(|| fresh(env, index as u64));
-        if let Some(Command::Record { value: slot, .. }) =
-            self.activation.borrow_mut().commands.get_mut(index)
-        {
+        let mut activation = self.activation.borrow_mut();
+        if let Some(Command::Record { value: slot, .. }) = activation.commands.get_mut(index) {
             *slot = value.clone();
         }
+        activation.resolve(index);
         value
     }
 
@@ -251,6 +271,45 @@ impl WorkflowContext {
         )
     }
 
+    /// Creates an awakeable: a wait that whoever holds its id completes from outside, for example a
+    /// person following a link, or a webhook. Returns the id to hand out and a future of the payload it
+    /// is completed with (`Engine::complete_awakeable` in the embedded engine). Completing it twice
+    /// records the first payload only. The id names the run and the command, so it is the same on every
+    /// replay. To give up after a while, [`select`] it against a [`WorkflowContext::sleep`].
+    pub fn awakeable<T: DeserializeOwned>(
+        &self,
+    ) -> (
+        String,
+        impl Future<Output = Result<T, WorkflowError>> + use<T>,
+    ) {
+        let (index, key) = {
+            let activation = self.activation.borrow();
+            (activation.commands.len(), activation.key.clone())
+        };
+        let cmd = aqueduct_core::CommandIndex(u32::try_from(index).unwrap_or(u32::MAX));
+        let (_, outcome) = self.issue(Command::AwaitSignal {
+            name: aqueduct_core::awakeable_signal(cmd),
+            timeout_ms: 0,
+        });
+        let context = self.clone();
+        let mut outcome = outcome;
+        let future = poll_fn(move |_| match outcome.take() {
+            Some(StepOutcome::Completed(payload)) => {
+                context.activation.borrow_mut().resolve(index);
+                Poll::Ready(
+                    serde_json::from_slice(payload.as_bytes())
+                        .map_err(|e| WorkflowError::Payload(e.to_string())),
+                )
+            }
+            Some(StepOutcome::Failed(error)) => {
+                context.activation.borrow_mut().resolve(index);
+                Poll::Ready(Err(WorkflowError::Failed(error)))
+            }
+            None => Poll::Pending,
+        });
+        (aqueduct_core::awakeable_id(&key, cmd), future)
+    }
+
     /// A future that issues `command` when first polled and resolves once its outcome is recorded.
     fn call<R, G>(
         &self,
@@ -263,6 +322,7 @@ impl WorkflowContext {
         let context = self.clone();
         let mut state = Some((command, finish));
         let mut outcome: Option<Option<StepOutcome>> = None;
+        let mut index = 0;
         poll_fn(move |_| {
             if outcome.is_none() {
                 let Some((command, _)) = state.as_mut() else {
@@ -273,11 +333,16 @@ impl WorkflowContext {
                     Ok(command) => command,
                     Err(error) => return Poll::Ready(Err(error)),
                 };
-                outcome = Some(context.issue(command));
+                let (issued, recorded) = context.issue(command);
+                index = issued;
+                outcome = Some(recorded);
             }
             match outcome.as_mut().and_then(Option::take) {
                 Some(result) => match state.take() {
-                    Some((_, finish)) => Poll::Ready(finish(result)),
+                    Some((_, finish)) => {
+                        context.activation.borrow_mut().resolve(index);
+                        Poll::Ready(finish(result))
+                    }
                     None => Poll::Pending,
                 },
                 // Not recorded yet: the run waits, and this activation ends here.
@@ -336,6 +401,102 @@ pub async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     .await
 }
 
+/// One of two outcomes, from [`select`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Either<L, R> {
+    /// The first future finished first.
+    Left(L),
+    /// The second future finished first.
+    Right(R),
+}
+
+thread_local! {
+    /// The activation of the workflow being polled on this thread, for [`select`].
+    static CURRENT: RefCell<Option<Rc<RefCell<Activation>>>> = const { RefCell::new(None) };
+}
+
+/// Polls `future` and returns its output with the rank of the latest completion it consumed.
+fn poll_ranked<F: Future + ?Sized>(
+    future: Pin<&mut F>,
+    cx: &mut Context<'_>,
+) -> Poll<(F::Output, Option<usize>)> {
+    let activation = CURRENT.with(|current| current.borrow().clone());
+    let saved = activation
+        .as_ref()
+        .and_then(|a| a.borrow_mut().resolved.take());
+    let polled = future.poll(cx);
+    let rank = activation.as_ref().and_then(|a| {
+        let mut a = a.borrow_mut();
+        let rank = a.resolved;
+        // The caller's own record continues with whatever this branch consumed.
+        a.resolved = match (saved, rank) {
+            (Some(s), Some(r)) => Some(s.max(r)),
+            (s, r) => s.or(r),
+        };
+        rank
+    });
+    polled.map(|output| (output, rank))
+}
+
+/// Waits for whichever future finishes first. Both are issued at once. The winner is decided by the
+/// order in which the journal recorded their outcomes, never by polling order, so a replay that finds
+/// both finished takes the same branch as the first execution.
+///
+/// The other future is dropped, but its commands stay issued: a losing step still runs, a losing sleep
+/// still fires, and a losing signal wait still takes the next signal with its name. Prefer
+/// [`WorkflowContext::wait_signal`]'s timeout for timed signal waits.
+pub async fn select<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> {
+    let (index, output) = select_all(vec![
+        Box::pin(async move { Either::Left(a.await) })
+            as Pin<Box<dyn Future<Output = Either<A::Output, B::Output>>>>,
+        Box::pin(async move { Either::Right(b.await) }),
+    ])
+    .await;
+    let _ = index;
+    output
+}
+
+/// Waits for the first of several futures to finish and returns its position and output. The winner is
+/// the one whose outcome the journal recorded first; see [`select`].
+pub async fn select_all<F: Future>(futures: Vec<F>) -> (usize, F::Output) {
+    let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    poll_fn(move |cx| {
+        let mut best: Option<(Option<usize>, usize, F::Output)> = None;
+        for (position, future) in futures.iter_mut().enumerate() {
+            if let Poll::Ready((output, rank)) = poll_ranked(future.as_mut(), cx) {
+                // A branch that consumed no completion is ready at once and wins outright.
+                let earlier = match &best {
+                    None => true,
+                    Some((best_rank, _, _)) => match (rank, best_rank) {
+                        (None, Some(_)) => true,
+                        (Some(r), Some(b)) => r < *b,
+                        _ => false,
+                    },
+                };
+                if earlier {
+                    best = Some((rank, position, output));
+                }
+            }
+        }
+        match best {
+            Some((rank, position, output)) => {
+                CURRENT.with(|current| {
+                    if let Some(a) = current.borrow().as_ref() {
+                        let mut a = a.borrow_mut();
+                        a.resolved = match (a.resolved, rank) {
+                            (Some(s), Some(r)) => Some(s.max(r)),
+                            (s, r) => s.or(r),
+                        };
+                    }
+                });
+                Poll::Ready((position, output))
+            }
+            None => Poll::Pending,
+        }
+    })
+    .await
+}
+
 /// A workflow function turned into a [`Decider`].
 pub struct Workflow<F, I, O, Fut> {
     function: F,
@@ -365,10 +526,20 @@ where
     O: Serialize,
 {
     fn decide(&self, view: &RunView<'_>) -> Vec<Command> {
+        let outcomes: Vec<Option<StepOutcome>> = view.outcomes().map(|o| o.cloned()).collect();
+        let mut ranks = vec![None; outcomes.len()];
+        for (rank, cmd) in view.completion_order().iter().enumerate() {
+            if let Some(slot) = usize::try_from(cmd.0).ok().and_then(|i| ranks.get_mut(i)) {
+                *slot = Some(rank);
+            }
+        }
         let activation = Rc::new(RefCell::new(Activation {
-            outcomes: view.outcomes().map(|o| o.cloned()).collect(),
+            outcomes,
+            ranks,
             commands: Vec::new(),
             env: view.env(),
+            key: view.key().to_owned(),
+            resolved: None,
         }));
         let input: I = match serde_json::from_slice(view.input().as_bytes()) {
             Ok(input) => input,
@@ -384,9 +555,11 @@ where
         let mut future = Box::pin((self.function)(context, input));
         // One poll runs the workflow as far as the journal allows: every call with a recorded outcome
         // resolves at once, and the first call without one leaves the future pending.
+        CURRENT.with(|current| *current.borrow_mut() = Some(Rc::clone(&activation)));
         let polled = future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()));
+        CURRENT.with(|current| *current.borrow_mut() = None);
         drop(future);
         let mut commands = std::mem::take(&mut activation.borrow_mut().commands);
         match polled {
