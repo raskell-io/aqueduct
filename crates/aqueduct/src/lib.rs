@@ -36,5 +36,7 @@ pub use aqueduct_sdk::{WorkflowContext, WorkflowError, join, join_all, workflow}
 
 /// The embedded engine: a durable engine inside your process.
 pub mod embedded {
-    pub use aqueduct_engine::embedded::{Attempt, Builder, Engine, EngineError, RunResult};
+    pub use aqueduct_engine::embedded::{
+        Attempt, Builder, Engine, EngineError, EngineStats, RunResult,
+    };
 }
