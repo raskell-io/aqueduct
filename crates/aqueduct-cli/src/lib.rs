@@ -113,6 +113,7 @@ fn describe(dir: &Path, key: &str) -> Result<String, String> {
                 format!("wait for signal {} (timeout {timeout_ms} ms)", step.name)
             }
             CommandKind::Signal { .. } => format!("wait for signal {}", step.name),
+            CommandKind::Recorded => format!("record {}", step.name),
         };
         let outcome = match &step.outcome {
             None if step.retry_at.is_some() => {
@@ -249,6 +250,9 @@ fn describe_entry(entry: &Entry) -> String {
         }
         Entry::SignalAwaited { cmd, name, .. } => format!("[{cmd}] waiting for signal {name}"),
         Entry::TimerFired { cmd } => format!("[{cmd}] timer fired"),
+        Entry::ValueRecorded { cmd, name, value } => {
+            format!("[{cmd}] recorded {name}: {}", text(value))
+        }
         Entry::SignalReceived { name, id, payload } => {
             format!("signal {name} ({id}) received: {}", text(payload))
         }
@@ -279,6 +283,13 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         }
         Entry::StepFailed { cmd: c, error } => {
             json!({"kind": "StepFailed", "cmd": cmd(c), "error": error})
+        }
+        Entry::ValueRecorded {
+            cmd: c,
+            name,
+            value,
+        } => {
+            json!({"kind": "ValueRecorded", "cmd": cmd(c), "name": name, "value": payload(value)})
         }
         Entry::StepRetryScheduled {
             cmd: c,

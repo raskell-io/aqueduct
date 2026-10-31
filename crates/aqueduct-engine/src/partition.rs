@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
 use aqueduct_core::{
-    CommandIndex, Decider, Effect, Entry, Event, Payload, RunState, Status, StepOutcome,
+    CommandIndex, Decider, Effect, Entry, Env, Event, Payload, RunState, Status, StepOutcome,
     Transition, start,
 };
 use aqueduct_storage::{LogStore, NoStateStore, StateStore, StorageError};
@@ -195,6 +195,8 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     immediate: Vec<Outbound>,
     ack_before_sync: bool,
     now_ms: u64,
+    /// The state of the generator that gives each activation its seed for recorded values.
+    seed: u64,
     retry_policies: BTreeMap<String, RetryPolicy>,
     default_retry: RetryPolicy,
     /// Every timer that has not fired: (wake time, run, command).
@@ -293,6 +295,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             immediate: Vec::new(),
             ack_before_sync: false,
             now_ms: 0,
+            seed: os_seed(),
             retry_policies: BTreeMap::new(),
             default_retry: RetryPolicy::default(),
             timers: BTreeSet::new(),
@@ -362,6 +365,21 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// and [`Partition::fire_due_timers`] fires timers whose wake time has been reached.
     pub fn set_time(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    /// Seeds the generator of the random bits offered to deciders for recorded values (by default
+    /// seeded from the operating system). A simulation sets it to stay reproducible.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.seed = seed;
+    }
+
+    /// The seed for the next activation (SplitMix64).
+    fn next_seed(&mut self) -> u64 {
+        self.seed = self.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
 
     /// Sends a signal to a run. A signal whose non-empty `id` the run has already recorded is dropped,
@@ -741,6 +759,10 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::Activate => {
+                    let env = Env {
+                        now_ms: self.now_ms,
+                        seed: self.next_seed(),
+                    };
                     let run = self
                         .runs
                         .get(key)
@@ -749,7 +771,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     let Some(decider) = self.deciders.get(run.state.workflow()) else {
                         continue;
                     };
-                    let commands = decider.decide(&run.state.view());
+                    let commands = decider.decide(&run.state.view_at(env));
                     let transition = run.state.handle_at(Event::Decision(commands), self.now_ms);
                     queue.extend(self.append(key, transition)?);
                 }
@@ -771,4 +793,13 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         }
         Ok(())
     }
+}
+
+/// Random bits from the operating system, without a dependency: the standard library seeds every
+/// `RandomState` from it. Good for seeds; not for secrets.
+fn os_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(0x6171_7565_6475_6374);
+    hasher.finish()
 }

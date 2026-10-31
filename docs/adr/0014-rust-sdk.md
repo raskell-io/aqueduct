@@ -35,4 +35,5 @@ procedures already work this way by re-execution (ADR 0008).
   optimisation for the embedded engine.
 - The simulator runs the same pipeline as a Rust workflow (`--workload rust`); it passes 10,000 seeds and
   ends with exactly the same outcomes as the Starlark version.
-- `ctx.now()`, `ctx.uuid()`, child workflows, sagas, queries and updates are not in the core yet.
+- Child workflows, sagas, queries and updates are not in the core yet. `ctx.now()`, `ctx.random()`,
+  `ctx.uuid()` and `ctx.record()` were added by ADR 0015.

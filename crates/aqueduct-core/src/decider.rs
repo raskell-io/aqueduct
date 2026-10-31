@@ -25,6 +25,16 @@ pub enum Command {
         /// The timeout in milliseconds; 0 waits forever.
         timeout_ms: u64,
     },
+    /// Record a value the logic observed from outside (the time, random bits, a local computation).
+    /// The first time it is issued, `value` is journaled and is the command's outcome at once; the
+    /// logic may use it in the same activation. When the journal already holds the command, the
+    /// journaled value is the outcome and `value` is ignored: only the name must match.
+    Record {
+        /// What the value is (for example `now` or `random`).
+        name: String,
+        /// The value observed now.
+        value: Payload,
+    },
     /// Complete the run. Must be the last command.
     CompleteRun {
         /// The run's output.
@@ -43,15 +53,32 @@ pub enum Command {
     },
 }
 
+/// What the engine offers a decider for new [`Command::Record`] values in one activation: its clock
+/// and a random seed. Values taken from it are journaled; replay never reads it again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Env {
+    /// The engine's clock: milliseconds since the Unix epoch.
+    pub now_ms: u64,
+    /// Random bits for this activation (from the operating system in an engine, from the seed in a
+    /// simulation).
+    pub seed: u64,
+}
+
 /// What a decider can observe about a run: its input and the outcomes recorded so far.
 #[derive(Clone, Copy, Debug)]
 pub struct RunView<'a> {
     state: &'a RunState,
+    env: Env,
 }
 
 impl<'a> RunView<'a> {
-    pub(crate) fn new(state: &'a RunState) -> Self {
-        RunView { state }
+    pub(crate) fn new(state: &'a RunState, env: Env) -> Self {
+        RunView { state, env }
+    }
+
+    /// The clock and seed for values recorded in this activation.
+    pub fn env(&self) -> Env {
+        self.env
     }
 
     /// The run's input.

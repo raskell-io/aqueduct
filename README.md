@@ -101,7 +101,9 @@ What holds today, for the embedded engine, and how it is checked:
 - **A step's result is recorded exactly once**, although a step may run more than once (at least once
   execution), so steps with side effects should be idempotent.
 - **Determinism:** procedures are deterministic by construction; Rust workflows are checked by replay, and
-  a run whose code changed under it is parked, never silently corrupted.
+  a run whose code changed under it is parked, never silently corrupted. The time, random numbers and
+  UUIDs come from the context (`ctx.now()`, `ctx.random()`, `ctx.uuid()`): recorded the first time,
+  read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)).
 - **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
   once per signal id.** **Retries** follow a policy with journaled backoff.
 - **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the

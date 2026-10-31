@@ -1,6 +1,6 @@
 //! The run state machine.
 
-use crate::decider::{Command, RunView};
+use crate::decider::{Command, Env, RunView};
 use crate::journal::{CommandIndex, Entry, Payload, StepOutcome};
 
 /// The lifecycle status of a run.
@@ -45,12 +45,14 @@ pub enum CommandKind {
         /// When the timeout fires; 0 means never.
         wake_at: u64,
     },
+    /// A value recorded from outside the logic. It is born completed.
+    Recorded,
 }
 
 /// A command as recorded in the journal, with its outcome if one has been recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduledStep {
-    /// The step's name, the signal's name, or `sleep`.
+    /// The step's name, the signal's name, the recorded value's name, or `sleep`.
     pub name: String,
     /// The step's input (empty for sleeps and signal waits).
     pub input: Payload,
@@ -75,6 +77,7 @@ impl ScheduledStep {
                     self.name
                 )
             }
+            CommandKind::Recorded => format!("a recorded value `{}`", self.name),
         }
     }
 }
@@ -292,6 +295,10 @@ impl RunState {
                     self.record(*cmd, StepOutcome::Completed(payload))?;
                 }
             }
+            Entry::ValueRecorded { cmd, name, value } => {
+                self.push_command(*cmd, name, Payload::default(), CommandKind::Recorded)?;
+                self.record(*cmd, StepOutcome::Completed(value.clone()))?;
+            }
             Entry::StepCompleted { cmd, result } => {
                 self.expect_kind(*cmd, |kind| kind == CommandKind::Step)?;
                 self.record(*cmd, StepOutcome::Completed(result.clone()))?;
@@ -438,9 +445,15 @@ impl RunState {
             .collect()
     }
 
-    /// The view a decider sees.
+    /// The view a decider sees, with an empty [`Env`] (for replay and tests: values already in the
+    /// journal do not need one).
     pub fn view(&self) -> RunView<'_> {
-        RunView::new(self)
+        RunView::new(self, Env::default())
+    }
+
+    /// The view a decider sees in an activation, with the engine's clock and seed for new values.
+    pub fn view_at(&self, env: Env) -> RunView<'_> {
+        RunView::new(self, env)
     }
 
     /// The name of the workflow or procedure the run executes.
@@ -635,7 +648,7 @@ impl RunState {
         let has_timer = match step.kind {
             CommandKind::Sleep { .. } => true,
             CommandKind::Signal { wake_at, .. } => wake_at > 0,
-            CommandKind::Step => false,
+            CommandKind::Step | CommandKind::Recorded => false,
         };
         if step.outcome.is_some() || !has_timer {
             return Transition::none();
@@ -689,12 +702,15 @@ impl RunState {
                         0
                     },
                 }),
+                Command::Record { .. } => Some(CommandKind::Recorded),
                 _ => None,
             };
             if let Some(kind) = new_kind {
                 let (name, input) = match &command {
                     Command::ScheduleStep { name, input } => (name.clone(), input.clone()),
-                    Command::AwaitSignal { name, .. } => (name.clone(), Payload::default()),
+                    Command::AwaitSignal { name, .. } | Command::Record { name, .. } => {
+                        (name.clone(), Payload::default())
+                    }
                     _ => ("sleep".to_owned(), Payload::default()),
                 };
                 let issued = ScheduledStep {
@@ -746,6 +762,21 @@ impl RunState {
                                 wake_at,
                             });
                         }
+                        CommandKind::Recorded => {
+                            let value = match command {
+                                Command::Record { value, .. } => value,
+                                _ => Payload::default(),
+                            };
+                            transition.entries.push(Entry::ValueRecorded {
+                                cmd,
+                                name: issued.name,
+                                value,
+                            });
+                            // The logic may have waited for the value instead of using it at once.
+                            if !transition.effects.contains(&Effect::Activate) {
+                                transition.effects.push(Effect::Activate);
+                            }
+                        }
                         CommandKind::Signal {
                             timeout_ms,
                             wake_at,
@@ -773,7 +804,8 @@ impl RunState {
             match command {
                 Command::ScheduleStep { .. }
                 | Command::Sleep { .. }
-                | Command::AwaitSignal { .. } => {}
+                | Command::AwaitSignal { .. }
+                | Command::Record { .. } => {}
                 Command::CompleteRun { .. } | Command::FailRun { .. } | Command::Park { .. }
                     if position + 1 != total =>
                 {
@@ -825,6 +857,7 @@ fn same_command(recorded: &ScheduledStep, issued: &ScheduledStep) -> bool {
                 CommandKind::Signal { timeout_ms: a, .. },
                 CommandKind::Signal { timeout_ms: b, .. },
             ) => a == b,
+            (CommandKind::Recorded, CommandKind::Recorded) => true,
             _ => false,
         }
 }

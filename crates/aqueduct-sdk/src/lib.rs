@@ -27,7 +27,10 @@
 //! ```
 //!
 //! Determinism is checked, not enforced: a workflow must not read the clock, random numbers, the
-//! environment or anything else outside its context. Replay detects divergence and parks the run.
+//! environment or anything else outside its context. Replay detects divergence and parks the run. For
+//! the outside world, the context records what the workflow saw: [`WorkflowContext::now`],
+//! [`WorkflowContext::random`], [`WorkflowContext::uuid`] and, for anything else,
+//! [`WorkflowContext::record`]. Each value is journaled the first time and read back on replay.
 
 #![forbid(unsafe_code)]
 
@@ -36,9 +39,9 @@ use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aqueduct_core::{Command, Decider, Payload, RunView, StepOutcome};
+use aqueduct_core::{Command, Decider, Env, Payload, RunView, StepOutcome};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -72,6 +75,14 @@ impl WorkflowError {
 struct Activation {
     outcomes: Vec<Option<StepOutcome>>,
     commands: Vec<Command>,
+    env: Env,
+}
+
+/// SplitMix64's output function: spreads a seed's bits.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// The workflow's only door to the world. Cheap to clone.
@@ -87,6 +98,97 @@ impl WorkflowContext {
         let index = activation.commands.len();
         activation.commands.push(command);
         activation.outcomes.get(index).cloned().flatten()
+    }
+
+    /// Records a value from outside the workflow: the journaled value when there is one, otherwise
+    /// `fresh(env, command index)`, which is then journaled.
+    fn record_with(&self, name: &str, fresh: impl FnOnce(Env, u64) -> Payload) -> Payload {
+        // The command index is taken before `fresh` runs: a `record` closure may use the context too,
+        // and its calls come after this one.
+        let (index, recorded, env) = {
+            let mut activation = self.activation.borrow_mut();
+            let index = activation.commands.len();
+            let recorded = match activation.outcomes.get(index) {
+                Some(Some(StepOutcome::Completed(recorded))) => Some(recorded.clone()),
+                _ => None,
+            };
+            activation.commands.push(Command::Record {
+                name: name.to_owned(),
+                value: Payload::default(),
+            });
+            (index, recorded, activation.env)
+        };
+        // Not recorded yet (or the journal diverges here, which the engine reports by parking).
+        let value = recorded.unwrap_or_else(|| fresh(env, index as u64));
+        if let Some(Command::Record { value: slot, .. }) =
+            self.activation.borrow_mut().commands.get_mut(index)
+        {
+            *slot = value.clone();
+        }
+        value
+    }
+
+    /// The current time, recorded: the engine's clock the first time, the same instant on every replay.
+    pub fn now(&self) -> SystemTime {
+        let value = self.record_with("now", |env, _| {
+            Payload::new(env.now_ms.to_string().into_bytes())
+        });
+        let ms = std::str::from_utf8(value.as_bytes())
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or_default();
+        UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    /// 64 random bits, recorded. Seeded by the engine from the operating system; not for secrets.
+    pub fn random(&self) -> u64 {
+        let value = self.record_with("random", |env, index| {
+            let bits = mix(env.seed ^ mix(index.wrapping_add(1)));
+            Payload::new(bits.to_string().into_bytes())
+        });
+        std::str::from_utf8(value.as_bytes())
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or_default()
+    }
+
+    /// A random (version 4) UUID, recorded. Unique for practical purposes; not for secrets.
+    pub fn uuid(&self) -> uuid::Uuid {
+        let value = self.record_with("uuid", |env, index| {
+            let high = mix(env.seed ^ mix(index.wrapping_add(1)));
+            let low = mix(high ^ 0x7575_6964_7575_6964);
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&high.to_be_bytes());
+            bytes[8..].copy_from_slice(&low.to_be_bytes());
+            let id = uuid::Builder::from_random_bytes(bytes).into_uuid();
+            Payload::new(format!("\"{id}\"").into_bytes())
+        });
+        std::str::from_utf8(value.as_bytes())
+            .ok()
+            .and_then(|text| uuid::Uuid::try_parse(text.trim_matches('"')).ok())
+            .unwrap_or_default()
+    }
+
+    /// Runs `compute` once and records its result; replay returns the recorded result without running
+    /// it again. For quick, local reads of the outside world (configuration, the environment, a local
+    /// file). Anything slow, remote or with side effects belongs in a step, which has retries.
+    pub fn record<T, F>(&self, name: &str, compute: F) -> Result<T, WorkflowError>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce() -> T,
+    {
+        let mut encode_error = None;
+        let value = self.record_with(name, |_, _| match serde_json::to_vec(&compute()) {
+            Ok(bytes) => Payload::new(bytes),
+            Err(e) => {
+                encode_error = Some(WorkflowError::Payload(e.to_string()));
+                Payload::default()
+            }
+        });
+        if let Some(error) = encode_error {
+            return Err(error);
+        }
+        serde_json::from_slice(value.as_bytes()).map_err(|e| WorkflowError::Payload(e.to_string()))
     }
 
     /// Runs a step (registered with the engine by name) with a JSON-encoded input and decodes its result.
@@ -266,6 +368,7 @@ where
         let activation = Rc::new(RefCell::new(Activation {
             outcomes: view.outcomes().map(|o| o.cloned()).collect(),
             commands: Vec::new(),
+            env: view.env(),
         }));
         let input: I = match serde_json::from_slice(view.input().as_bytes()) {
             Ok(input) => input,

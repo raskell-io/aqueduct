@@ -62,6 +62,13 @@ fn entry() -> impl Strategy<Value = Entry> {
             id,
             payload
         }),
+        (any::<u32>(), ".{0,12}", payload()).prop_map(|(cmd, name, value)| {
+            Entry::ValueRecorded {
+                cmd: CommandIndex(cmd),
+                name,
+                value,
+            }
+        }),
     ]
 }
 
