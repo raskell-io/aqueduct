@@ -58,16 +58,42 @@ pub struct RedbStateStore {
 impl RedbStateStore {
     /// Opens (or creates) the state store at `path`.
     pub fn open(path: &Path) -> Result<RedbStateStore, StorageError> {
+        if !path.exists() {
+            create_atomically(path)?;
+        }
         let db = redb::Database::create(path).map_err(io)?;
-        // Create the tables, so that readers never see them missing.
+        Ok(RedbStateStore { db })
+    }
+}
+
+/// Creates a new state store so that a crash at any moment leaves either no store or a complete one.
+/// Creating a redb file in place is not atomic: a crash part-way leaves a file that is not a redb
+/// database, and every later open fails. So the store is built under a temporary name, synced, and
+/// renamed into place; a leftover temporary file from an earlier crash is discarded.
+fn create_atomically(path: &Path) -> Result<(), StorageError> {
+    let creating = path.with_extension("redb.creating");
+    if creating.exists() {
+        std::fs::remove_file(&creating)?;
+    }
+    {
+        let db = redb::Database::create(&creating).map_err(io)?;
         let txn = db.begin_write().map_err(io)?;
         {
+            // Create the tables, so that readers never see them missing.
             txn.open_table(RUNS).map_err(io)?;
             txn.open_table(META).map_err(io)?;
         }
         txn.commit().map_err(io)?;
-        Ok(RedbStateStore { db })
     }
+    std::fs::File::open(&creating)?.sync_all()?;
+    std::fs::rename(&creating, path)?;
+    if let Some(dir) = path.parent() {
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        #[cfg(not(unix))]
+        let _ = dir;
+    }
+    Ok(())
 }
 
 impl StateStore for RedbStateStore {
@@ -175,6 +201,21 @@ mod tests {
             vec![b"x".to_vec()],
             "runs not saved again keep their records"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_creation_is_discarded() {
+        // A crash while the store was first being created leaves only the temporary file behind.
+        let dir =
+            std::env::temp_dir().join(format!("aqueduct-state-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.redb");
+        std::fs::write(path.with_extension("redb.creating"), b"half-written").unwrap();
+        let mut store = RedbStateStore::open(&path).unwrap();
+        assert_eq!(store.load().unwrap(), Checkpoint::default());
+        assert!(!path.with_extension("redb.creating").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
