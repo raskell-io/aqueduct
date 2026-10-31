@@ -1,12 +1,18 @@
 //! The file-backed log (ADR 0009): a directory of segment files holding framed records.
 //!
+//! - Every record has a log sequence number (LSN): 0, 1, 2, ... Each segment file is named after the LSN of
+//!   its first record (`<lsn:020>.log`).
 //! - Records are framed (`frame`) and buffered by [`LogStore::append`]; [`LogStore::sync`] writes the
 //!   buffer to the current segment and calls `sync_data` (`F_FULLFSYNC` on macOS, `fdatasync` on Linux).
 //! - When the current segment is full, the next sync starts a new segment and syncs the directory, so the
 //!   new file's existence is durable too.
-//! - [`LogStore::recover`] reads every segment in order. Only the last segment may end in a torn or
-//!   corrupt tail, which a crash during a write can explain; it is truncated. Damage anywhere else is
-//!   reported as [`StorageError::Corrupt`] and never repaired silently.
+//! - [`LogStore::recover_from`] reads the segments that hold records from a given LSN on, and checks
+//!   that consecutive segments leave no gap. Only the last segment may end in a torn or corrupt tail,
+//!   which a crash during a write can explain; it is truncated. Damage anywhere else, and missing records,
+//!   are reported as [`StorageError::Corrupt`] and never repaired silently. Bit rot in the middle of the
+//!   last segment cannot be told apart from a torn tail.
+//! - [`LogStore::trim`] deletes whole segments before an LSN that a checkpoint covers; the current
+//!   segment is never deleted.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -37,17 +43,18 @@ pub struct FileLog {
     options: FileLogOptions,
     current: Option<Segment>,
     pending: Vec<u8>,
+    pending_records: u64,
+    next_lsn: u64,
 }
 
 #[derive(Debug)]
 struct Segment {
-    index: u64,
     file: File,
     len: u64,
 }
 
 impl FileLog {
-    /// Opens (or creates) a log in `dir`. Call [`LogStore::recover`] before appending.
+    /// Opens (or creates) a log in `dir`. Call [`LogStore::recover_from`] before appending.
     pub fn open(dir: impl Into<PathBuf>, options: FileLogOptions) -> Result<FileLog, StorageError> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
@@ -56,6 +63,8 @@ impl FileLog {
             options,
             current: None,
             pending: Vec::new(),
+            pending_records: 0,
+            next_lsn: 0,
         })
     }
 
@@ -64,37 +73,37 @@ impl FileLog {
         &self.dir
     }
 
-    /// The indexes of the segment files present, in order.
+    /// The first LSNs of the segment files present, in order.
     pub fn segments(&self) -> Result<Vec<u64>, StorageError> {
-        let mut indexes = Vec::new();
+        let mut bases = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
             let name = entry?.file_name();
             let Some(name) = name.to_str() else { continue };
-            if let Some(index) = name
+            if let Some(base) = name
                 .strip_suffix(".log")
                 .and_then(|n| n.parse::<u64>().ok())
             {
-                indexes.push(index);
+                bases.push(base);
             }
         }
-        indexes.sort_unstable();
-        Ok(indexes)
+        bases.sort_unstable();
+        Ok(bases)
     }
 
-    fn path(&self, index: u64) -> PathBuf {
-        self.dir.join(format!("{index:020}.log"))
+    fn path(&self, base: u64) -> PathBuf {
+        self.dir.join(format!("{base:020}.log"))
     }
 
-    fn open_segment(&self, index: u64, len: u64) -> Result<Segment, StorageError> {
+    fn open_segment(&self, base: u64, len: u64) -> Result<Segment, StorageError> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.path(index))?;
-        Ok(Segment { index, file, len })
+            .open(self.path(base))?;
+        Ok(Segment { file, len })
     }
 
-    fn start_segment(&mut self, index: u64) -> Result<(), StorageError> {
-        let segment = self.open_segment(index, 0)?;
+    fn start_segment(&mut self, base: u64) -> Result<(), StorageError> {
+        let segment = self.open_segment(base, 0)?;
         segment.file.sync_all()?;
         sync_dir(&self.dir)?;
         self.current = Some(segment);
@@ -110,6 +119,7 @@ impl LogStore for FileLog {
         for record in records {
             self.pending.extend_from_slice(&frame::encode(record)?);
         }
+        self.pending_records += records.len() as u64;
         Ok(())
     }
 
@@ -122,8 +132,7 @@ impl LogStore for FileLog {
             Some(segment) => segment.len > 0 && segment.len >= self.options.segment_bytes,
         };
         if full {
-            let next = self.current.as_ref().map_or(0, |s| s.index + 1);
-            self.start_segment(next)?;
+            self.start_segment(self.next_lsn)?;
         }
         let segment = self.current.as_mut().ok_or(StorageError::NotRecovered)?;
         segment
@@ -135,21 +144,47 @@ impl LogStore for FileLog {
             .sync_data()
             .map_err(|e| StorageError::SyncFailed(e.to_string()))?;
         segment.len += self.pending.len() as u64;
+        self.next_lsn += self.pending_records;
         self.pending.clear();
+        self.pending_records = 0;
         Ok(())
     }
 
-    fn recover(&mut self) -> Result<Vec<Vec<u8>>, StorageError> {
+    fn recover_from(&mut self, from: u64) -> Result<Vec<Vec<u8>>, StorageError> {
         self.pending.clear();
+        self.pending_records = 0;
         self.current = None;
-        let indexes = self.segments()?;
+        let bases = self.segments()?;
+        if bases.is_empty() {
+            if from > 0 {
+                return Err(StorageError::Corrupt(format!(
+                    "the log is empty, but records up to LSN {from} are expected"
+                )));
+            }
+            self.next_lsn = 0;
+            self.start_segment(0)?;
+            return Ok(Vec::new());
+        }
+        let Some(start) = bases.iter().rposition(|&base| base <= from) else {
+            return Err(StorageError::Corrupt(format!(
+                "records from LSN {from} are missing: the oldest segment starts at LSN {}",
+                bases[0]
+            )));
+        };
         let mut records = Vec::new();
-        for (position, &index) in indexes.iter().enumerate() {
-            let path = self.path(index);
+        let mut expected = bases[start];
+        for (position, &base) in bases.iter().enumerate().skip(start) {
+            let path = self.path(base);
+            if base != expected {
+                return Err(StorageError::Corrupt(format!(
+                    "segment {} starts at LSN {base}, but the previous segment ends at LSN {expected}",
+                    path.display()
+                )));
+            }
             let mut bytes = Vec::new();
             File::open(&path)?.read_to_end(&mut bytes)?;
             let decoded = frame::decode_all(&bytes);
-            let last = position + 1 == indexes.len();
+            let last = position + 1 == bases.len();
             if decoded.valid_len < bytes.len() {
                 if !last {
                     return Err(StorageError::Corrupt(format!(
@@ -164,15 +199,44 @@ impl LogStore for FileLog {
                 file.set_len(decoded.valid_len as u64)?;
                 file.sync_all()?;
             }
-            records.extend(decoded.payloads);
+            let count = decoded.payloads.len() as u64;
+            let skip = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX);
+            records.extend(decoded.payloads.into_iter().skip(skip));
+            expected = base + count;
             if last {
-                self.current = Some(self.open_segment(index, decoded.valid_len as u64)?);
+                self.current = Some(self.open_segment(base, decoded.valid_len as u64)?);
             }
         }
-        if self.current.is_none() {
-            self.start_segment(0)?;
+        self.next_lsn = expected;
+        if from > self.next_lsn {
+            return Err(StorageError::Corrupt(format!(
+                "records up to LSN {from} are expected, but the log ends at LSN {}",
+                self.next_lsn
+            )));
         }
         Ok(records)
+    }
+
+    fn next_lsn(&self) -> u64 {
+        self.next_lsn
+    }
+
+    fn trim(&mut self, before: u64) -> Result<(), StorageError> {
+        let bases = self.segments()?;
+        let mut removed = false;
+        for pair in bases.windows(2) {
+            // A segment can go when the next one starts at or before `before`: all its records are older.
+            if let [base, next] = pair
+                && *next <= before
+            {
+                fs::remove_file(self.path(*base))?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_dir(&self.dir)?;
+        }
+        Ok(())
     }
 }
 
@@ -280,6 +344,40 @@ mod tests {
 
         let mut log = FileLog::open(&dir, options).unwrap();
         assert!(matches!(log.recover(), Err(StorageError::Corrupt(_))));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_from_an_lsn_and_trimming() {
+        let dir = temp_dir();
+        let options = FileLogOptions { segment_bytes: 200 };
+        let mut log = FileLog::open(&dir, options).unwrap();
+        log.recover().unwrap();
+        for n in 0..60 {
+            log.append(&[record(n)]).unwrap();
+            log.sync().unwrap();
+        }
+        assert_eq!(log.next_lsn(), 60);
+        let before = log.segments().unwrap().len();
+        log.trim(40).unwrap();
+        let after = log.segments().unwrap();
+        assert!(after.len() < before, "old segments are deleted");
+        assert!(after[0] <= 40, "nothing at or after LSN 40 is deleted");
+        drop(log);
+
+        let mut log = FileLog::open(&dir, options).unwrap();
+        let tail = log.recover_from(40).unwrap();
+        assert_eq!(tail, (40..60).map(record).collect::<Vec<_>>());
+        assert_eq!(log.next_lsn(), 60);
+        // Asking for trimmed records, or for more than the log holds, is an error.
+        assert!(matches!(
+            FileLog::open(&dir, options).unwrap().recover_from(0),
+            Err(StorageError::Corrupt(_))
+        ));
+        assert!(matches!(
+            FileLog::open(&dir, options).unwrap().recover_from(61),
+            Err(StorageError::Corrupt(_))
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 

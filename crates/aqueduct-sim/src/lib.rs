@@ -48,6 +48,9 @@ pub struct Bugs {
     pub skip_tail_truncation: bool,
     /// Never re-dispatch steps whose dispatch or result was lost.
     pub no_redispatch: bool,
+    /// After recovery, forget which runs have records after the checkpoint, so the next checkpoint
+    /// skips them while moving past their log records.
+    pub checkpoint_forgets_recovered_runs: bool,
 }
 
 /// Parameters of a simulated world. Probabilities are in parts per million.
@@ -137,6 +140,8 @@ pub struct Report {
     pub duplicated: u64,
     /// Retries the engine scheduled after transient failures.
     pub retries: u64,
+    /// Checkpoints saved; recovery loads the last one and replays only the log after it.
+    pub checkpoints: u64,
     /// Recoveries that found and truncated a torn or corrupt tail.
     pub torn_tails: u64,
     /// Step executions, including repeats.

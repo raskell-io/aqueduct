@@ -11,7 +11,7 @@
 //!
 //! The simulator drives it with a simulated disk; the embedded engine drives it with a file log.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
@@ -19,7 +19,7 @@ use aqueduct_core::{
     CommandIndex, Decider, Effect, Entry, Event, Payload, RunState, Status, StepOutcome,
     Transition, start,
 };
-use aqueduct_storage::{LogStore, StorageError};
+use aqueduct_storage::{LogStore, NoStateStore, StateStore, StorageError};
 
 /// The deciders a partition can run, by workflow name.
 #[derive(Clone, Default)]
@@ -183,8 +183,11 @@ pub enum PartitionError {
 }
 
 /// A partition processor over a log store.
-pub struct Partition<L: LogStore> {
+pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     log: L,
+    state: S,
+    /// Runs changed since the last checkpoint.
+    dirty: BTreeSet<String>,
     deciders: Deciders,
     runs: BTreeMap<String, PartitionRun>,
     batch: Vec<Vec<u8>>,
@@ -196,7 +199,7 @@ pub struct Partition<L: LogStore> {
     default_retry: RetryPolicy,
 }
 
-impl<L: LogStore> std::fmt::Debug for Partition<L> {
+impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Partition")
             .field("runs", &self.runs.len())
@@ -206,21 +209,52 @@ impl<L: LogStore> std::fmt::Debug for Partition<L> {
 }
 
 impl<L: LogStore> Partition<L> {
-    /// Recovers a partition from its log and performs every run's recovery effects.
+    /// Recovers a partition from its whole log and performs every run's recovery effects.
     pub fn recover(log: L, deciders: Deciders) -> Result<Partition<L>, PartitionError> {
-        let mut partition = Partition::load(log, deciders)?;
+        Partition::recover_with_state(log, NoStateStore, deciders)
+    }
+
+    /// Recovers runs from the whole log without performing their recovery effects (see
+    /// [`Partition::resume`]).
+    pub fn load(log: L, deciders: Deciders) -> Result<Partition<L>, PartitionError> {
+        Partition::load_with_state(log, NoStateStore, deciders)
+    }
+}
+
+impl<L: LogStore, S: StateStore> Partition<L, S> {
+    /// Recovers a partition from its last checkpoint and the log after it, then performs every run's
+    /// recovery effects.
+    pub fn recover_with_state(
+        log: L,
+        state: S,
+        deciders: Deciders,
+    ) -> Result<Partition<L, S>, PartitionError> {
+        let mut partition = Partition::load_with_state(log, state, deciders)?;
         partition.resume()?;
         Ok(partition)
     }
 
-    /// Recovers runs from the log without performing their recovery effects (see [`Partition::resume`]).
-    pub fn load(mut log: L, deciders: Deciders) -> Result<Partition<L>, PartitionError> {
-        let records = log.recover()?;
-        let mut by_run: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    /// Recovers runs from the last checkpoint and the log written after it, without performing their
+    /// recovery effects (see [`Partition::resume`]).
+    pub fn load_with_state(
+        mut log: L,
+        mut state: S,
+        deciders: Deciders,
+    ) -> Result<Partition<L, S>, PartitionError> {
+        let checkpoint = state.load()?;
+        let records = log.recover_from(checkpoint.lsn)?;
+        // Each run's records: those in the checkpoint, then those logged after it.
+        let mut by_run: BTreeMap<String, Vec<Vec<u8>>> = checkpoint.runs;
+        // Runs with records after the checkpoint are not in it yet: the next checkpoint must save them,
+        // because it moves past the log records that hold them.
+        let mut dirty = BTreeSet::new();
         for bytes in &records {
             let (key, record) = decode_log_record(bytes).map_err(|e| {
                 PartitionError::Corrupt(format!("a framed log record does not decode: {e}"))
             })?;
+            if !dirty.contains(key) {
+                dirty.insert(key.to_owned());
+            }
             by_run
                 .entry(key.to_owned())
                 .or_default()
@@ -245,6 +279,8 @@ impl<L: LogStore> Partition<L> {
         }
         Ok(Partition {
             log,
+            state,
+            dirty,
             deciders,
             runs,
             batch: Vec::new(),
@@ -507,6 +543,43 @@ impl<L: LogStore> Partition<L> {
         self.log
     }
 
+    /// Gives the log and state stores back, dropping everything in memory (as a crash would).
+    pub fn into_parts(self) -> (L, S) {
+        (self.log, self.state)
+    }
+
+    /// Saves a checkpoint of every run changed since the last one, then lets the log drop the records
+    /// it covers. Returns the checkpoint's LSN. Call only after [`Partition::flush`], when nothing is
+    /// waiting to be written: a checkpoint must never cover a record that is not durable.
+    pub fn checkpoint(&mut self) -> Result<u64, PartitionError> {
+        if !self.batch.is_empty() {
+            return Err(PartitionError::Internal(
+                "a checkpoint was requested before a flush".into(),
+            ));
+        }
+        let lsn = self.log.next_lsn();
+        let runs: Vec<(String, Vec<Vec<u8>>)> = self
+            .dirty
+            .iter()
+            .filter_map(|key| self.runs.get(key).map(|run| (key, run)))
+            .map(|(key, run)| {
+                // The canonical encoding re-creates exactly the records that were logged.
+                let mut chain = ChainWriter::new(key);
+                (
+                    key.clone(),
+                    run.journal
+                        .iter()
+                        .map(|entry| chain.append(entry))
+                        .collect(),
+                )
+            })
+            .collect();
+        self.state.save(lsn, &runs)?;
+        self.dirty.clear();
+        self.log.trim(lsn)?;
+        Ok(lsn)
+    }
+
     /// Invariant check: every run's state equals the fold of its journal.
     pub fn check_fold(&self) -> Result<(), String> {
         for (key, run) in &self.runs {
@@ -526,6 +599,13 @@ impl<L: LogStore> Partition<L> {
     #[doc(hidden)]
     pub fn inject_ack_before_sync(&mut self, enabled: bool) {
         self.ack_before_sync = enabled;
+    }
+
+    /// Testing only: forget which runs changed since the last checkpoint, as if runs recovered from the
+    /// log tail were not marked. A deliberate bug that the simulator must catch.
+    #[doc(hidden)]
+    pub fn inject_forget_dirty_runs(&mut self) {
+        self.dirty.clear();
     }
 
     /// Testing only: messages released early by [`Partition::inject_ack_before_sync`].
@@ -550,6 +630,9 @@ impl<L: LogStore> Partition<L> {
         let record = run.chain.append(entry);
         run.journal.push(entry.clone());
         self.batch.push(encode_log_record(key, &record));
+        if !self.dirty.contains(key) {
+            self.dirty.insert(key.to_owned());
+        }
         Ok(())
     }
 

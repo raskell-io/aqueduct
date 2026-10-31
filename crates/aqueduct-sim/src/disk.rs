@@ -13,6 +13,8 @@ use crate::rng::Rng;
 pub struct SimDisk {
     durable: Vec<u8>,
     pending: Vec<u8>,
+    pending_records: u64,
+    synced_records: u64,
     rng: Rng,
     sync_fail_ppm: u32,
     torn_ppm: u32,
@@ -30,6 +32,8 @@ impl SimDisk {
         SimDisk {
             durable: Vec::new(),
             pending: Vec::new(),
+            pending_records: 0,
+            synced_records: 0,
             rng,
             sync_fail_ppm,
             torn_ppm,
@@ -55,6 +59,7 @@ impl SimDisk {
         }
         self.durable.extend_from_slice(&kept);
         self.pending.clear();
+        self.pending_records = 0;
     }
 
     /// The bytes that would survive a crash right now if no unsynced data survived.
@@ -65,6 +70,7 @@ impl SimDisk {
 
 impl LogStore for SimDisk {
     fn append(&mut self, records: &[Vec<u8>]) -> Result<(), StorageError> {
+        self.pending_records += records.len() as u64;
         for record in records {
             self.pending.extend_from_slice(&frame::encode(record)?);
         }
@@ -76,13 +82,16 @@ impl LogStore for SimDisk {
             return Err(StorageError::SyncFailed("injected fsync failure".into()));
         }
         self.durable.append(&mut self.pending);
+        self.synced_records += self.pending_records;
+        self.pending_records = 0;
         self.syncs += 1;
         Ok(())
     }
 
-    fn recover(&mut self) -> Result<Vec<Vec<u8>>, StorageError> {
+    fn recover_from(&mut self, from: u64) -> Result<Vec<Vec<u8>>, StorageError> {
         // Only called after a crash, when nothing is pending.
         self.pending.clear();
+        self.pending_records = 0;
         let decoded = frame::decode_all(&self.durable);
         if decoded.valid_len < self.durable.len() {
             self.torn_tails += 1;
@@ -90,6 +99,23 @@ impl LogStore for SimDisk {
                 self.durable.truncate(decoded.valid_len);
             }
         }
-        Ok(decoded.payloads)
+        self.synced_records = decoded.payloads.len() as u64;
+        if from > self.synced_records {
+            return Err(StorageError::Corrupt(format!(
+                "records up to LSN {from} are expected, but the log ends at LSN {}",
+                self.synced_records
+            )));
+        }
+        let skip = usize::try_from(from).unwrap_or(usize::MAX);
+        Ok(decoded.payloads.into_iter().skip(skip).collect())
+    }
+
+    fn next_lsn(&self) -> u64 {
+        self.synced_records
+    }
+
+    fn trim(&mut self, _before: u64) -> Result<(), StorageError> {
+        // The simulated disk keeps everything, so the final check can compare the whole log with memory.
+        Ok(())
     }
 }

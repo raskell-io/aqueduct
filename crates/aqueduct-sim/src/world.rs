@@ -66,6 +66,9 @@ enum Ev {
         key: String,
         cmd: CommandIndex,
     },
+    CheckpointTick {
+        incarnation: u64,
+    },
 }
 
 /// What a worker reports for one execution of a step.
@@ -94,6 +97,7 @@ impl Ev {
             Ev::TimerTick { .. } => 14,
             Ev::NodeAttemptFailed { .. } => 15,
             Ev::WorkerAttemptAck { .. } => 16,
+            Ev::CheckpointTick { .. } => 17,
         }
     }
 
@@ -148,6 +152,9 @@ fn report_event(key: String, cmd: CommandIndex, report: WorkerReport) -> Ev {
     }
 }
 
+/// How often the node saves a checkpoint (when nothing is waiting to be written).
+const CHECKPOINT_TICK: u64 = 70;
+
 /// How often the node checks for due timers, in simulated milliseconds.
 const TIMER_TICK: u64 = 25;
 
@@ -195,6 +202,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
             ..Report::default()
         },
     };
+    world.node.forget_dirty_runs = config.bugs.checkpoint_forgets_recovered_runs;
     world.run().map_err(|message| Failure {
         seed,
         workload: config.workload,
@@ -212,6 +220,7 @@ impl World<'_> {
         );
         self.schedule(self.config.worker_resend, Ev::WorkerResend);
         self.schedule(TIMER_TICK, Ev::TimerTick { incarnation: 0 });
+        self.schedule(CHECKPOINT_TICK, Ev::CheckpointTick { incarnation: 0 });
 
         loop {
             let Some(((time, _), ev)) = self.queue.pop_first() else {
@@ -335,6 +344,14 @@ impl World<'_> {
                 if self.node.up {
                     self.node.on_signal(&key)?;
                     self.after_node_event();
+                }
+            }
+            Ev::CheckpointTick { incarnation } => {
+                if self.node.up && incarnation == self.node.incarnation {
+                    if self.node.checkpoint()? {
+                        self.report.checkpoints += 1;
+                    }
+                    self.schedule(CHECKPOINT_TICK, Ev::CheckpointTick { incarnation });
                 }
             }
             Ev::TimerTick { incarnation } => {
@@ -492,6 +509,7 @@ impl World<'_> {
         self.node.resume()?;
         let incarnation = self.node.incarnation;
         self.schedule(TIMER_TICK, Ev::TimerTick { incarnation });
+        self.schedule(CHECKPOINT_TICK, Ev::CheckpointTick { incarnation });
         let incarnation = self.node.incarnation;
         self.schedule(
             self.config.redispatch_interval,

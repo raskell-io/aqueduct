@@ -14,12 +14,34 @@ const SIM_RETRY: RetryPolicy = RetryPolicy {
     multiplier: 2,
     max_backoff_ms: 200,
 };
-use aqueduct_storage::StorageError;
+use aqueduct_storage::{Checkpoint, StateStore, StorageError};
 
 use crate::disk::SimDisk;
 
 /// The single workflow the simulated workload runs.
 pub(crate) const WORKFLOW: &str = "pipeline";
+
+/// A simulated state store. Saves are atomic and survive crashes, like a committed redb transaction.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SimState {
+    checkpoint: Checkpoint,
+    pub saves: u64,
+}
+
+impl StateStore for SimState {
+    fn load(&mut self) -> Result<Checkpoint, StorageError> {
+        Ok(self.checkpoint.clone())
+    }
+
+    fn save(&mut self, lsn: u64, runs: &[(String, Vec<Vec<u8>>)]) -> Result<(), StorageError> {
+        for (key, records) in runs {
+            self.checkpoint.runs.insert(key.clone(), records.clone());
+        }
+        self.checkpoint.lsn = lsn;
+        self.saves += 1;
+        Ok(())
+    }
+}
 
 static NO_RUNS: BTreeMap<String, PartitionRun> = BTreeMap::new();
 
@@ -27,10 +49,11 @@ pub(crate) struct Node {
     pub up: bool,
     pub incarnation: u64,
     pub flush_scheduled: bool,
-    partition: Option<Partition<SimDisk>>,
-    stopped_disk: Option<SimDisk>,
+    partition: Option<Partition<SimDisk, SimState>>,
+    stopped: Option<(SimDisk, SimState)>,
     deciders: Deciders,
     ack_before_sync: bool,
+    pub forget_dirty_runs: bool,
 }
 
 impl Node {
@@ -41,7 +64,8 @@ impl Node {
     ) -> Result<Self, String> {
         let mut deciders = Deciders::new();
         deciders.insert(WORKFLOW, decider);
-        let mut partition = Partition::load(disk, deciders.clone()).map_err(|e| e.to_string())?;
+        let mut partition = Partition::load_with_state(disk, SimState::default(), deciders.clone())
+            .map_err(|e| e.to_string())?;
         partition.inject_ack_before_sync(ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);
         Ok(Node {
@@ -49,30 +73,31 @@ impl Node {
             incarnation: 0,
             flush_scheduled: false,
             partition: Some(partition),
-            stopped_disk: None,
+            stopped: None,
             deciders,
             ack_before_sync,
+            forget_dirty_runs: false,
         })
     }
 
-    fn partition(&mut self) -> Result<&mut Partition<SimDisk>, String> {
+    fn partition(&mut self) -> Result<&mut Partition<SimDisk, SimState>, String> {
         self.partition
             .as_mut()
             .ok_or_else(|| "the node is down".to_owned())
     }
 
     pub fn disk(&self) -> &SimDisk {
-        match (&self.partition, &self.stopped_disk) {
+        match (&self.partition, &self.stopped) {
             (Some(partition), _) => partition.log(),
-            (None, Some(disk)) => disk,
+            (None, Some((disk, _))) => disk,
             (None, None) => unreachable_disk(),
         }
     }
 
     pub fn disk_mut(&mut self) -> Option<&mut SimDisk> {
-        match (&mut self.partition, &mut self.stopped_disk) {
+        match (&mut self.partition, &mut self.stopped) {
             (Some(partition), _) => Some(partition.log_mut()),
-            (None, disk) => disk.as_mut(),
+            (None, stopped) => stopped.as_mut().map(|(disk, _)| disk),
         }
     }
 
@@ -144,6 +169,17 @@ impl Node {
             .map_err(|e| e.to_string())
     }
 
+    /// Saves a checkpoint, if nothing is waiting to be written.
+    pub fn checkpoint(&mut self) -> Result<bool, String> {
+        match self.partition.as_mut() {
+            Some(partition) if !partition.needs_flush() => {
+                partition.checkpoint().map_err(|e| e.to_string())?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn on_redispatch(&mut self) {
         if let Some(partition) = self.partition.as_mut() {
             partition.redispatch();
@@ -159,9 +195,9 @@ impl Node {
 
     pub fn crash(&mut self) {
         if let Some(partition) = self.partition.take() {
-            let mut disk = partition.into_log();
+            let (mut disk, state) = partition.into_parts();
             disk.crash();
-            self.stopped_disk = Some(disk);
+            self.stopped = Some((disk, state));
         }
         self.up = false;
         self.flush_scheduled = false;
@@ -169,9 +205,12 @@ impl Node {
 
     /// Recovers runs from the log, without performing their recovery effects yet.
     pub fn recover(&mut self) -> Result<(), String> {
-        let disk = self.stopped_disk.take().ok_or("no disk to recover from")?;
-        let mut partition =
-            Partition::load(disk, self.deciders.clone()).map_err(|e| e.to_string())?;
+        let (disk, state) = self.stopped.take().ok_or("no disk to recover from")?;
+        let mut partition = Partition::load_with_state(disk, state, self.deciders.clone())
+            .map_err(|e| e.to_string())?;
+        if self.forget_dirty_runs {
+            partition.inject_forget_dirty_runs();
+        }
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);
         self.partition = Some(partition);
