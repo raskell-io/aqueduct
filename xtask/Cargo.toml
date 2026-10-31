@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 aqueduct-sim.workspace = true
+aqueduct-storage.workspace = true

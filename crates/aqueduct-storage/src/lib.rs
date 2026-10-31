@@ -1,12 +1,15 @@
-//! Storage for Aqueduct: the log store trait, record framing, and (from phase 0's storage benchmark)
-//! the embedded implementations. See `BRIEF.md`, section 6.3.
+//! Storage for Aqueduct: the log store trait, record framing, and the file-backed log (ADR 0009).
+//! See `BRIEF.md`, section 6.3.
 //!
 //! Records are framed with a length and a CRC-32 so that a torn write at the end of a log is detected
 //! and truncated on recovery, before any record is interpreted.
 
 #![forbid(unsafe_code)]
 
+mod file_log;
 pub mod frame;
+
+pub use file_log::{FileLog, FileLogOptions};
 
 /// A storage failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -21,6 +24,18 @@ pub enum StorageError {
     /// A record is too large to frame.
     #[error("record of {0} bytes exceeds the maximum frame size")]
     RecordTooLarge(usize),
+    /// Stored data is damaged somewhere a crash cannot explain (not at the tail of the log).
+    #[error("corrupt log: {0}")]
+    Corrupt(String),
+    /// The log was used before [`LogStore::recover`].
+    #[error("the log must be recovered before it is written")]
+    NotRecovered,
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(error: std::io::Error) -> Self {
+        StorageError::Io(error.to_string())
+    }
 }
 
 /// An append-only log of opaque records, for one partition.
