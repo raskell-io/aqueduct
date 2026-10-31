@@ -23,6 +23,11 @@ pub trait StateStore {
     /// Atomically and durably records the given runs' complete records and the new checkpoint LSN. Runs
     /// not mentioned keep their saved records. Called only when every log record before `lsn` is durable.
     fn save(&mut self, lsn: u64, runs: &[(String, Vec<Vec<u8>>)]) -> Result<(), StorageError>;
+
+    /// Loads one run's saved records, if the run is in the last checkpoint.
+    fn load_run(&mut self, key: &str) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
+        Ok(self.load()?.runs.remove(key))
+    }
 }
 
 /// No state store: recovery always replays the whole log.
@@ -106,6 +111,22 @@ impl StateStore for RedbStateStore {
         txn.commit()
             .map_err(|e| StorageError::SyncFailed(e.to_string()))?;
         Ok(())
+    }
+
+    fn load_run(&mut self, key: &str) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
+        use redb::ReadableDatabase;
+        let txn = self.db.begin_read().map_err(io)?;
+        let table = txn.open_table(RUNS).map_err(io)?;
+        let Some(value) = table.get(key).map_err(io)? else {
+            return Ok(None);
+        };
+        let decoded = frame::decode_all(value.value());
+        if decoded.valid_len != value.value().len() {
+            return Err(StorageError::Corrupt(format!(
+                "the checkpoint of run {key} does not decode"
+            )));
+        }
+        Ok(Some(decoded.payloads))
     }
 }
 

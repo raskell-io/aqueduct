@@ -197,6 +197,11 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     now_ms: u64,
     retry_policies: BTreeMap<String, RetryPolicy>,
     default_retry: RetryPolicy,
+    /// Every timer that has not fired: (wake time, run, command).
+    timers: BTreeSet<(u64, String, CommandIndex)>,
+    /// Each run's entries in `timers`, to update the index when a run changes.
+    run_timers: BTreeMap<String, Vec<(CommandIndex, u64)>>,
+    evict_finished: bool,
 }
 
 impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
@@ -290,6 +295,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             now_ms: 0,
             retry_policies: BTreeMap::new(),
             default_retry: RetryPolicy::default(),
+            timers: BTreeSet::new(),
+            run_timers: BTreeMap::new(),
+            evict_finished: false,
+        })
+        .map(|mut partition| {
+            let keys: Vec<String> = partition.runs.keys().cloned().collect();
+            for key in keys {
+                partition.refresh_timers(&key);
+            }
+            partition
         })
     }
 
@@ -313,7 +328,11 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         workflow: &str,
         input: Payload,
     ) -> Result<(), PartitionError> {
-        if !self.runs.contains_key(key) {
+        // A finished run may have been unloaded; it still exists, so starting it again is a no-op.
+        let unloaded = !self.runs.contains_key(key)
+            && self.evict_finished
+            && self.state.load_run(key)?.is_some();
+        if !self.runs.contains_key(key) && !unloaded {
             if self.deciders.get(workflow).is_none() {
                 return Err(PartitionError::UnknownWorkflow(workflow.to_owned()));
             }
@@ -354,10 +373,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         id: &str,
         payload: Payload,
     ) -> Result<(), PartitionError> {
-        let run = self
-            .runs
-            .get(key)
-            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        let Some(run) = self.runs.get(key) else {
+            // An unloaded finished run drops the signal, as any finished run does.
+            if self.lookup(key)?.is_none() {
+                return Err(PartitionError::UnknownRun(key.to_owned()));
+            }
+            self.send(Outbound::Signaled {
+                key: key.to_owned(),
+            });
+            return Ok(());
+        };
         let event = Event::Signal {
             name: name.to_owned(),
             id: id.to_owned(),
@@ -375,15 +400,10 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// Fires every timer whose wake time is at or before the partition's clock. Timers never fire early.
     pub fn fire_due_timers(&mut self) -> Result<(), PartitionError> {
         let due: Vec<(String, CommandIndex)> = self
-            .runs
+            .timers
             .iter()
-            .flat_map(|(key, run)| {
-                run.state
-                    .timers()
-                    .into_iter()
-                    .filter(|(_, wake_at)| *wake_at <= self.now_ms)
-                    .map(move |(cmd, _)| (key.clone(), cmd))
-            })
+            .take_while(|(wake_at, _, _)| *wake_at <= self.now_ms)
+            .map(|(_, key, cmd)| (key.clone(), *cmd))
             .collect();
         for (key, cmd) in due {
             let Some(run) = self.runs.get(&key) else {
@@ -398,11 +418,68 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
 
     /// The earliest wake time of any timer that has not fired.
     pub fn next_timer(&self) -> Option<u64> {
-        self.runs
-            .values()
-            .flat_map(|run| run.state.timers())
-            .map(|(_, wake_at)| wake_at)
-            .min()
+        self.timers.first().map(|(wake_at, _, _)| *wake_at)
+    }
+
+    /// The number of pending timers.
+    pub fn pending_timers(&self) -> usize {
+        self.timers.len()
+    }
+
+    /// Unloads finished runs once a checkpoint holds them, so memory holds only active runs. Lookups
+    /// ([`Partition::lookup`]), repeated starts and signals fall back to the state store.
+    pub fn set_evict_finished(&mut self, evict: bool) {
+        self.evict_finished = evict;
+        self.evict();
+    }
+
+    /// A run's state, from memory or, for an unloaded finished run, from the state store.
+    pub fn lookup(&mut self, key: &str) -> Result<Option<RunState>, PartitionError> {
+        if let Some(run) = self.runs.get(key) {
+            return Ok(Some(run.state.clone()));
+        }
+        let Some(records) = self.state.load_run(key)? else {
+            return Ok(None);
+        };
+        let verified = verify_chain(key, records.iter().map(Vec::as_slice)).map_err(|e| {
+            PartitionError::Corrupt(format!("run {key}: hash chain does not verify: {e}"))
+        })?;
+        let state = RunState::from_journal(&verified.entries)
+            .map_err(|e| PartitionError::Corrupt(format!("run {key}: journal is invalid: {e}")))?;
+        Ok(Some(state))
+    }
+
+    fn evict(&mut self) {
+        if !self.evict_finished {
+            return;
+        }
+        let finished: Vec<String> = self
+            .runs
+            .iter()
+            .filter(|(key, run)| run.state.status().is_terminal() && !self.dirty.contains(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in finished {
+            self.runs.remove(&key);
+            self.refresh_timers(&key);
+        }
+    }
+
+    /// Re-indexes one run's pending timers.
+    fn refresh_timers(&mut self, key: &str) {
+        for (cmd, wake_at) in self.run_timers.remove(key).unwrap_or_default() {
+            self.timers.remove(&(wake_at, key.to_owned(), cmd));
+        }
+        let Some(run) = self.runs.get(key) else {
+            return;
+        };
+        let pending = run.state.timers();
+        for (cmd, wake_at) in &pending {
+            self.timers.insert((*wake_at, key.to_owned(), *cmd));
+        }
+        if !pending.is_empty() {
+            self.run_timers.insert(key.to_owned(), pending);
+        }
     }
 
     /// Sets the retry policy for one step name.
@@ -468,6 +545,11 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         outcome: StepOutcome,
     ) -> Result<(), PartitionError> {
         let Some(run) = self.runs.get(key) else {
+            // Not in memory: the run ended (and was unloaded) or never existed. Nothing to record.
+            self.send(Outbound::ResultRecorded {
+                key: key.to_owned(),
+                cmd,
+            });
             return Ok(());
         };
         let transition = run
@@ -577,6 +659,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         self.state.save(lsn, &runs)?;
         self.dirty.clear();
         self.log.trim(lsn)?;
+        self.evict();
         Ok(lsn)
     }
 
@@ -633,6 +716,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         if !self.dirty.contains(key) {
             self.dirty.insert(key.to_owned());
         }
+        self.refresh_timers(key);
         Ok(())
     }
 
