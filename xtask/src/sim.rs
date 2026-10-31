@@ -2,12 +2,13 @@
 
 use std::time::Instant;
 
-use aqueduct_sim::{Config, Report, run_seed};
+use aqueduct_sim::{Config, Report, WorkloadKind, run_seed};
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut from = 0u64;
     let mut count = 1_000u64;
     let mut single = None;
+    let mut workload = WorkloadKind::Pipeline;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = || -> Result<u64, String> {
@@ -20,6 +21,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--seed" => single = Some(value()?),
             "--seeds" => count = value()?,
             "--from" => from = value()?,
+            "--workload" => {
+                workload = match iter.next().map(String::as_str) {
+                    Some("native") => WorkloadKind::Pipeline,
+                    Some("starlark") => WorkloadKind::StarlarkPipeline,
+                    other => {
+                        return Err(format!(
+                            "--workload must be native or starlark, not {other:?}"
+                        ));
+                    }
+                }
+            }
             other => {
                 return Err(format!(
                     "unknown argument {other}; use --seed N, or --seeds N [--from S]"
@@ -28,7 +40,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let config = Config::default();
+    let config = Config {
+        workload,
+        ..Config::default()
+    };
     if let Some(seed) = single {
         let report = run_seed(seed, &config).map_err(|f| f.to_string())?;
         println!("{report:#?}");
@@ -51,7 +66,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.failed += report.failed;
     }
     println!(
-        "{count} seeds ({from}..{}) passed in {:.1} s\n\
+        "{count} seeds ({from}..{}, {workload:?}) passed in {:.1} s\n\
          events {}, crashes {} (of which failed syncs {}), torn tails truncated {}\n\
          messages dropped {}, duplicated {}\n\
          step executions {} (repeats {}), runs completed {}, failed as intended {}",

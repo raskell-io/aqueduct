@@ -23,6 +23,12 @@ pub enum Command {
         /// A description of the failure.
         error: String,
     },
+    /// The logic cannot continue (for example, a procedure script raised an error or exceeded its
+    /// budget). Parks the run for an operator instead of failing it. Must be the last command.
+    Park {
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 /// What a decider can observe about a run: its input and the outcomes recorded so far.
@@ -45,6 +51,11 @@ impl<'a> RunView<'a> {
     pub fn outcome(&self, cmd: CommandIndex) -> Option<&'a StepOutcome> {
         let index = usize::try_from(cmd.0).ok()?;
         self.state.steps().get(index)?.outcome.as_ref()
+    }
+
+    /// The outcome of every scheduled step command, by command index (`None` while pending).
+    pub fn outcomes(&self) -> impl Iterator<Item = Option<&'a StepOutcome>> + 'a {
+        self.state.steps().iter().map(|step| step.outcome.as_ref())
     }
 
     /// Commands in the order their outcomes were recorded. Logic that depends on this order must be
