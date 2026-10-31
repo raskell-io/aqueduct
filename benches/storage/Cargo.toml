@@ -1,0 +1,16 @@
+[package]
+name = "aqueduct-bench-storage"
+description = "Phase 0 storage benchmark: redb vs fjall vs a plain framed log (ADR 0009)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+aqueduct-storage.workspace = true
+fjall = "3"
+redb = "4"

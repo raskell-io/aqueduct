@@ -1,0 +1,32 @@
+name: Probe
+
+# Measures fsync latency and the storage benchmark on hosted runners. Runner disks are virtualised and
+# shared, so these numbers are a first data point for Linux, not a reference (ADR 0003, ADR 0009).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/probe.yml
+      - xtask/src/fsync.rs
+      - benches/storage/**
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: fsync
+        run: cargo xtask fsync | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: storage benchmark
+        run: cargo run --release -p aqueduct-bench-storage | tee -a "$GITHUB_STEP_SUMMARY"
