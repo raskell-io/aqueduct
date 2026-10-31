@@ -1,5 +1,8 @@
 # History format, version 0 (draft)
 
+> This specification is licensed under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/).
+> Anyone may implement it, in software under any license, without asking (ADR 0007).
+
 This document specifies how a run's journal is encoded. It is the contract: an implementation in any
 language that follows it can read and verify an Aqueduct history without the Rust code. Version 0 is a
 draft and may change; freezing it requires the owner's approval (BRIEF.md, section 0). Decisions behind it

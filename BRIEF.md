@@ -759,7 +759,9 @@ Standards:
 - Errors: `thiserror` in libraries, typed and actionable; no `unwrap` outside tests.
 - All crates have `publish = false` until the owner approves publishing.
 - Semantic versioning; `CHANGELOG.md` kept from the first release.
-- License: dual **Apache-2.0 OR MIT**. Contributions under the DCO (signed-off commits), no CLA.
+- License: dual **Apache-2.0 OR MIT**. Contributions under the Aqueduct CLA (Apache-derived license
+  grant with an open source commitment), signed by pull request comment; trademark policy for the name;
+  specifications under CC-BY-4.0 (ADR 0007).
 
 ---
 
