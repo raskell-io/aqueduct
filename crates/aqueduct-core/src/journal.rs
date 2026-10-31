@@ -72,6 +72,17 @@ pub enum Entry {
         /// A description of the failure.
         error: String,
     },
+    /// An attempt of a step failed with a retryable error; the step runs again at `wake_at`.
+    StepRetryScheduled {
+        /// The step's command index.
+        cmd: CommandIndex,
+        /// The number of the attempt that failed (1 for the first).
+        attempt: u32,
+        /// The attempt's error.
+        error: String,
+        /// When the next attempt is dispatched: milliseconds since the Unix epoch.
+        wake_at: u64,
+    },
     /// The run started a durable timer (sleep).
     TimerStarted {
         /// The command's index.

@@ -57,6 +57,22 @@ enum Ev {
     TimerTick {
         incarnation: u64,
     },
+    NodeAttemptFailed {
+        key: String,
+        cmd: CommandIndex,
+        error: String,
+    },
+    WorkerAttemptAck {
+        key: String,
+        cmd: CommandIndex,
+    },
+}
+
+/// What a worker reports for one execution of a step.
+#[derive(Clone, Debug)]
+enum WorkerReport {
+    Outcome(StepOutcome),
+    Retry(String),
 }
 
 impl Ev {
@@ -76,6 +92,8 @@ impl Ev {
             Ev::NodeSignal { .. } => 12,
             Ev::ClientSignalAck { .. } => 13,
             Ev::TimerTick { .. } => 14,
+            Ev::NodeAttemptFailed { .. } => 15,
+            Ev::WorkerAttemptAck { .. } => 16,
         }
     }
 
@@ -89,6 +107,8 @@ impl Ev {
                 | Ev::WorkerResultAck { .. }
                 | Ev::NodeSignal { .. }
                 | Ev::ClientSignalAck { .. }
+                | Ev::NodeAttemptFailed { .. }
+                | Ev::WorkerAttemptAck { .. }
         )
     }
 }
@@ -112,13 +132,20 @@ struct World<'c> {
     acked_results: BTreeSet<(String, CommandIndex)>,
     /// Runs whose `go` signal the client saw acknowledged.
     acked_signals: BTreeSet<String>,
-    /// Timer firings already checked against their wake time.
-    checked_timers: BTreeSet<(String, CommandIndex)>,
+    /// Timer firings (run, journal position) already checked against their wake time.
+    checked_timers: BTreeSet<(String, usize)>,
     /// Results the worker holds and resends until acknowledged.
-    worker_pending: BTreeMap<(String, CommandIndex), StepOutcome>,
+    worker_pending: BTreeMap<(String, CommandIndex), WorkerReport>,
     executions: BTreeMap<(String, CommandIndex), u64>,
     report: Report,
     workload: Workload,
+}
+
+fn report_event(key: String, cmd: CommandIndex, report: WorkerReport) -> Ev {
+    match report {
+        WorkerReport::Outcome(outcome) => Ev::NodeStepResult { key, cmd, outcome },
+        WorkerReport::Retry(error) => Ev::NodeAttemptFailed { key, cmd, error },
+    }
 }
 
 /// How often the node checks for due timers, in simulated milliseconds.
@@ -228,6 +255,13 @@ impl World<'_> {
                 self.report.end_time = self.now;
                 self.report.syncs = self.node.disk().syncs;
                 self.report.torn_tails = self.node.disk().torn_tails;
+                self.report.retries = self
+                    .node
+                    .runs()
+                    .values()
+                    .flat_map(|run| run.journal())
+                    .filter(|e| matches!(e, aqueduct_core::Entry::StepRetryScheduled { .. }))
+                    .count() as u64;
                 self.report.step_executions = self.executions.values().sum();
                 self.report.duplicate_executions =
                     self.report.step_executions - self.executions.len() as u64;
@@ -247,6 +281,12 @@ impl World<'_> {
             Ev::NodeStepResult { key, cmd, outcome } => {
                 if self.node.up {
                     self.node.on_step_result(&key, cmd, outcome)?;
+                    self.after_node_event();
+                }
+            }
+            Ev::NodeAttemptFailed { key, cmd, error } => {
+                if self.node.up {
+                    self.node.on_attempt_failed(&key, cmd, error)?;
                     self.after_node_event();
                 }
             }
@@ -346,23 +386,38 @@ impl World<'_> {
                     self.worker_pending.clear();
                 }
                 *self.executions.entry((key.clone(), cmd)).or_default() += 1;
-                let outcome = (self.workload.execute)(&name, &input);
+                let report = if self.faults && self.rng.chance(self.config.transient_ppm) {
+                    // A transient failure: the engine's retry policy schedules another attempt.
+                    WorkerReport::Retry("transient failure".into())
+                } else {
+                    WorkerReport::Outcome((self.workload.execute)(&name, &input))
+                };
                 self.worker_pending
-                    .insert((key.clone(), cmd), outcome.clone());
-                self.send(Ev::NodeStepResult { key, cmd, outcome });
+                    .insert((key.clone(), cmd), report.clone());
+                self.send(report_event(key, cmd, report));
             }
             Ev::WorkerResultAck { key, cmd } => {
-                self.worker_pending.remove(&(key.clone(), cmd));
+                // Acknowledges an outcome: it must never be lost.
+                if let Some(WorkerReport::Outcome(_)) = self.worker_pending.get(&(key.clone(), cmd))
+                {
+                    self.worker_pending.remove(&(key.clone(), cmd));
+                }
                 self.acked_results.insert((key, cmd));
+            }
+            Ev::WorkerAttemptAck { key, cmd } => {
+                // Acknowledges a retryable failure; the step stays pending until a retry completes it.
+                if let Some(WorkerReport::Retry(_)) = self.worker_pending.get(&(key.clone(), cmd)) {
+                    self.worker_pending.remove(&(key, cmd));
+                }
             }
             Ev::WorkerResend => {
                 let pending: Vec<_> = self
                     .worker_pending
                     .iter()
-                    .map(|((key, cmd), outcome)| (key.clone(), *cmd, outcome.clone()))
+                    .map(|((key, cmd), report)| (key.clone(), *cmd, report.clone()))
                     .collect();
-                for (key, cmd, outcome) in pending {
-                    self.send(Ev::NodeStepResult { key, cmd, outcome });
+                for (key, cmd, report) in pending {
+                    self.send(report_event(key, cmd, report));
                 }
                 self.schedule(self.config.worker_resend, Ev::WorkerResend);
             }
@@ -398,6 +453,7 @@ impl World<'_> {
                     input,
                 },
                 Outbound::ResultRecorded { key, cmd } => Ev::WorkerResultAck { key, cmd },
+                Outbound::AttemptRecorded { key, cmd } => Ev::WorkerAttemptAck { key, cmd },
                 Outbound::Finished { .. } => continue,
             };
             self.send(ev);
@@ -487,19 +543,25 @@ impl World<'_> {
     /// Invariant: timers never fire early. Checked when a firing is first seen, right after the event
     /// that appended it, so the simulated clock is the time it fired.
     fn check_timers(&mut self) -> Result<(), String> {
+        use aqueduct_core::Entry;
         for (key, run) in self.node.runs() {
-            for entry in run.journal() {
-                let aqueduct_core::Entry::TimerFired { cmd } = entry else {
+            let journal = run.journal();
+            for (position, entry) in journal.iter().enumerate() {
+                let Entry::TimerFired { cmd } = entry else {
                     continue;
                 };
-                if !self.checked_timers.insert((key.clone(), *cmd)) {
+                if !self.checked_timers.insert((key.clone(), position)) {
                     continue;
                 }
-                let wake_at = run.journal().iter().find_map(|e| match e {
-                    aqueduct_core::Entry::TimerStarted {
+                // The timer that fired is the latest one armed for this command before the firing.
+                let wake_at = journal[..position].iter().rev().find_map(|e| match e {
+                    Entry::TimerStarted {
                         cmd: c, wake_at, ..
                     }
-                    | aqueduct_core::Entry::SignalAwaited {
+                    | Entry::SignalAwaited {
+                        cmd: c, wake_at, ..
+                    }
+                    | Entry::StepRetryScheduled {
                         cmd: c, wake_at, ..
                     } if c == cmd => Some(*wake_at),
                     _ => None,

@@ -47,6 +47,7 @@ record = version:u8  kind:u8  prev:hash  fields
 | 9 | `SignalAwaited` | `cmd:cmd`, `name:string`, `timeout_ms:varint`, `wake_at:varint` |
 | 10 | `TimerFired` | `cmd:cmd` |
 | 11 | `SignalReceived` | `name:string`, `id:string`, `payload:bytes` |
+| 12 | `StepRetryScheduled` | `cmd:cmd`, `attempt:varint` (fits 32 bits), `error:string`, `wake_at:varint` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
@@ -79,7 +80,10 @@ A decoded history is a valid journal if:
    completes a sleep (outcome `null`) or times out a signal wait that has a timeout. A `SignalReceived`
    completes the oldest signal wait with the same name that has no outcome yet; if there is none, the
    signal is kept, and the next `SignalAwaited` with that name takes the oldest kept signal at once.
-4. Nothing follows `RunCompleted`, `RunFailed` or `Parked` (in version 0; operator resume of parked runs is
+4. `StepRetryScheduled` records a failed, retryable attempt of a step that has no outcome and no pending
+   retry; `attempt` counts 1, 2, 3, ... per step. The next `TimerFired` for that step dispatches it again
+   and gives it no outcome. A step's outcome may still arrive while a retry is pending (a late attempt).
+5. Nothing follows `RunCompleted`, `RunFailed` or `Parked` (in version 0; operator resume of parked runs is
    specified in a later version).
 
 The order of completions may differ from the order of commands; it is the order in which the outcomes

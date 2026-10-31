@@ -47,6 +47,16 @@ fn entry() -> impl Strategy<Value = Entry> {
         any::<u32>().prop_map(|cmd| Entry::TimerFired {
             cmd: CommandIndex(cmd)
         }),
+        (any::<u32>(), any::<u32>(), ".{0,12}", any::<u64>()).prop_map(
+            |(cmd, attempt, error, wake_at)| {
+                Entry::StepRetryScheduled {
+                    cmd: CommandIndex(cmd),
+                    attempt,
+                    error,
+                    wake_at,
+                }
+            }
+        ),
         (".{0,12}", ".{0,12}", payload()).prop_map(|(name, id, payload)| Entry::SignalReceived {
             name,
             id,

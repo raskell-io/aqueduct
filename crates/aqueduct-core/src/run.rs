@@ -58,6 +58,10 @@ pub struct ScheduledStep {
     pub kind: CommandKind,
     /// The recorded outcome, if any.
     pub outcome: Option<StepOutcome>,
+    /// Attempts of this step that failed with a retryable error.
+    pub failed_attempts: u32,
+    /// When the next attempt is due, while a retry is pending (milliseconds since the Unix epoch).
+    pub retry_at: Option<u64>,
 }
 
 impl ScheduledStep {
@@ -86,6 +90,17 @@ pub enum Event {
         cmd: CommandIndex,
         /// The step's outcome.
         outcome: StepOutcome,
+    },
+    /// A step attempt failed with a retryable error, and the engine's retry policy allows another
+    /// attempt after `retry_after_ms`. (When it does not, the engine reports a terminal
+    /// [`Event::StepResult`] instead.)
+    StepAttemptFailed {
+        /// The step's command index.
+        cmd: CommandIndex,
+        /// The attempt's error.
+        error: String,
+        /// The backoff before the next attempt.
+        retry_after_ms: u64,
     },
     /// A timer is due (the engine fires it no earlier than its wake time).
     TimerFired {
@@ -285,6 +300,33 @@ impl RunState {
                 self.expect_kind(*cmd, |kind| kind == CommandKind::Step)?;
                 self.record(*cmd, StepOutcome::Failed(error.clone()))?;
             }
+            Entry::StepRetryScheduled {
+                cmd,
+                attempt,
+                wake_at,
+                ..
+            } => {
+                let index = self.index(*cmd)?;
+                let step = &mut self.steps[index];
+                let valid = step.kind == CommandKind::Step
+                    && step.outcome.is_none()
+                    && step.retry_at.is_none()
+                    && *attempt == step.failed_attempts + 1;
+                if !valid {
+                    return Err(JournalError::InvalidCompletion(*cmd));
+                }
+                step.failed_attempts = *attempt;
+                step.retry_at = Some(*wake_at);
+            }
+            Entry::TimerFired { cmd } if self.command(*cmd)?.kind == CommandKind::Step => {
+                // A retry is due: the step is dispatched again; it still has no outcome.
+                let index = self.index(*cmd)?;
+                if self.steps[index].retry_at.take().is_none()
+                    || self.steps[index].outcome.is_some()
+                {
+                    return Err(JournalError::InvalidCompletion(*cmd));
+                }
+            }
             Entry::TimerFired { cmd } => {
                 let outcome = match self.command(*cmd)?.kind {
                     CommandKind::Sleep { .. } => StepOutcome::Completed(Payload::new(*b"null")),
@@ -337,6 +379,11 @@ impl RunState {
             Event::StepResult { cmd, outcome } => self.handle_result(cmd, outcome),
             Event::Decision(commands) => self.handle_decision(commands, now_ms),
             Event::TimerFired { cmd } => self.handle_timer(cmd),
+            Event::StepAttemptFailed {
+                cmd,
+                error,
+                retry_after_ms,
+            } => self.handle_attempt_failed(cmd, error, retry_after_ms, now_ms),
             Event::Signal { name, id, payload } => self.handle_signal(name, id, payload),
         }
     }
@@ -351,6 +398,7 @@ impl RunState {
             .zip(0u32..)
             .filter(|(step, _)| step.outcome.is_none())
             .filter_map(|(step, index)| match step.kind {
+                CommandKind::Step => step.retry_at.map(|wake_at| (CommandIndex(index), wake_at)),
                 CommandKind::Sleep { wake_at, .. } => Some((CommandIndex(index), wake_at)),
                 CommandKind::Signal { wake_at, .. } if wake_at > 0 => {
                     Some((CommandIndex(index), wake_at))
@@ -379,7 +427,9 @@ impl RunState {
         self.steps
             .iter()
             .zip(0u32..)
-            .filter(|(step, _)| step.outcome.is_none() && step.kind == CommandKind::Step)
+            .filter(|(step, _)| {
+                step.outcome.is_none() && step.kind == CommandKind::Step && step.retry_at.is_none()
+            })
             .map(|(step, index)| Effect::DispatchStep {
                 cmd: CommandIndex(index),
                 name: step.name.clone(),
@@ -463,8 +513,17 @@ impl RunState {
             input,
             kind,
             outcome: None,
+            failed_attempts: 0,
+            retry_at: None,
         });
         Ok(())
+    }
+
+    fn index(&self, cmd: CommandIndex) -> Result<usize, JournalError> {
+        usize::try_from(cmd.0)
+            .ok()
+            .filter(|index| *index < self.steps.len())
+            .ok_or(JournalError::UnknownCommand(cmd))
     }
 
     fn command(&self, cmd: CommandIndex) -> Result<&ScheduledStep, JournalError> {
@@ -531,10 +590,48 @@ impl RunState {
         }
     }
 
+    fn handle_attempt_failed(
+        &self,
+        cmd: CommandIndex,
+        error: String,
+        retry_after_ms: u64,
+        now_ms: u64,
+    ) -> Transition {
+        let Ok(step) = self.command(cmd) else {
+            return Transition::none();
+        };
+        if step.kind != CommandKind::Step || step.outcome.is_some() || step.retry_at.is_some() {
+            // Already completed, or already waiting to retry (a duplicate report): nothing to do.
+            return Transition::none();
+        }
+        Transition {
+            entries: vec![Entry::StepRetryScheduled {
+                cmd,
+                attempt: step.failed_attempts + 1,
+                error,
+                wake_at: now_ms.saturating_add(retry_after_ms),
+            }],
+            effects: Vec::new(),
+        }
+    }
+
     fn handle_timer(&self, cmd: CommandIndex) -> Transition {
         let Ok(step) = self.command(cmd) else {
             return Transition::none();
         };
+        if step.kind == CommandKind::Step {
+            if step.outcome.is_some() || step.retry_at.is_none() {
+                return Transition::none();
+            }
+            return Transition {
+                entries: vec![Entry::TimerFired { cmd }],
+                effects: vec![Effect::DispatchStep {
+                    cmd,
+                    name: step.name.clone(),
+                    input: step.input.clone(),
+                }],
+            };
+        }
         let has_timer = match step.kind {
             CommandKind::Sleep { .. } => true,
             CommandKind::Signal { wake_at, .. } => wake_at > 0,
@@ -605,6 +702,8 @@ impl RunState {
                     input,
                     kind,
                     outcome: None,
+                    failed_attempts: 0,
+                    retry_at: None,
                 };
                 if let Some(recorded) = self.steps.get(steps_seen) {
                     if !same_command(recorded, &issued) {

@@ -10,4 +10,4 @@
 pub mod embedded;
 mod partition;
 
-pub use partition::{Deciders, Outbound, Partition, PartitionError, PartitionRun};
+pub use partition::{Deciders, Outbound, Partition, PartitionError, PartitionRun, RetryPolicy};

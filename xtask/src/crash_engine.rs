@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use aqueduct_core::{Decider, Effect, Event, Payload, RunState, Status, StepOutcome, start};
-use aqueduct_engine::embedded::Engine;
+use aqueduct_engine::embedded::{Attempt, Engine};
 use aqueduct_procedure::Procedure;
 use aqueduct_sim::Rng;
 
@@ -102,7 +102,11 @@ fn open(dir: &str, seed: u64) -> Result<Engine, String> {
         let delay = Rng::new(seed ^ name.len() as u64).below(3);
         builder = builder.step(name, move |input| {
             std::thread::sleep(Duration::from_millis(delay));
-            execute(name, input)
+            // The workload's failures depend only on the input, so they are terminal.
+            match execute(name, input) {
+                StepOutcome::Completed(result) => Attempt::Completed(result),
+                StepOutcome::Failed(error) => Attempt::Fail(error),
+            }
         });
     }
     if std::env::var_os("AQUEDUCT_CRASH_BUG").is_some_and(|v| v == "ack-before-sync") {
