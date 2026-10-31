@@ -57,3 +57,8 @@ Option 3, with redb for state:
 - Linux numbers are still missing; the CI probe (`.github/workflows/probe.yml`) gives a first, not
   representative, data point from a GitHub runner. The cluster reference machine must be measured before
   phase 4 targets are set.
+- One writer per data directory: the file log takes an exclusive lock (`log/LOCK`, `File::try_lock`,
+  stable since Rust 1.89) before reading anything, and holds it until it is closed; the operating system
+  releases it when the process dies. Added after noticing that a second opener (a second engine, or the CLI)
+  would have truncated the first writer's write in progress as if it were a torn tail, before redb's own
+  lock refused it.
