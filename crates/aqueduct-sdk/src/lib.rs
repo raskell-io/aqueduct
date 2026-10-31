@@ -285,6 +285,32 @@ impl WorkflowContext {
         )
     }
 
+    /// Escalates a decision to a person or an agent and waits for the resolution, which it decodes.
+    /// An escalation is an outcome, not an error: the run waits durably (for days if need be), shows up
+    /// in `Engine::escalations`, and continues with whatever the resolver decides. Escalations are
+    /// counted by `reason`.
+    pub fn escalate<T, P>(
+        &self,
+        reason: &str,
+        payload: &P,
+    ) -> impl Future<Output = Result<T, WorkflowError>> + use<T, P>
+    where
+        T: DeserializeOwned,
+        P: Serialize + ?Sized,
+    {
+        let command = serde_json::to_vec(payload)
+            .map_err(|e| WorkflowError::Payload(e.to_string()))
+            .map(|payload| Command::Escalate {
+                reason: reason.to_owned(),
+                payload: Payload::new(payload),
+            });
+        self.call(command, |outcome| match outcome {
+            StepOutcome::Completed(resolution) => serde_json::from_slice(resolution.as_bytes())
+                .map_err(|e| WorkflowError::Payload(e.to_string())),
+            StepOutcome::Failed(error) => Err(WorkflowError::Failed(error)),
+        })
+    }
+
     /// Starts a [`Saga`]: steps with compensations.
     pub fn saga(&self) -> Saga {
         Saga {

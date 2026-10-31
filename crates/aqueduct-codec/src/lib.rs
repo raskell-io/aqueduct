@@ -53,6 +53,8 @@ mod kind {
     pub const STEP_RETRY_SCHEDULED: u8 = 12;
     pub const VALUE_RECORDED: u8 = 13;
     pub const CANCEL_REQUESTED: u8 = 14;
+    pub const ESCALATED: u8 = 15;
+    pub const ESCALATION_RESOLVED: u8 = 16;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -144,6 +146,8 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::StepRetryScheduled { .. } => kind::STEP_RETRY_SCHEDULED,
         Entry::ValueRecorded { .. } => kind::VALUE_RECORDED,
         Entry::CancelRequested { .. } => kind::CANCEL_REQUESTED,
+        Entry::Escalated { .. } => kind::ESCALATED,
+        Entry::EscalationResolved { .. } => kind::ESCALATION_RESOLVED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -206,6 +210,19 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_bytes(&mut out, name.as_bytes());
             put_bytes(&mut out, id.as_bytes());
             put_bytes(&mut out, payload.as_bytes());
+        }
+        Entry::Escalated {
+            cmd,
+            reason,
+            payload,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, reason.as_bytes());
+            put_bytes(&mut out, payload.as_bytes());
+        }
+        Entry::EscalationResolved { cmd, outcome } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, outcome.as_bytes());
         }
         Entry::ValueRecorded { cmd, name, value } => {
             put_varint(&mut out, u64::from(cmd.0));
@@ -279,6 +296,15 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
             cmd: reader.cmd()?,
             name: reader.string()?,
             value: reader.payload()?,
+        },
+        kind::ESCALATED => Entry::Escalated {
+            cmd: reader.cmd()?,
+            reason: reader.string()?,
+            payload: reader.payload()?,
+        },
+        kind::ESCALATION_RESOLVED => Entry::EscalationResolved {
+            cmd: reader.cmd()?,
+            outcome: reader.payload()?,
         },
         kind::CANCEL_REQUESTED => Entry::CancelRequested {
             reason: reader.string()?,

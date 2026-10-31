@@ -19,7 +19,7 @@ do.**
 | **Retryable step error** | timeout, connection refused, HTTP 503, rate limited | retried per the step's policy; when attempts are exhausted it becomes terminal | no (attempts are counted in state) |
 | **Terminal step error** | validation rejected, HTTP 4xx, `fallible` marked as final by the worker | `StepFailed` | yes |
 | **Run failure** | the logic returns an error, a procedure calls `fail()`, a non-fallible step fails | `RunFailed` | yes |
-| **Escalation** (phase 2) | an agent step needs a person, a timeout escalates | `Escalated`, a first-class outcome | yes |
+| **Escalation** | an agent step needs a person, a timeout escalates | `Escalated`, then `EscalationResolved`: a first-class outcome the run waits for (ADR 0020) | yes |
 | **Parked run** | non-determinism, a procedure bug, an exceeded budget | `Parked`; an operator fixes and resumes or resets | yes |
 | **Node fatal** | fsync failure, I/O error on the log, disk full | the node stops and recovers from the log (ADR 0003); never surfaced as a run failure | no |
 | **Corruption** | a hash chain that does not verify after framing succeeded | the partition refuses to start, with a precise report | no |

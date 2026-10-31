@@ -8,16 +8,45 @@ use serde_json::{Value, json};
 
 const CLAIMS: &str = include_str!("../examples/water_damage_photo_evidence.star");
 
-/// Drives a run to its end, executing steps with `execute` in issue order.
+/// Drives a run to its end (or until it waits for something only the outside can give, such as an
+/// escalation's resolution), executing steps with `execute` in issue order.
 fn drive(
     procedure: &Procedure,
     input: Value,
-    mut execute: impl FnMut(&str, &Value) -> Result<Value, String>,
+    execute: impl FnMut(&str, &Value) -> Result<Value, String>,
 ) -> (RunState, Vec<Entry>) {
     let first = start("test", Payload::new(input.to_string().into_bytes()));
     let mut journal = first.entries;
     let mut state = RunState::from_journal(&journal).unwrap();
-    let mut work = first.effects;
+    run(procedure, &mut state, &mut journal, first.effects, execute);
+    (state, journal)
+}
+
+/// Handles `event`, then drives the run as [`drive`] does.
+fn resume(
+    procedure: &Procedure,
+    state: &mut RunState,
+    journal: &mut Vec<Entry>,
+    event: Event,
+    execute: impl FnMut(&str, &Value) -> Result<Value, String>,
+) {
+    let transition = state.handle(event);
+    for entry in &transition.entries {
+        state.apply(entry).unwrap();
+    }
+    journal.extend(transition.entries);
+    run(procedure, state, journal, transition.effects, execute);
+}
+
+fn run(
+    procedure: &Procedure,
+    state: &mut RunState,
+    journal: &mut Vec<Entry>,
+    effects: Vec<Effect>,
+    mut execute: impl FnMut(&str, &Value) -> Result<Value, String>,
+) {
+    let mut work = effects;
+    work.reverse();
     while let Some(effect) = work.pop() {
         let event = match effect {
             Effect::Activate => {
@@ -45,7 +74,17 @@ fn drive(
         journal.extend(transition.entries);
         work.extend(transition.effects.into_iter().rev());
     }
-    (state, journal)
+}
+
+/// Resolves the run's only open escalation, which must have this reason, with `decision`.
+fn resolve(state: &RunState, reason: &str, decision: &str) -> Event {
+    let open = state.open_escalations();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].1, reason);
+    Event::ResolveEscalation {
+        cmd: open[0].0,
+        outcome: Payload::new(json!(decision).to_string().into_bytes()),
+    }
 }
 
 fn claim(amount: u32) -> Value {
@@ -102,9 +141,9 @@ fn claims_procedure_settles_a_simple_claim() {
 #[test]
 fn claims_procedure_asks_for_photos_and_escalates_without_them() {
     let procedure = Procedure::compile("claims.star", CLAIMS).unwrap();
-    let (state, journal) = drive(&procedure, claim(1200), claims_world(true, false));
-    assert_eq!(state.status(), Status::Failed);
-    assert_eq!(state.error(), Some("escalated: no-photos"));
+    let (mut state, mut journal) = drive(&procedure, claim(1200), claims_world(true, false));
+    // An escalation is not an error: the run waits for a person.
+    assert_eq!(state.status(), Status::Running);
     assert_eq!(
         step_names(&journal),
         [
@@ -114,13 +153,43 @@ fn claims_procedure_asks_for_photos_and_escalates_without_them() {
             "customer.photos"
         ]
     );
+    let open = state.open_escalations();
+    assert_eq!(
+        serde_json::from_slice::<Value>(open[0].2.as_bytes()).unwrap(),
+        claim(1200)
+    );
+    let event = resolve(&state, "no-photos", "settle");
+    resume(
+        &procedure,
+        &mut state,
+        &mut journal,
+        event,
+        claims_world(true, false),
+    );
+    assert_eq!(state.status(), Status::Completed);
+    assert_eq!(step_names(&journal).last().unwrap(), "claims.settle@v2");
 }
 
 #[test]
-fn claims_procedure_escalates_large_claims() {
+fn claims_procedure_escalates_large_claims_and_a_person_can_decline() {
     let procedure = Procedure::compile("claims.star", CLAIMS).unwrap();
-    let (state, _) = drive(&procedure, claim(9000), claims_world(true, true));
-    assert_eq!(state.error(), Some("escalated: manual-review"));
+    let (mut state, mut journal) = drive(&procedure, claim(9000), claims_world(true, true));
+    let event = resolve(&state, "manual-review", "suspected fraud");
+    resume(
+        &procedure,
+        &mut state,
+        &mut journal,
+        event,
+        claims_world(true, true),
+    );
+    assert_eq!(state.status(), Status::Failed);
+    assert_eq!(state.error(), Some("declined: suspected fraud"));
+    // A second resolution of the same escalation changes nothing.
+    let again = state.handle(Event::ResolveEscalation {
+        cmd: aqueduct_core::CommandIndex(4),
+        outcome: Payload::new(*b"\"settle\""),
+    });
+    assert!(again.entries.is_empty());
 }
 
 #[test]

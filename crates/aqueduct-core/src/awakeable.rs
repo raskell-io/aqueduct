@@ -30,10 +30,22 @@ pub fn awakeable_id(key: &str, cmd: CommandIndex) -> String {
 /// assert_eq!(parse_awakeable_id("no command"), None);
 /// ```
 pub fn parse_awakeable_id(id: &str) -> Option<(&str, String)> {
+    let (key, cmd) = parse_command_id(id)?;
+    Some((key, awakeable_signal(cmd)))
+}
+
+/// Splits an id of the form `<run key>#<command index>` (awakeables, escalations).
+///
+/// ```
+/// use aqueduct_core::{CommandIndex, parse_command_id};
+/// assert_eq!(parse_command_id("claims:7#4"), Some(("claims:7", CommandIndex(4))));
+/// assert_eq!(parse_command_id("#4"), None);
+/// ```
+pub fn parse_command_id(id: &str) -> Option<(&str, CommandIndex)> {
     let (key, cmd) = id.rsplit_once('#')?;
     let cmd = cmd.parse::<u32>().ok()?;
     if key.is_empty() {
         return None;
     }
-    Some((key, awakeable_signal(CommandIndex(cmd))))
+    Some((key, CommandIndex(cmd)))
 }

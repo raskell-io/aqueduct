@@ -26,8 +26,10 @@ commands:
   complete-awakeable <dir> <id> <json>
                                       complete an awakeable with a payload
   cancel <dir> <key> [<reason>]       ask a run to stop: what it waits for fails as cancelled
+  escalations <dir>                   open escalations: id, reason, payload
+  resolve <dir> <id> <json>           resolve an escalation; the run continues with the payload
 
-Signals, completions and cancellations are durable when the command returns; the run continues when the engine
+Signals, completions, cancellations and resolutions are durable when the command returns; the run continues when the engine
 next opens the directory.
 ";
 
@@ -74,6 +76,32 @@ pub fn run(args: &[String]) -> Result<String, String> {
                     1,
                 )
             })
+        }
+        Some("escalations") => {
+            let partition = load(Path::new(arg(1, "data directory")?))?;
+            let mut out = String::new();
+            for (key, cmd, reason, payload) in partition.open_escalations() {
+                out.push_str(&format!(
+                    "{}  {reason}  {}\n",
+                    aqueduct_core::awakeable_id(&key, cmd),
+                    text(&payload)
+                ));
+            }
+            Ok(out)
+        }
+        Some("resolve") => {
+            let id = arg(2, "escalation id")?;
+            let json = arg(3, "JSON resolution")?;
+            let (key, cmd) = aqueduct_core::parse_command_id(id)
+                .ok_or_else(|| format!("`{id}` is not an escalation id (<run key>#<command>)"))?;
+            serde_json::from_str::<serde_json::Value>(json)
+                .map_err(|e| format!("the resolution is not JSON ({e})"))?;
+            let mut partition = load(Path::new(arg(1, "data directory")?))?;
+            partition
+                .resolve_escalation(key, cmd, Payload::new(json.as_bytes().to_vec()))
+                .map_err(|e| e.to_string())?;
+            partition.flush().map_err(|e| e.to_string())?;
+            Ok(format!("escalation {id} resolved\n"))
         }
         Some("cancel") => {
             let key = arg(2, "run key")?;
@@ -175,6 +203,7 @@ fn describe(dir: &Path, key: &str) -> Result<String, String> {
             }
             CommandKind::Signal { .. } => format!("wait for signal {}", step.name),
             CommandKind::Recorded => format!("record {}", step.name),
+            CommandKind::Escalation => format!("escalation {}", step.name),
         };
         let outcome = match &step.outcome {
             None if step.retry_at.is_some() => {
@@ -321,6 +350,14 @@ fn describe_entry(entry: &Entry) -> String {
         Entry::RunFailed { error } => format!("run failed: {error}"),
         Entry::Parked { reason } => format!("run parked: {reason}"),
         Entry::CancelRequested { reason } => format!("cancel requested: {reason}"),
+        Entry::Escalated {
+            cmd,
+            reason,
+            payload,
+        } => format!("[{cmd}] escalated {reason}: {}", text(payload)),
+        Entry::EscalationResolved { cmd, outcome } => {
+            format!("[{cmd}] escalation resolved: {}", text(outcome))
+        }
     }
 }
 
@@ -390,6 +427,14 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         Entry::RunFailed { error } => json!({"kind": "RunFailed", "error": error}),
         Entry::Parked { reason } => json!({"kind": "Parked", "reason": reason}),
         Entry::CancelRequested { reason } => json!({"kind": "CancelRequested", "reason": reason}),
+        Entry::Escalated {
+            cmd: c,
+            reason,
+            payload: p,
+        } => json!({"kind": "Escalated", "cmd": cmd(c), "reason": reason, "payload": payload(p)}),
+        Entry::EscalationResolved { cmd: c, outcome } => {
+            json!({"kind": "EscalationResolved", "cmd": cmd(c), "outcome": payload(outcome)})
+        }
     }
 }
 

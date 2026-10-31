@@ -35,6 +35,13 @@ pub enum Command {
         /// The value observed now.
         value: Payload,
     },
+    /// Escalate a decision to a person or an agent, and wait for its resolution (the outcome).
+    Escalate {
+        /// Why; escalations are counted by reason.
+        reason: String,
+        /// What the resolver needs to decide.
+        payload: Payload,
+    },
     /// Complete the run. Must be the last command.
     CompleteRun {
         /// The run's output.

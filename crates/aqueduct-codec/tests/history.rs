@@ -28,6 +28,17 @@ fn entry() -> impl Strategy<Value = Entry> {
         ".{0,12}".prop_map(|error| Entry::RunFailed { error }),
         ".{0,12}".prop_map(|reason| Entry::Parked { reason }),
         ".{0,12}".prop_map(|reason| Entry::CancelRequested { reason }),
+        (any::<u32>(), ".{0,12}", payload()).prop_map(|(cmd, reason, payload)| {
+            Entry::Escalated {
+                cmd: CommandIndex(cmd),
+                reason,
+                payload,
+            }
+        }),
+        (any::<u32>(), payload()).prop_map(|(cmd, outcome)| Entry::EscalationResolved {
+            cmd: CommandIndex(cmd),
+            outcome
+        }),
         (any::<u32>(), any::<u64>(), any::<u64>()).prop_map(|(cmd, duration_ms, wake_at)| {
             Entry::TimerStarted {
                 cmd: CommandIndex(cmd),

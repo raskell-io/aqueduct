@@ -52,6 +52,8 @@ pub enum CommandKind {
     },
     /// A value recorded from outside the logic. It is born completed.
     Recorded,
+    /// An escalation, waiting for a person or an agent to resolve it. Its outcome is the resolution.
+    Escalation,
 }
 
 /// A command as recorded in the journal, with its outcome if one has been recorded.
@@ -85,6 +87,7 @@ impl ScheduledStep {
                 )
             }
             CommandKind::Recorded => format!("a recorded value `{}`", self.name),
+            CommandKind::Escalation => format!("an escalation `{}`", self.name),
         }
     }
 }
@@ -116,6 +119,13 @@ pub enum Event {
     TimerFired {
         /// The command whose timer is due.
         cmd: CommandIndex,
+    },
+    /// A person or an agent resolved an escalation. Only the first resolution counts.
+    ResolveEscalation {
+        /// The escalation's command.
+        cmd: CommandIndex,
+        /// The resolution.
+        outcome: Payload,
     },
     /// Someone asked the run to stop. Only the first cancellation counts.
     Cancel {
@@ -289,6 +299,17 @@ impl RunState {
             Entry::StepScheduled { cmd, name, input } => {
                 self.push_command(*cmd, name, input.clone(), CommandKind::Step)?;
             }
+            Entry::Escalated {
+                cmd,
+                reason,
+                payload,
+            } => {
+                self.push_command(*cmd, reason, payload.clone(), CommandKind::Escalation)?;
+            }
+            Entry::EscalationResolved { cmd, outcome } => {
+                self.expect_kind(*cmd, |kind| kind == CommandKind::Escalation)?;
+                self.record(*cmd, StepOutcome::Completed(outcome.clone()))?;
+            }
             Entry::CancelRequested { reason } => {
                 if self.cancel.is_some() {
                     return Err(JournalError::DuplicateCancel);
@@ -435,6 +456,18 @@ impl RunState {
                 retry_after_ms,
             } => self.handle_attempt_failed(cmd, error, retry_after_ms, now_ms),
             Event::Signal { name, id, payload } => self.handle_signal(name, id, payload),
+            Event::ResolveEscalation { cmd, outcome } => {
+                match self.command(cmd) {
+                    Ok(step) if step.kind == CommandKind::Escalation && step.outcome.is_none() => {
+                        Transition {
+                            entries: vec![Entry::EscalationResolved { cmd, outcome }],
+                            effects: vec![Effect::Activate],
+                        }
+                    }
+                    // Unknown, not an escalation, or already resolved (or cancelled): dropped.
+                    _ => Transition::none(),
+                }
+            }
             Event::Cancel { reason } => {
                 if self.cancel.is_some() {
                     return Transition::none();
@@ -542,6 +575,19 @@ impl RunState {
     /// The failure or parking reason, if the run failed or was parked.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Escalations waiting for a resolution: `(command, reason, payload)`.
+    pub fn open_escalations(&self) -> Vec<(CommandIndex, &str, &Payload)> {
+        if self.status.is_terminal() {
+            return Vec::new();
+        }
+        self.steps
+            .iter()
+            .zip(0u32..)
+            .filter(|(step, _)| step.kind == CommandKind::Escalation && step.outcome.is_none())
+            .map(|(step, index)| (CommandIndex(index), step.name.as_str(), &step.input))
+            .collect()
     }
 
     /// The cancellation's reason, if the run was cancelled.
@@ -721,7 +767,7 @@ impl RunState {
         let has_timer = match step.kind {
             CommandKind::Sleep { .. } => true,
             CommandKind::Signal { wake_at, .. } => wake_at > 0,
-            CommandKind::Step | CommandKind::Recorded => false,
+            CommandKind::Step | CommandKind::Recorded | CommandKind::Escalation => false,
         };
         if step.outcome.is_some() || !has_timer {
             return Transition::none();
@@ -778,11 +824,13 @@ impl RunState {
                     },
                 }),
                 Command::Record { .. } => Some(CommandKind::Recorded),
+                Command::Escalate { .. } => Some(CommandKind::Escalation),
                 _ => None,
             };
             if let Some(kind) = new_kind {
                 let (name, input) = match &command {
                     Command::ScheduleStep { name, input } => (name.clone(), input.clone()),
+                    Command::Escalate { reason, payload } => (reason.clone(), payload.clone()),
                     Command::AwaitSignal { name, .. } | Command::Record { name, .. } => {
                         (name.clone(), Payload::default())
                     }
@@ -840,6 +888,11 @@ impl RunState {
                                 timeout_ms,
                                 wake_at,
                             },
+                            CommandKind::Escalation => Entry::Escalated {
+                                cmd,
+                                reason: issued.name,
+                                payload: issued.input,
+                            },
                             CommandKind::Recorded => continue,
                         });
                         if !transition.effects.contains(&Effect::Activate) {
@@ -869,6 +922,13 @@ impl RunState {
                                 cmd,
                                 duration_ms,
                                 wake_at,
+                            });
+                        }
+                        CommandKind::Escalation => {
+                            transition.entries.push(Entry::Escalated {
+                                cmd,
+                                reason: issued.name,
+                                payload: issued.input,
                             });
                         }
                         CommandKind::Recorded => {
@@ -914,7 +974,8 @@ impl RunState {
                 Command::ScheduleStep { .. }
                 | Command::Sleep { .. }
                 | Command::AwaitSignal { .. }
-                | Command::Record { .. } => {}
+                | Command::Record { .. }
+                | Command::Escalate { .. } => {}
                 Command::CompleteRun { .. } | Command::FailRun { .. } | Command::Park { .. }
                     if position + 1 != total =>
                 {
@@ -967,6 +1028,7 @@ fn same_command(recorded: &ScheduledStep, issued: &ScheduledStep) -> bool {
                 CommandKind::Signal { timeout_ms: b, .. },
             ) => a == b,
             (CommandKind::Recorded, CommandKind::Recorded) => true,
+            (CommandKind::Escalation, CommandKind::Escalation) => true,
             _ => false,
         }
 }

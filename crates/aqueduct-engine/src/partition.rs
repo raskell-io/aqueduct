@@ -158,6 +158,11 @@ pub enum Outbound {
         /// The run key.
         key: String,
     },
+    /// An escalation's resolution was recorded (or dropped: already resolved, or the run ended).
+    Resolved {
+        /// The run key.
+        key: String,
+    },
     /// A run reached a terminal status.
     Finished {
         /// The run key.
@@ -410,6 +415,50 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             key: key.to_owned(),
         });
         Ok(())
+    }
+
+    /// Resolves an escalation of a run; the run continues with `outcome`. Only the first resolution
+    /// counts; later ones, and resolutions of ended runs, are acknowledged and dropped.
+    pub fn resolve_escalation(
+        &mut self,
+        key: &str,
+        cmd: CommandIndex,
+        outcome: Payload,
+    ) -> Result<(), PartitionError> {
+        let Some(run) = self.runs.get(key) else {
+            if self.lookup(key)?.is_none() {
+                return Err(PartitionError::UnknownRun(key.to_owned()));
+            }
+            self.send(Outbound::Resolved {
+                key: key.to_owned(),
+            });
+            return Ok(());
+        };
+        let transition = run
+            .state
+            .handle_at(Event::ResolveEscalation { cmd, outcome }, self.now_ms);
+        let effects = self.append(key, transition)?;
+        self.perform(key, effects)?;
+        self.send(Outbound::Resolved {
+            key: key.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Every open escalation, by run key: `(key, command, reason, payload)`. Runs with an open
+    /// escalation are running, so they are all in memory.
+    pub fn open_escalations(&self) -> Vec<(String, CommandIndex, String, Payload)> {
+        self.runs
+            .iter()
+            .flat_map(|(key, run)| {
+                run.state
+                    .open_escalations()
+                    .into_iter()
+                    .map(|(cmd, reason, payload)| {
+                        (key.clone(), cmd, reason.to_owned(), payload.clone())
+                    })
+            })
+            .collect()
     }
 
     /// Sends a signal to a run. A signal whose non-empty `id` the run has already recorded is dropped,
