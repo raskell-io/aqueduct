@@ -70,6 +70,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "aqueduct"
 version = "0.0.0"
 dependencies = [
+ "aqueduct-core",
+ "aqueduct-engine",
+ "aqueduct-procedure",
  "aqueduct-sdk",
 ]
 
@@ -128,6 +131,10 @@ name = "aqueduct-sdk"
 version = "0.0.0"
 dependencies = [
  "aqueduct-core",
+ "aqueduct-engine",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -138,6 +145,7 @@ dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
+ "aqueduct-sdk",
  "aqueduct-storage",
  "serde_json",
 ]

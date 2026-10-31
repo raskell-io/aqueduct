@@ -145,3 +145,15 @@ fn a_checkpoint_that_skips_recovered_runs_is_caught() {
         failure.message
     );
 }
+
+#[test]
+fn the_rust_sdk_pipeline_holds_every_invariant() {
+    // The same pipeline as a Rust async fn: replay by re-running the function on every activation.
+    let config = Config {
+        workload: WorkloadKind::RustPipeline,
+        ..Config::default()
+    };
+    for seed in 0..300 {
+        run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
+    }
+}

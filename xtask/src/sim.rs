@@ -26,9 +26,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     Some("native") => WorkloadKind::Pipeline,
                     Some("starlark") => WorkloadKind::StarlarkPipeline,
                     Some("timers") => WorkloadKind::StarlarkTimers,
+                    Some("rust") => WorkloadKind::RustPipeline,
                     other => {
                         return Err(format!(
-                            "--workload must be native, starlark or timers, not {other:?}"
+                            "--workload must be native, starlark, timers or rust, not {other:?}"
                         ));
                     }
                 }
