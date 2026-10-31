@@ -111,6 +111,22 @@ def run(input):
     return step("validate", merged)
 "##;
 
+/// The pipeline as a Rust workflow written with the SDK: the same steps and data flow as
+/// [`STARLARK_PIPELINE`], replayed by re-running the `async fn` on every activation.
+pub async fn rust_pipeline(
+    ctx: aqueduct_sdk::WorkflowContext,
+    input: String,
+) -> Result<String, aqueduct_sdk::WorkflowError> {
+    let extracted: String = ctx.step("extract", &input).await?;
+    let (a, b) = aqueduct_sdk::join(
+        ctx.step::<String, _>("map_a", &extracted),
+        ctx.step::<String, _>("map_b", &extracted),
+    )
+    .await;
+    let merged: String = ctx.step("merge", &format!("{}#{}", a?, b?)).await?;
+    ctx.step("validate", &merged).await
+}
+
 /// A procedure that sleeps one simulated second, then waits for the `go` signal.
 pub const STARLARK_TIMERS: &str = r##"
 def run(input):
@@ -157,6 +173,12 @@ impl Workload {
                 decider: Arc::new(Pipeline),
                 execute,
             },
+            WorkloadKind::RustPipeline => Workload {
+                kind,
+                signals: false,
+                decider: Arc::new(aqueduct_sdk::workflow(rust_pipeline)),
+                execute: execute_json,
+            },
             WorkloadKind::StarlarkTimers => Workload {
                 kind,
                 signals: true,
@@ -185,7 +207,9 @@ impl Workload {
             WorkloadKind::Pipeline => {
                 Payload::new((0..len).map(|_| rng.below(256) as u8).collect::<Vec<u8>>())
             }
-            WorkloadKind::StarlarkPipeline | WorkloadKind::StarlarkTimers => {
+            WorkloadKind::StarlarkPipeline
+            | WorkloadKind::StarlarkTimers
+            | WorkloadKind::RustPipeline => {
                 let text: String = (0..len)
                     .map(|_| char::from(b'a' + rng.below(26) as u8))
                     .collect();

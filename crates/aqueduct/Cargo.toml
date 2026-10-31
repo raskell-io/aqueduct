@@ -15,3 +15,6 @@ workspace = true
 
 [dependencies]
 aqueduct-sdk.workspace = true
+aqueduct-core.workspace = true
+aqueduct-engine.workspace = true
+aqueduct-procedure.workspace = true

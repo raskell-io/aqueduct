@@ -37,6 +37,7 @@ jobs:
       - run: cargo xtask sim --seeds 10000
       - run: cargo xtask sim --seeds 2000 --workload starlark
       - run: cargo xtask sim --seeds 2000 --workload timers
+      - run: cargo xtask sim --seeds 2000 --workload rust
 
   crash:
     name: crash harness

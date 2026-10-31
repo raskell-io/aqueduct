@@ -37,6 +37,8 @@ pub enum WorkloadKind {
     /// A Starlark procedure that sleeps and waits for a signal: exercises durable timers and
     /// exactly-once signals under faults.
     StarlarkTimers,
+    /// The pipeline as a Rust `async fn` written with the SDK (`aqueduct-sdk`).
+    RustPipeline,
 }
 
 /// Deliberately injected bugs, used to check that the simulator catches them.
@@ -175,6 +177,7 @@ impl std::fmt::Display for Failure {
             WorkloadKind::Pipeline => "native",
             WorkloadKind::StarlarkPipeline => "starlark",
             WorkloadKind::StarlarkTimers => "timers",
+            WorkloadKind::RustPipeline => "rust",
         };
         write!(
             f,
