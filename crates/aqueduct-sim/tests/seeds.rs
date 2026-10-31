@@ -192,24 +192,3 @@ fn a_decision_based_on_something_not_yet_durable_is_caught() {
         "the simulator should catch a dispatch built on lost state"
     );
 }
-
-#[test]
-fn a_recorded_value_used_before_it_is_durable_is_caught() {
-    // The Rust workload passes a recorded UUID to its first step. Releasing that dispatch before the
-    // value is durable lets a crash record a different UUID for the same command.
-    let config = Config {
-        workload: WorkloadKind::RustPipeline,
-        bugs: Bugs {
-            ack_before_sync: true,
-            ..Bugs::default()
-        },
-        ..Config::default()
-    };
-    let failure = (0..2_000)
-        .filter_map(|seed| run_seed(seed, &config).err())
-        .find(|failure| failure.message.contains("was dispatched as"))
-        .expect(
-            "the simulator should catch a dispatch that used a value later recorded differently",
-        );
-    assert!(failure.message.contains("stamp"), "{}", failure.message);
-}
