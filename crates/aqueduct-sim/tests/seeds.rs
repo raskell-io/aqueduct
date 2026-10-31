@@ -124,3 +124,24 @@ fn timers_and_signals_hold_every_invariant() {
         run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
     }
 }
+
+#[test]
+fn a_checkpoint_that_skips_recovered_runs_is_caught() {
+    // Found by the simulator while checkpoints were written: runs recovered from the log after a
+    // checkpoint must be saved by the next one, which moves past their log records.
+    let config = Config {
+        bugs: Bugs {
+            checkpoint_forgets_recovered_runs: true,
+            ..Bugs::default()
+        },
+        ..Config::default()
+    };
+    let failure = (0..1_000)
+        .find_map(|seed| run_seed(seed, &config).err())
+        .expect("the simulator should catch checkpoints that skip recovered runs");
+    assert!(
+        failure.message.contains("lost acknowledged") || failure.message.contains("hash chain"),
+        "{}",
+        failure.message
+    );
+}

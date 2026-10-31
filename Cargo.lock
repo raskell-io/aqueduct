@@ -148,6 +148,7 @@ version = "0.0.0"
 dependencies = [
  "crc32fast",
  "proptest",
+ "redb",
  "thiserror",
 ]
 

@@ -8,8 +8,10 @@
 
 mod file_log;
 pub mod frame;
+mod state;
 
 pub use file_log::{FileLog, FileLogOptions};
+pub use state::{Checkpoint, NoStateStore, RedbStateStore, StateStore};
 
 /// A storage failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -51,5 +53,18 @@ pub trait LogStore {
     fn sync(&mut self) -> Result<(), StorageError>;
 
     /// Returns all valid records in order and truncates any torn or corrupt tail.
-    fn recover(&mut self) -> Result<Vec<Vec<u8>>, StorageError>;
+    fn recover(&mut self) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.recover_from(0)
+    }
+
+    /// Returns the valid records with LSN `from` and later, in order, truncating any torn tail. Fails if
+    /// records from `from` on are missing (trimmed or never written).
+    fn recover_from(&mut self, from: u64) -> Result<Vec<Vec<u8>>, StorageError>;
+
+    /// The LSN the next synced record will get.
+    fn next_lsn(&self) -> u64;
+
+    /// Allows records before `before` to be deleted (a checkpoint covers them). Implementations may keep
+    /// some of them; they must keep everything from `before` on.
+    fn trim(&mut self, before: u64) -> Result<(), StorageError>;
 }

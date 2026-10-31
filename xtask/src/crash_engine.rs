@@ -97,7 +97,8 @@ fn describe(status: Status, output: Option<&Payload>, error: Option<&str>) -> St
 fn open(dir: &str, seed: u64) -> Result<Engine, String> {
     let mut builder = Engine::builder(PathBuf::from(dir))
         .workflow("pipeline", procedure()?)
-        .segment_bytes(256 << 10);
+        .segment_bytes(16 << 10)
+        .checkpoint_every(64);
     for name in STEPS {
         let delay = Rng::new(seed ^ name.len() as u64).below(3);
         builder = builder.step(name, move |input| {
@@ -213,10 +214,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if checked != last + 1 {
         return Err(format!("{checked} runs checked, {} acknowledged", last + 1));
     }
+    // Evidence that checkpoints trimmed the log: how many segments are left, and the oldest LSN kept.
+    let segments = aqueduct_storage::FileLog::open(
+        dir.join("log"),
+        aqueduct_storage::FileLogOptions::default(),
+    )
+    .and_then(|log| log.segments())
+    .map_err(|e| e.to_string())?;
     println!(
-        "{kills} kills passed in {:.1} s: {checked} acknowledged runs all ended as the reference ({completed} completed, {} failed as intended)",
+        "{kills} kills passed in {:.1} s: {checked} acknowledged runs all ended as the reference ({completed} completed, {} failed as intended); log trimmed to {} segments from LSN {}",
         started.elapsed().as_secs_f64(),
-        checked - completed
+        checked - completed,
+        segments.len(),
+        segments.first().copied().unwrap_or(0)
     );
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

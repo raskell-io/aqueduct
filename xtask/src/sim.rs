@@ -60,6 +60,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.sync_failures += report.sync_failures;
         total.torn_tails += report.torn_tails;
         total.retries += report.retries;
+        total.checkpoints += report.checkpoints;
         total.dropped += report.dropped;
         total.duplicated += report.duplicated;
         total.step_executions += report.step_executions;
@@ -69,7 +70,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     println!(
         "{count} seeds ({from}..{}, {workload:?}) passed in {:.1} s\n\
-         events {}, crashes {} (of which failed syncs {}), torn tails truncated {}\n\
+         events {}, crashes {} (of which failed syncs {}), torn tails truncated {}, checkpoints {}\n\
          messages dropped {}, duplicated {}\n\
          step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}",
         from + count,
@@ -78,6 +79,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.crashes,
         total.sync_failures,
         total.torn_tails,
+        total.checkpoints,
         total.dropped,
         total.duplicated,
         total.step_executions,

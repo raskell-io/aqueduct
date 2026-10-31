@@ -26,8 +26,12 @@
 //! Steps return an [`Attempt`]: retryable failures are retried by the step's [`RetryPolicy`] with
 //! durable, journaled backoff; terminal failures fail the step at once.
 //!
+//! Every `checkpoint_every` log records, and on shutdown, the engine saves a checkpoint of the runs that
+//! changed to `state.redb` (ADR 0009); recovery loads it and replays only the log after it, and log
+//! segments it covers are deleted.
+//!
 //! Not yet: a timer index (timers are found by scanning
-//! runs), a materialised state store
+//! runs), unloading finished runs from memory
 //! (recovery replays the whole log; checkpoints in redb come with ADR 0009's state store).
 
 use std::collections::BTreeMap;
@@ -39,7 +43,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use aqueduct_core::{CommandIndex, Decider, Payload, Status, StepOutcome};
-use aqueduct_storage::{FileLog, FileLogOptions};
+use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore};
 
 use crate::{Deciders, Outbound, Partition, PartitionError, RetryPolicy};
 
@@ -107,6 +111,7 @@ pub struct Builder {
     workers: usize,
     redispatch: Duration,
     log: FileLogOptions,
+    checkpoint_every: u64,
     ack_before_sync: bool,
     retry_policies: BTreeMap<String, RetryPolicy>,
     default_retry: RetryPolicy,
@@ -158,6 +163,13 @@ impl Builder {
         self
     }
 
+    /// Saves a checkpoint after this many log records (default 10,000), and on shutdown. Recovery
+    /// loads the last checkpoint and replays only the log after it; older log segments are deleted.
+    pub fn checkpoint_every(mut self, records: u64) -> Self {
+        self.checkpoint_every = records.max(1);
+        self
+    }
+
     /// Log segment size (default 64 MiB).
     pub fn segment_bytes(mut self, bytes: u64) -> Self {
         self.log.segment_bytes = bytes;
@@ -175,8 +187,10 @@ impl Builder {
     pub fn open(self) -> Result<Engine, EngineError> {
         let log = FileLog::open(self.dir.join("log"), self.log)
             .map_err(|e| EngineError::Open(e.to_string()))?;
-        let mut partition =
-            Partition::recover(log, self.deciders).map_err(|e| EngineError::Open(e.to_string()))?;
+        let state = RedbStateStore::open(&self.dir.join("state.redb"))
+            .map_err(|e| EngineError::Open(e.to_string()))?;
+        let mut partition = Partition::recover_with_state(log, state, self.deciders)
+            .map_err(|e| EngineError::Open(e.to_string()))?;
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(self.default_retry);
         for (step, policy) in &self.retry_policies {
@@ -195,8 +209,11 @@ impl Builder {
                 std::thread::spawn(move || worker(&inbox, &steps, &results))
             })
             .collect();
+        let last_checkpoint = partition.log().next_lsn();
         let processor = Processor {
             partition,
+            checkpoint_every: self.checkpoint_every,
+            last_checkpoint,
             jobs,
             waiters: BTreeMap::new(),
             starts: BTreeMap::new(),
@@ -229,6 +246,7 @@ impl Engine {
             workers: 4,
             redispatch: Duration::from_secs(30),
             log: FileLogOptions::default(),
+            checkpoint_every: 10_000,
             ack_before_sync: false,
             retry_policies: BTreeMap::new(),
             default_retry: RetryPolicy::default(),
@@ -354,7 +372,9 @@ struct Job {
 }
 
 struct Processor {
-    partition: Partition<FileLog>,
+    partition: Partition<FileLog, RedbStateStore>,
+    checkpoint_every: u64,
+    last_checkpoint: u64,
     jobs: Sender<Job>,
     waiters: BTreeMap<String, Vec<Sender<Result<RunResult, EngineError>>>>,
     starts: BTreeMap<String, Vec<Sender<Result<(), EngineError>>>>,
@@ -394,11 +414,24 @@ impl Processor {
             for request in first.into_iter().chain(inbox.try_iter()) {
                 if !self.handle(request)? {
                     self.flush()?;
+                    self.checkpoint()?;
                     return Ok(());
                 }
             }
             self.flush()?;
+            if self.partition.log().next_lsn() - self.last_checkpoint >= self.checkpoint_every {
+                self.checkpoint()?;
+            }
         }
+    }
+
+    /// Saves a checkpoint. Only called right after a flush, when everything in memory is durable.
+    fn checkpoint(&mut self) -> Result<(), String> {
+        self.last_checkpoint = self
+            .partition
+            .checkpoint()
+            .map_err(|e| format!("checkpoint failed: {e}"))?;
+        Ok(())
     }
 
     /// Applies one request; false on shutdown.
