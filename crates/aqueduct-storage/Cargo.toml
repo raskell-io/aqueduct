@@ -14,4 +14,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-aqueduct-core.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

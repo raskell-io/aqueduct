@@ -621,7 +621,7 @@ must be derived from that measurement, and throughput targets depend on group co
 |---|---|
 | Embedded: journal appends per second, fsync on, group commit | 50,000+ |
 | Embedded: three-step workflows completed per second | 5,000+ |
-| Embedded: start to first step dispatched, p99, fsync on | set after fsync measurement |
+| Embedded: start to first step dispatched, p99, fsync on | under 15 ms on macOS (ADR 0003); Linux to be measured |
 | Embedded: start to first step dispatched, p99, `Durability::Os` | under 5 ms |
 | Procedure interpreter: decisions per second per core | set in phase 2 |
 | Single server: run starts per second over gRPC | 10,000+ |
@@ -629,6 +629,9 @@ must be derived from that measurement, and throughput targets depend on group co
 | Recovery: leader failover to first new dispatch, p99 | under 3 s |
 | Pending timers per cluster without memory growth | 10 million+ |
 | Open runs per partition with lazy loading | millions; only active runs in memory |
+
+The phase 0 measurement on the M4 (about 4 ms per `F_FULLFSYNC`) is in
+`docs/measurements/2026-10-31-fsync-m4.md`, and the revised targets are in ADR 0003.
 
 Benchmarks live in `benches/` (criterion for micro benchmarks, a load generator binary for end to end) and
 run nightly. Regressions over 10 percent fail the nightly job.

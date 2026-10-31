@@ -1,9 +1,74 @@
 //! The pure core of Aqueduct: the journal model, commands and events, and the state machine
-//! `(state, event) -> (state, effects)` that decides what happens to a run.
+//! `(state, event) -> (entries, effects)` that decides what happens to a run.
 //!
 //! This crate has no I/O, no clock, no randomness and no async. Everything with side effects lives
-//! behind traits in other crates so it can be simulated. See `BRIEF.md`, sections 4 and 5.
+//! in other crates so it can be simulated. The execution model is described in
+//! `docs/adr/0004-execution-model.md`.
 //!
-//! Status: phase 0, not yet implemented.
+//! The flow for a run:
+//!
+//! 1. [`start`] produces the first [`Entry`] and an [`Effect::Activate`].
+//! 2. The caller appends entries to the journal, applying each with [`RunState::apply`].
+//! 3. Once the entries are durable, the caller performs the effects. [`Effect::Activate`] means: ask the
+//!    run's [`Decider`] for its commands and feed them back with [`Event::Decision`].
+//!    [`Effect::DispatchStep`] means: execute the step and feed the outcome back with
+//!    [`Event::StepResult`].
+//! 4. After a restart, [`RunState::from_journal`] rebuilds the state and
+//!    [`RunState::recovery_effects`] says what to do next.
+//!
+//! ```
+//! use aqueduct_core::{
+//!     start, Command, CommandIndex, Decider, Effect, Entry, Event, Payload, RunState, RunView,
+//!     Status, StepOutcome,
+//! };
+//!
+//! // A decider that runs one step and completes with its result.
+//! struct Echo;
+//! impl Decider for Echo {
+//!     fn decide(&self, view: &RunView<'_>) -> Vec<Command> {
+//!         let mut commands =
+//!             vec![Command::ScheduleStep { name: "echo".into(), input: view.input().clone() }];
+//!         if let Some(StepOutcome::Completed(result)) = view.outcome(CommandIndex(0)) {
+//!             commands.push(Command::CompleteRun { output: result.clone() });
+//!         }
+//!         commands
+//!     }
+//! }
+//!
+//! // Appends a transition's entries and returns its effects (a real engine makes the
+//! // entries durable before performing the effects).
+//! fn handle(state: &mut RunState, journal: &mut Vec<Entry>, event: Event) -> Vec<Effect> {
+//!     let transition = state.handle(event);
+//!     for entry in &transition.entries {
+//!         state.apply(entry).expect("valid entry");
+//!     }
+//!     journal.extend(transition.entries);
+//!     transition.effects
+//! }
+//!
+//! let first = start(Payload::new(*b"hello"));
+//! let mut journal = first.entries;
+//! let mut state = RunState::from_journal(&journal).expect("valid journal");
+//!
+//! let commands = Echo.decide(&state.view());
+//! let effects = handle(&mut state, &mut journal, Event::Decision(commands));
+//! assert!(matches!(effects[0], Effect::DispatchStep { .. }));
+//!
+//! let outcome = StepOutcome::Completed(Payload::new(*b"hello"));
+//! handle(&mut state, &mut journal, Event::StepResult { cmd: CommandIndex(0), outcome });
+//! let commands = Echo.decide(&state.view());
+//! handle(&mut state, &mut journal, Event::Decision(commands));
+//!
+//! assert_eq!(state.status(), Status::Completed);
+//! assert_eq!(state, RunState::from_journal(&journal).expect("valid journal"));
+//! ```
 
 #![forbid(unsafe_code)]
+
+mod decider;
+mod journal;
+mod run;
+
+pub use decider::{Command, Decider, RunView};
+pub use journal::{CommandIndex, Entry, IdempotencyKey, Payload, StepOutcome};
+pub use run::{Effect, Event, JournalError, RunState, ScheduledStep, Status, Transition, start};
