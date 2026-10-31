@@ -148,3 +148,66 @@ fn inspect_verify_export_and_replay() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn signals_and_awakeables_are_sent_while_the_engine_is_stopped() {
+    use aqueduct_sdk::{WorkflowContext, WorkflowError, workflow};
+
+    async fn two_waits(ctx: WorkflowContext, _: ()) -> Result<String, WorkflowError> {
+        let (id, review) = ctx.awakeable::<String>();
+        let _: () = ctx.step("publish", &id).await?;
+        let go: Option<bool> = ctx.wait_signal("go", None).await?;
+        Ok(format!("{} {}", review.await?, go.unwrap_or(false)))
+    }
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-signal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_str().unwrap();
+    let open = || {
+        Engine::builder(&dir)
+            .workflow("waits", Arc::new(workflow(two_waits)))
+            .step("publish", |_: &Payload| {
+                Attempt::Completed(Payload::new(*b"null"))
+            })
+            .open()
+            .unwrap()
+    };
+    {
+        let engine = open();
+        // Durable once `start` returns; a signal that arrives before its wait is kept for it.
+        engine.start("w", "waits", Payload::new(*b"null")).unwrap();
+    }
+    // The engine is stopped: the CLI records both completions durably.
+    assert!(
+        cli(&["signal", path, "w", "go", "yes"])
+            .unwrap_err()
+            .contains("not JSON")
+    );
+    assert!(cli(&["signal", path, "nobody", "go", "true"]).is_err());
+    assert!(
+        cli(&["signal", path, "w", "go", "true", "go-1"])
+            .unwrap()
+            .contains("running")
+    );
+    assert!(
+        cli(&["signal", path, "w", "go", "false", "go-1"]).is_ok(),
+        "a retried send is accepted"
+    );
+    assert!(
+        cli(&["complete-awakeable", path, "w", "\"x\""])
+            .unwrap_err()
+            .contains("not an awakeable")
+    );
+    cli(&["complete-awakeable", path, "w#0", "\"looks good\""]).unwrap();
+    let journal = cli(&["journal", path, "w"]).unwrap();
+    assert_eq!(
+        journal.matches("signal go (go-1) received").count(),
+        1,
+        "{journal}"
+    );
+
+    let engine = open();
+    let done = engine.wait("w", Duration::from_secs(10)).unwrap();
+    assert_eq!(done.output, Some(Payload::new(*b"\"looks good true\"")));
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

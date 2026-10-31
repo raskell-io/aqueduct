@@ -153,15 +153,24 @@ fn the_rust_sdk_pipeline_holds_every_invariant() {
         workload: WorkloadKind::RustPipeline,
         ..Config::default()
     };
+    let (mut completed, mut failed) = (0, 0);
     for seed in 0..300 {
-        run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
+        let report = run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
+        completed += report.completed;
+        failed += report.failed;
     }
+    // Both paths are exercised: a step that rejects its input would fail every run "as intended".
+    assert!(
+        completed > 500 && failed > 200,
+        "completed {completed}, failed {failed}"
+    );
 }
 
 #[test]
-fn a_recorded_value_used_before_it_is_durable_is_caught() {
-    // The Rust workload passes a recorded UUID to its first step. Releasing that dispatch before the
-    // value is durable lets a crash record a different UUID for the same command.
+fn a_decision_based_on_something_not_yet_durable_is_caught() {
+    // The Rust workload passes a recorded UUID to a step, and the winner of a race to another. Releasing
+    // those dispatches before the sync lets a crash take back the value (or the order of the race's
+    // results), so the same command is dispatched again with another input.
     let config = Config {
         workload: WorkloadKind::RustPipeline,
         bugs: Bugs {
@@ -170,11 +179,16 @@ fn a_recorded_value_used_before_it_is_durable_is_caught() {
         },
         ..Config::default()
     };
-    let failure = (0..2_000)
+    let caught: std::collections::BTreeSet<&str> = (0..2_000)
         .filter_map(|seed| run_seed(seed, &config).err())
-        .find(|failure| failure.message.contains("was dispatched as"))
-        .expect(
-            "the simulator should catch a dispatch that used a value later recorded differently",
-        );
-    assert!(failure.message.contains("stamp"), "{}", failure.message);
+        .filter_map(|failure| {
+            ["\"stamp\"", "\"winner\""].into_iter().find(|step| {
+                failure.message.contains("was dispatched as") && failure.message.contains(step)
+            })
+        })
+        .collect();
+    assert!(
+        !caught.is_empty(),
+        "the simulator should catch a dispatch built on lost state"
+    );
 }

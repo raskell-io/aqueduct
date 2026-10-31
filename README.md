@@ -75,6 +75,22 @@ at its original time.
 cargo run -p aqueduct --example quickstart
 ```
 
+Waiting for people works the same way. [`approval.rs`](crates/aqueduct/examples/approval.rs) asks for
+approval through an **awakeable**, an id that anyone outside the engine can complete, and gives up after
+a day with `select` ([ADR 0016](docs/adr/0016-select-and-awakeables.md)):
+
+```rust
+let (id, decision) = ctx.awakeable::<bool>();
+ctx.step::<(), _>("ask_approver", &id).await?;            // hand the id to a person or a webhook
+let approved = match select(decision, ctx.sleep(Duration::from_secs(86_400))).await {
+    Either::Left(decision) => decision?,
+    Either::Right(()) => false,                              // nobody answered within a day
+};
+```
+
+Complete it from code with `engine.complete_awakeable(&id, payload)`, or from the command line while
+the engine is stopped: `aqueduct complete-awakeable approval-data 'expense:42#0' true`.
+
 The same engine runs **procedures**: hermetic Starlark scripts that an agent can write and a person can
 review ([ADR 0008](docs/adr/0008-procedure-language-starlark.md)):
 

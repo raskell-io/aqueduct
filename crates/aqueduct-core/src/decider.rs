@@ -68,12 +68,18 @@ pub struct Env {
 #[derive(Clone, Copy, Debug)]
 pub struct RunView<'a> {
     state: &'a RunState,
+    key: &'a str,
     env: Env,
 }
 
 impl<'a> RunView<'a> {
-    pub(crate) fn new(state: &'a RunState, env: Env) -> Self {
-        RunView { state, env }
+    pub(crate) fn new(state: &'a RunState, key: &'a str, env: Env) -> Self {
+        RunView { state, key, env }
+    }
+
+    /// The run's key (empty in a view without one, such as a local replay).
+    pub fn key(&self) -> &'a str {
+        self.key
     }
 
     /// The clock and seed for values recorded in this activation.

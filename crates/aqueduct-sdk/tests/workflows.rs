@@ -212,7 +212,7 @@ fn recorded_values_are_taken_once_and_replayed() {
         now_ms: 1_700_000_000_000,
         seed: 42,
     };
-    let commands = decider.decide(&state.view_at(first));
+    let commands = decider.decide(&state.view_at("r", first));
     assert_eq!(commands.len(), 5, "four values and the step: {commands:?}");
     let transition = apply(&mut state, Event::Decision(commands));
     assert_eq!(
@@ -242,7 +242,7 @@ fn recorded_values_are_taken_once_and_replayed() {
         seed: 7,
     };
     let reads_before = READS.with(Cell::get);
-    let commands = decider.decide(&state.view_at(later));
+    let commands = decider.decide(&state.view_at("r", later));
     let transition = apply(&mut state, Event::Decision(commands));
     assert_eq!(
         READS.with(Cell::get),
@@ -284,4 +284,179 @@ fn every_run_gets_its_own_uuid() {
 
 fn uuid_version(id: &str) -> u32 {
     id.chars().nth(14).and_then(|c| c.to_digit(16)).unwrap()
+}
+
+mod select_and_awakeables {
+    use super::*;
+    use aqueduct_core::CommandIndex;
+    use aqueduct_sdk::{Either, select, select_all};
+    use std::sync::Mutex;
+
+    async fn race(ctx: WorkflowContext, _: ()) -> Result<String, WorkflowError> {
+        Ok(
+            match select(
+                ctx.step::<String, _>("a", &()),
+                ctx.step::<String, _>("b", &()),
+            )
+            .await
+            {
+                Either::Left(a) => format!("a:{}", a?),
+                Either::Right(b) => format!("b:{}", b?),
+            },
+        )
+    }
+
+    fn apply(state: &mut RunState, event: Event) {
+        let transition = state.handle(event);
+        for entry in &transition.entries {
+            state.apply(entry).unwrap();
+        }
+    }
+
+    fn activate(state: &mut RunState, decider: &impl Decider) {
+        let commands = decider.decide(&state.view());
+        apply(state, Event::Decision(commands));
+    }
+
+    fn result(cmd: u32, value: &str) -> Event {
+        Event::StepResult {
+            cmd: CommandIndex(cmd),
+            outcome: StepOutcome::Completed(json(&format!("\"{value}\""))),
+        }
+    }
+
+    /// Both steps finish before the workflow is activated again, in the given order.
+    fn race_with(order: [u32; 2]) -> String {
+        let decider = workflow(race);
+        let mut state = RunState::from_journal(&start("w", json("null")).entries).unwrap();
+        let commands = decider.decide(&state.view());
+        assert_eq!(commands.len(), 2, "both branches are issued: {commands:?}");
+        apply(&mut state, Event::Decision(commands));
+        for cmd in order {
+            apply(&mut state, result(cmd, &format!("r{cmd}")));
+        }
+        activate(&mut state, &decider);
+        assert_eq!(state.status(), Status::Completed);
+        String::from_utf8(state.output().unwrap().as_bytes().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn the_winner_is_the_first_outcome_in_the_journal_not_the_first_branch() {
+        assert_eq!(race_with([0, 1]), "\"a:r0\"");
+        assert_eq!(race_with([1, 0]), "\"b:r1\"");
+    }
+
+    #[test]
+    fn a_replay_that_finds_both_finished_takes_the_same_branch() {
+        // `b` finishes, the workflow chooses it and goes on; then `a` finishes. Replaying from the full
+        // journal must choose `b` again, or the run would diverge.
+        async fn then_more(ctx: WorkflowContext, _: ()) -> Result<String, WorkflowError> {
+            let (position, first) = select_all(vec![
+                ctx.step::<String, _>("a", &()),
+                ctx.step::<String, _>("b", &()),
+            ])
+            .await;
+            let next: String = ctx.step("after", &position).await?;
+            Ok(format!("{}{next}", first?))
+        }
+        let decider = workflow(then_more);
+        let mut state = RunState::from_journal(&start("w", json("null")).entries).unwrap();
+        activate(&mut state, &decider);
+        apply(&mut state, result(1, "b"));
+        activate(&mut state, &decider);
+        apply(&mut state, result(0, "a"));
+        activate(&mut state, &decider);
+        assert_eq!(state.status(), Status::Running, "{:?}", state.error());
+        let Some(step) = state.steps().get(2) else {
+            panic!("the next step is issued");
+        };
+        assert_eq!(
+            (step.name.as_str(), step.input.as_bytes()),
+            ("after", &b"1"[..])
+        );
+        apply(&mut state, result(2, "!"));
+        activate(&mut state, &decider);
+        assert_eq!(state.output(), Some(&json("\"b!\"")));
+    }
+
+    #[test]
+    fn a_sleep_bounds_a_step() {
+        async fn bounded(ctx: WorkflowContext, _: ()) -> Result<String, WorkflowError> {
+            match select(
+                ctx.step::<String, _>("slow", &()),
+                ctx.sleep(Duration::from_secs(1)),
+            )
+            .await
+            {
+                Either::Left(done) => done,
+                Either::Right(()) => Ok("gave up".into()),
+            }
+        }
+        let decider = workflow(bounded);
+        let mut state = RunState::from_journal(&start("w", json("null")).entries).unwrap();
+        activate(&mut state, &decider);
+        apply(
+            &mut state,
+            Event::TimerFired {
+                cmd: CommandIndex(1),
+            },
+        );
+        apply(&mut state, result(0, "late"));
+        activate(&mut state, &decider);
+        assert_eq!(state.output(), Some(&json("\"gave up\"")));
+    }
+
+    #[test]
+    fn an_awakeable_is_completed_from_outside_once() {
+        async fn approval(ctx: WorkflowContext, user: String) -> Result<String, WorkflowError> {
+            let (id, decision) = ctx.awakeable::<String>();
+            let _: () = ctx.step("send_link", &(user, id)).await?;
+            match select(decision, ctx.sleep(Duration::from_secs(30))).await {
+                Either::Left(decision) => decision,
+                Either::Right(()) => Ok("expired".into()),
+            }
+        }
+        let links: Arc<Mutex<Vec<String>>> = Arc::default();
+        let dir = std::env::temp_dir().join(format!("aqueduct-sdk-awk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = |links: Arc<Mutex<Vec<String>>>| {
+            Engine::builder(&dir)
+                .workflow("approval", Arc::new(workflow(approval)))
+                .step("send_link", move |input: &Payload| {
+                    let (_, id): (String, String) =
+                        serde_json::from_slice(input.as_bytes()).unwrap();
+                    links.lock().unwrap().push(id);
+                    StepOutcome::Completed(json("null"))
+                })
+                .open()
+                .unwrap()
+        };
+        let engine = open(Arc::clone(&links));
+        engine
+            .start("approve:ada", "approval", json("\"ada\""))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let id = loop {
+            if let Some(id) = links.lock().unwrap().first().cloned() {
+                break id;
+            }
+            assert!(Instant::now() < deadline, "the link was never sent");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(id, "approve:ada#0");
+        // Restart before completing: the id still works.
+        drop(engine);
+        let engine = open(Arc::clone(&links));
+        engine
+            .complete_awakeable(&id, json("\"approved\""))
+            .unwrap();
+        engine
+            .complete_awakeable(&id, json("\"rejected\""))
+            .unwrap();
+        let done = engine.wait("approve:ada", Duration::from_secs(10)).unwrap();
+        assert_eq!(done.output, Some(json("\"approved\"")));
+        assert!(engine.complete_awakeable("not-an-id", json("1")).is_err());
+        drop(engine);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

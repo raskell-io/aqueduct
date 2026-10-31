@@ -65,10 +65,12 @@
 
 #![forbid(unsafe_code)]
 
+mod awakeable;
 mod decider;
 mod journal;
 mod run;
 
+pub use awakeable::{AWAKEABLE_PREFIX, awakeable_id, awakeable_signal, parse_awakeable_id};
 pub use decider::{Command, Decider, Env, RunView};
 pub use journal::{CommandIndex, Entry, IdempotencyKey, Payload, StepOutcome};
 pub use run::{

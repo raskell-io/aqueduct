@@ -74,6 +74,7 @@ dependencies = [
  "aqueduct-engine",
  "aqueduct-procedure",
  "aqueduct-sdk",
+ "serde",
  "serde_json",
 ]
 
@@ -94,6 +95,7 @@ dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
+ "aqueduct-sdk",
  "aqueduct-storage",
  "serde_json",
 ]

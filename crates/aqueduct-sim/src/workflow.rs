@@ -114,13 +114,22 @@ def run(input):
 /// The pipeline as a Rust workflow written with the SDK: the same steps and data flow as
 /// [`STARLARK_PIPELINE`], replayed by re-running the `async fn` on every activation. It first stamps
 /// the run with a recorded UUID, passed to a step: a value used before it was durable, then recorded
-/// again differently after a crash, shows up as one command dispatched with two inputs.
+/// again differently after a crash, shows up as one command dispatched with two inputs. Then it races
+/// two steps with `select_all`.
 pub async fn rust_pipeline(
     ctx: aqueduct_sdk::WorkflowContext,
     input: String,
 ) -> Result<String, aqueduct_sdk::WorkflowError> {
     let stamp = ctx.uuid();
     let _: String = ctx.step("stamp", &stamp.to_string()).await?;
+    // A race whose winner depends on which result the journal recorded first. The winner feeds the next
+    // step's input, so a replay that chose differently would diverge and park the run.
+    let (winner, _) = aqueduct_sdk::select_all(vec![
+        ctx.step::<String, _>("probe_a", &input),
+        ctx.step::<String, _>("probe_b", &input),
+    ])
+    .await;
+    let _: String = ctx.step("winner", &winner.to_string()).await?;
     let extracted: String = ctx.step("extract", &input).await?;
     let (a, b) = aqueduct_sdk::join(
         ctx.step::<String, _>("map_a", &extracted),
