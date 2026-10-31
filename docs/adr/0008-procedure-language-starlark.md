@@ -70,13 +70,14 @@ Options considered:
   syntax tree, and counterfactual replay carries more of the burden of proof before approval.
 - **Dependencies:** `starlark` brings about 285 crates, and depends unconditionally on `rustyline` (a
   terminal line editor), which pulls in two Windows-only crates under BSL-1.0 (the Boost Software License,
-  permissive and OSI-approved, not the Business Source License). Allowing BSL-1.0 needs the owner's
-  approval (BRIEF.md section 0). Making `rustyline` optional upstream would remove both the licence question
-  and much of the weight.
+  permissive and OSI-approved, not the Business Source License). The owner approved BSL-1.0 for exactly
+  those two crates on 2026-10-31 (`deny.toml`). Making `rustyline` optional upstream would remove both the
+  exception and much of the weight.
 - **Unmaintained transitive crates:** `cargo deny` reports four RustSec "unmaintained" notices (not
   vulnerabilities) that come in through `starlark`: `derivative` (RUSTSEC-2024-0388), `fxhash`
   (RUSTSEC-2025-0057), `paste`, and `atomic-polyfill` (RUSTSEC-2023-0089, via `pagable` and `postcard`).
-  Accepting them is the owner's decision; they are a signal to track upstream health.
+  The owner accepted them on 2026-10-31; they are ignored by ID in `deny.toml`, and remain a signal to
+  track upstream health.
 - **The API is pre-1.0.** `aqueduct-procedure` is the only crate that touches it, so upgrades stay local.
 - Passing per-activation state through `Evaluator::extra` requires `ProvidesStaticType`, whose derive
   generates `unsafe` code that `#![forbid(unsafe_code)]` rejects. The spike uses a thread-local instead,

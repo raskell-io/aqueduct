@@ -878,7 +878,7 @@ ingress, the approval path and the cluster transport.
    CNCF Serverless Workflow specification), so that users can migrate in?
 7. Async runtime strategy for deterministic simulation (section 10.1).
 8. Procedure language: settled as Starlark (ADR 0008). Open: termination mechanism in starlark-rust, and
-   whether to allow BSL-1.0 (Boost) for its `rustyline` dependency or remove that dependency upstream.
+   removing its `rustyline` dependency upstream (BSL-1.0 is allowed for it by exception meanwhile).
 9. Hash function and signature scheme for the history hash chain and approvals.
 10. Longevity commitment for the history format: how many years, how many format versions.
 11. License policy for CDLA-Permissive-2.0 and MPL-2.0 dependencies.
