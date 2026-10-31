@@ -33,7 +33,7 @@ pub use aqueduct_core::{Payload, Status, StepOutcome};
 pub use aqueduct_engine::RetryPolicy;
 pub use aqueduct_procedure::Procedure;
 pub use aqueduct_sdk::{
-    Either, WorkflowContext, WorkflowError, join, join_all, select, select_all, workflow,
+    Either, Saga, WorkflowContext, WorkflowError, join, join_all, select, select_all, workflow,
 };
 
 /// The embedded engine: a durable engine inside your process.

@@ -460,3 +460,105 @@ mod select_and_awakeables {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+mod sagas {
+    use super::*;
+    use aqueduct_core::CommandIndex;
+
+    async fn order(ctx: WorkflowContext, _: ()) -> Result<String, WorkflowError> {
+        let mut saga = ctx.saga();
+        let result = async {
+            saga.step::<(), _, _>("reserve", &1, "release", &1).await?;
+            saga.step::<(), _, _>("charge", &2, "refund", &2).await?;
+            ctx.step::<String, _>("ship", &3).await
+        }
+        .await;
+        match result {
+            Ok(done) => Ok(done),
+            Err(error) => Err(saga.abort(error).await),
+        }
+    }
+
+    fn step_names(state: &RunState) -> Vec<&str> {
+        state.steps().iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// Runs `order`, completing each step as `outcome(name)` says, one activation at a time.
+    fn run(outcome: impl Fn(&str) -> StepOutcome) -> RunState {
+        let decider = workflow(order);
+        let mut state = RunState::from_journal(&start("w", json("null")).entries).unwrap();
+        for _ in 0..20 {
+            let commands = decider.decide(&state.view());
+            for entry in state.handle(Event::Decision(commands)).entries {
+                state.apply(&entry).unwrap();
+            }
+            if state.status().is_terminal() {
+                break;
+            }
+            let pending: Vec<(u32, String)> = state
+                .steps()
+                .iter()
+                .zip(0u32..)
+                .filter(|(s, _)| s.outcome.is_none())
+                .map(|(s, i)| (i, s.name.clone()))
+                .collect();
+            assert_eq!(pending.len(), 1, "one step at a time: {pending:?}");
+            let (cmd, name) = &pending[0];
+            let event = Event::StepResult {
+                cmd: CommandIndex(*cmd),
+                outcome: outcome(name),
+            };
+            for entry in state.handle(event).entries {
+                state.apply(&entry).unwrap();
+            }
+        }
+        state
+    }
+
+    fn ok(_: &str) -> StepOutcome {
+        StepOutcome::Completed(json("\"ok\""))
+    }
+
+    #[test]
+    fn nothing_is_undone_when_every_step_succeeds() {
+        let state = run(|name| match name {
+            "reserve" | "charge" => StepOutcome::Completed(json("null")),
+            _ => ok(name),
+        });
+        assert_eq!(state.status(), Status::Completed);
+        assert_eq!(step_names(&state), ["reserve", "charge", "ship"]);
+    }
+
+    #[test]
+    fn a_failure_undoes_the_completed_steps_last_first() {
+        let state = run(|name| match name {
+            "ship" => StepOutcome::Failed("no carrier".into()),
+            "reserve" | "charge" | "refund" | "release" => StepOutcome::Completed(json("null")),
+            _ => ok(name),
+        });
+        assert_eq!(state.status(), Status::Failed);
+        assert_eq!(
+            step_names(&state),
+            ["reserve", "charge", "ship", "refund", "release"]
+        );
+        assert_eq!(state.steps()[3].input, json("2"));
+        assert_eq!(state.error(), Some("step `ship` failed: no carrier"));
+    }
+
+    #[test]
+    fn a_step_that_fails_is_not_compensated_and_a_failed_compensation_does_not_stop_the_others() {
+        let state = run(|name| match name {
+            "charge" => StepOutcome::Failed("declined".into()),
+            "release" => StepOutcome::Failed("warehouse offline".into()),
+            _ => StepOutcome::Completed(json("null")),
+        });
+        assert_eq!(state.status(), Status::Failed);
+        // `charge` failed, so only `reserve` is undone.
+        assert_eq!(step_names(&state), ["reserve", "charge", "release"]);
+        let error = state.error().unwrap();
+        assert!(
+            error.contains("declined") && error.contains("warehouse offline"),
+            "{error}"
+        );
+    }
+}
