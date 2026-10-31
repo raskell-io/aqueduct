@@ -43,6 +43,10 @@ impl StateStore for SimState {
     }
 }
 
+/// The seed of recorded values in a simulation: fixed, so a seed replays exactly. A restarted node
+/// draws other values, as a real restart would.
+const SIM_SEED: u64 = 0x5eed_a9ed_0c70;
+
 static NO_RUNS: BTreeMap<String, PartitionRun> = BTreeMap::new();
 
 pub(crate) struct Node {
@@ -68,6 +72,7 @@ impl Node {
             .map_err(|e| e.to_string())?;
         partition.inject_ack_before_sync(ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);
+        partition.set_seed(SIM_SEED);
         Ok(Node {
             up: true,
             incarnation: 0,
@@ -213,6 +218,7 @@ impl Node {
         }
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);
+        partition.set_seed(SIM_SEED ^ self.incarnation);
         self.partition = Some(partition);
         self.up = true;
         self.incarnation += 1;

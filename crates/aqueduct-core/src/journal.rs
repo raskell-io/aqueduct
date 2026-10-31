@@ -103,6 +103,16 @@ pub enum Entry {
         /// When the timeout fires (milliseconds since the Unix epoch); 0 means never.
         wake_at: u64,
     },
+    /// The run observed a value from outside its logic (the time, random bits, a local computation).
+    /// The command is born completed with that value; replay reads it from here.
+    ValueRecorded {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// What the value is (for example `now` or `random`).
+        name: String,
+        /// The value.
+        value: Payload,
+    },
     /// A timer fired: a sleep ended, or a signal wait timed out.
     TimerFired {
         /// The command whose timer fired.

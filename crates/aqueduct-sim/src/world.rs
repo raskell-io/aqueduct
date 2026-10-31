@@ -141,6 +141,8 @@ struct World<'c> {
     /// Results the worker holds and resends until acknowledged.
     worker_pending: BTreeMap<(String, CommandIndex), WorkerReport>,
     executions: BTreeMap<(String, CommandIndex), u64>,
+    /// The name and input each command was dispatched with.
+    dispatched: BTreeMap<(String, CommandIndex), (String, Payload)>,
     report: Report,
     workload: Workload,
 }
@@ -197,6 +199,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         checked_timers: BTreeSet::new(),
         worker_pending: BTreeMap::new(),
         executions: BTreeMap::new(),
+        dispatched: BTreeMap::new(),
         report: Report {
             seed,
             ..Report::default()
@@ -401,6 +404,21 @@ impl World<'_> {
                 if self.faults && self.rng.chance(self.config.worker_amnesia_ppm) {
                     // The worker restarts and forgets the results it was still trying to report.
                     self.worker_pending.clear();
+                }
+                // Invariant: a command is dispatched with one name and input only, so nothing a
+                // worker saw is ever recorded differently (for example, a recorded value used before
+                // it was durable, then recorded again after a crash).
+                let sent = (name.clone(), input.clone());
+                match self.dispatched.get(&(key.clone(), cmd)) {
+                    Some(earlier) if *earlier != sent => {
+                        return Err(format!(
+                            "run {key} command {cmd} was dispatched as {earlier:?}, then as {sent:?}"
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.dispatched.insert((key.clone(), cmd), sent);
+                    }
                 }
                 *self.executions.entry((key.clone(), cmd)).or_default() += 1;
                 let report = if self.faults && self.rng.chance(self.config.transient_ppm) {
@@ -625,6 +643,25 @@ impl World<'_> {
             if received > 1 || received < waited {
                 return Err(format!(
                     "run {key} recorded {received} signals and waited for {waited}"
+                ));
+            }
+        }
+
+        // Every dispatched step is in the final journal as it was dispatched.
+        for ((key, cmd), (name, input)) in &self.dispatched {
+            let scheduled = self.node.runs().get(key).and_then(|run| {
+                run.journal().iter().find_map(|e| match e {
+                    aqueduct_core::Entry::StepScheduled {
+                        cmd: c,
+                        name,
+                        input,
+                    } if c == cmd => Some((name, input)),
+                    _ => None,
+                })
+            });
+            if scheduled != Some((name, input)) {
+                return Err(format!(
+                    "run {key} command {cmd} was dispatched as {name} {input:?}, the journal has {scheduled:?}"
                 ));
             }
         }
