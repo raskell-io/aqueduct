@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Aqueduct: the Fractal mark and its typeface</title>
+<style>
+  @font-face { font-family: 'f0'; src: url('Geist-Variable.woff2'); font-weight: 100 900; }
+@font-face { font-family: 'f1'; src: url('GeistMono-Variable.woff2'); font-weight: 100 900; }
+@font-face { font-family: 'f2'; src: url('fonts/Inter.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f3'; src: url('fonts/IBMPlexSans.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f4'; src: url('fonts/SpaceGrotesk.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f5'; src: url('fonts/Manrope.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f6'; src: url('fonts/Sora.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f7'; src: url('fonts/Outfit.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f8'; src: url('fonts/Unbounded.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f9'; src: url('fonts/Syne.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f10'; src: url('fonts/JetBrainsMono.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f11'; src: url('fonts/Fraunces.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f12'; src: url('fonts/InstrumentSerif.ttf'); font-weight: 100 900; }
+@font-face { font-family: 'f13'; src: url('fonts/Cinzel.ttf'); font-weight: 100 900; }
+  @font-face { font-family: Geist; src: url(Geist-Variable.woff2); font-weight: 100 900; }
+  @font-face { font-family: "Geist Mono"; src: url(GeistMono-Variable.woff2); font-weight: 100 900; }
+  :root { --ink: #0b0f14; --paper: #f4f1ea; --muted: #6b7280; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: Geist, system-ui, sans-serif; background: #e9e6df; color: var(--ink); }
+  main { max-width: 1240px; margin: 0 auto; padding: 48px 32px 96px; }
+  h1 { font-weight: 600; font-size: 34px; letter-spacing: -0.02em; margin: 0 0 8px; }
+  h3 { font-weight: 600; font-size: 24px; margin: 48px 0 6px; letter-spacing: -0.01em; }
+  .intro { color: #374151; max-width: 860px; line-height: 1.55; }
+  .card { background: #fff; border-radius: 18px; padding: 26px 28px; margin: 0 0 22px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .card header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .letter { font: 600 14px "Geist Mono", monospace; background: var(--ink); color: #fff; border-radius: 6px; padding: 3px 8px; }
+  h2 { margin: 0; font-weight: 600; font-size: 21px; letter-spacing: -0.01em; }
+  .note { color: var(--muted); font-size: 15px; }
+  .card p { color: #4b5563; max-width: 860px; line-height: 1.5; margin: 10px 0 16px; }
+  .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; margin-top: 16px; }
+  figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  figure.paper > svg, figure.ink > svg { padding: 30px 9px; border-radius: 14px; width: 168px; height: 168px; }
+  figure.paper > svg { background: var(--paper); }
+  figure.ink > svg { background: var(--ink); }
+  figcaption { font: 12px "Geist Mono", monospace; color: var(--muted); }
+  figure.smalls { align-items: flex-start; }
+  .small { display: flex; align-items: center; gap: 8px; }
+  .small span { font: 11px "Geist Mono", monospace; color: var(--muted); }
+  .lockup { display: flex; align-items: center; gap: 18px; padding: 20px 30px; border-radius: 14px; }
+  .lockup.light { background: var(--paper); color: var(--ink); }
+  .lockup.dark { background: var(--ink); color: #f2efe8; }
+  .small-lockup { padding: 16px 24px; }
+  .sample { color: #374151; max-width: 520px; line-height: 1.35; }
+</style></head>
+<body><main>
+  <h1>Aqueduct: the Fractal mark and its typeface</h1>
+  <p class="intro">You chose the Fractal direction. Below, six refinements of it, each at every size and in one colour,
+  then the same mark (F1) set against fourteen typefaces, all under the SIL Open Font License: neutral and engineered
+  (Geist, Inter, IBM Plex Sans), technical (Geist Mono, JetBrains Mono, Space Grotesk), geometric and round (Manrope,
+  Sora, Outfit), wide and expressive (Unbounded, Syne), and serif (Fraunces, Instrument Serif, and Cinzel, which is
+  cut from Roman inscriptions, the aqueduct's own era). Each is shown lowercase, in title case, and in spaced capitals.</p>
+  <h3>The mark</h3>
+  
+  <section class="card">
+    <header><span class="letter">F1</span><h2>Three levels, thinning line</h2></header>
+    <p>The direction you chose, as it stands: one arch, two, four, the line thinning as the arches get smaller.</p>
+    <div class="row">
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0iw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v0iw)"/></svg><figcaption>icon, dark tile</figcaption></figure>
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0lw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#f4f1ea"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v0lw)"/></svg><figcaption>icon, light tile</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v0aw)"/></svg><figcaption>on light</figcaption></figure>
+      <figure class="ink"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v0bw)"/></svg><figcaption>on dark</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0mw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="#0b0f14"/></svg><figcaption>one colour</figcaption></figure>
+      <figure class="smalls"><div class="small"><svg viewBox="-14 -14 128 128" width="48" height="48" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0s48w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v0s48w)"/></svg><span>48</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="32" height="32" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0s32w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v0s32w)"/></svg><span>32</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="16" height="16" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v0s16w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v0s16w)"/></svg><span>16</span></div><figcaption>favicon sizes</figcaption></figure>
+    </div>
+  </section>
+  <section class="card">
+    <header><span class="letter">F2</span><h2>Two levels</h2></header>
+    <p>One arch carrying two. Less detail, so it stays crisp at 16 px; the recursion is implied rather than shown.</p>
+    <div class="row">
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1iw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v1iw)"/></svg><figcaption>icon, dark tile</figcaption></figure>
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1lw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#f4f1ea"/><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v1lw)"/></svg><figcaption>icon, light tile</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v1aw)"/></svg><figcaption>on light</figcaption></figure>
+      <figure class="ink"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v1bw)"/></svg><figcaption>on dark</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1mw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="#0b0f14"/></svg><figcaption>one colour</figcaption></figure>
+      <figure class="smalls"><div class="small"><svg viewBox="-14 -14 128 128" width="48" height="48" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1s48w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v1s48w)"/></svg><span>48</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="32" height="32" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1s32w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v1s32w)"/></svg><span>32</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="16" height="16" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v1s16w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.50 78 A33.50 33.50 0 0 1 83.50 78" fill="none" stroke="currentColor" stroke-width="9.00"/>
+<path d="M15.25 78 A15.75 15.75 0 0 1 46.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<path d="M53.25 78 A15.75 15.75 0 0 1 84.75 78" fill="none" stroke="currentColor" stroke-width="6.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v1s16w)"/></svg><span>16</span></div><figcaption>favicon sizes</figcaption></figure>
+    </div>
+  </section>
+  <section class="card">
+    <header><span class="letter">F3</span><h2>Monoline</h2></header>
+    <p>Every arch drawn with the same line: more technical and more even, like a diagram.</p>
+    <div class="row">
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2iw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v2iw)"/></svg><figcaption>icon, dark tile</figcaption></figure>
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2lw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#f4f1ea"/><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v2lw)"/></svg><figcaption>icon, light tile</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v2aw)"/></svg><figcaption>on light</figcaption></figure>
+      <figure class="ink"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v2bw)"/></svg><figcaption>on dark</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2mw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="#0b0f14"/></svg><figcaption>one colour</figcaption></figure>
+      <figure class="smalls"><div class="small"><svg viewBox="-14 -14 128 128" width="48" height="48" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2s48w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v2s48w)"/></svg><span>48</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="32" height="32" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2s32w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v2s32w)"/></svg><span>32</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="16" height="16" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v2s16w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M14.75 78 A35.25 35.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A16.25 16.25 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M14.75 78 A6.75 6.75 0 0 1 28.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M33.75 78 A6.75 6.75 0 0 1 47.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A16.25 16.25 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M52.75 78 A6.75 6.75 0 0 1 66.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<path d="M71.75 78 A6.75 6.75 0 0 1 85.25 78" fill="none" stroke="currentColor" stroke-width="5.50"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v2s16w)"/></svg><span>16</span></div><figcaption>favicon sizes</figcaption></figure>
+    </div>
+  </section>
+  <section class="card">
+    <header><span class="letter">F4</span><h2>Solid</h2></header>
+    <p>The arches as filled shapes: a half-disc, two holes, four half-discs again. Bold, works as a stamp and at 16 px.</p>
+    <div class="row">
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3iw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="url(#v3iw)"/></svg><figcaption>icon, dark tile</figcaption></figure>
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3lw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#f4f1ea"/><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="url(#v3lw)"/></svg><figcaption>icon, light tile</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="url(#v3aw)"/></svg><figcaption>on light</figcaption></figure>
+      <figure class="ink"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="url(#v3bw)"/></svg><figcaption>on dark</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3mw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="#0b0f14"/></svg><figcaption>one colour</figcaption></figure>
+      <figure class="smalls"><div class="small"><svg viewBox="-14 -14 128 128" width="48" height="48" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3s48w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="url(#v3s48w)"/></svg><span>48</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="32" height="32" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3s32w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="url(#v3s32w)"/></svg><span>32</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="16" height="16" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v3s16w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M10.00 80 A40.00 40.00 0 0 1 90.00 80 Z M14.80 80 A16.40 16.40 0 0 1 47.60 80 Z M16.77 80 A6.72 6.72 0 0 1 30.22 80 Z M32.18 80 A6.72 6.72 0 0 1 45.63 80 Z M52.40 80 A16.40 16.40 0 0 1 85.20 80 Z M54.37 80 A6.72 6.72 0 0 1 67.82 80 Z M69.78 80 A6.72 6.72 0 0 1 83.23 80 Z" fill="currentColor" fill-rule="evenodd"/><rect x="10" y="83" width="80" height="7" rx="3.5" fill="url(#v3s16w)"/></svg><span>16</span></div><figcaption>favicon sizes</figcaption></figure>
+    </div>
+  </section>
+  <section class="card">
+    <header><span class="letter">F5</span><h2>Water inside</h2></header>
+    <p>No base line: the smallest arches are the water, as if what the structure carries runs through its finest parts.</p>
+    <div class="row">
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4iw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="url(#v4iw)" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="url(#v4iw)" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="url(#v4iw)" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="url(#v4iw)" stroke-width="3.60"/></svg><figcaption>icon, dark tile</figcaption></figure>
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4lw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#f4f1ea"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="url(#v4lw)" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="url(#v4lw)" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="url(#v4lw)" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="url(#v4lw)" stroke-width="3.60"/></svg><figcaption>icon, light tile</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="url(#v4aw)" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="url(#v4aw)" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="url(#v4aw)" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="url(#v4aw)" stroke-width="3.60"/></svg><figcaption>on light</figcaption></figure>
+      <figure class="ink"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="url(#v4bw)" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="url(#v4bw)" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="url(#v4bw)" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="url(#v4bw)" stroke-width="3.60"/></svg><figcaption>on dark</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4mw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="#0b0f14" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="#0b0f14" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="#0b0f14" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="#0b0f14" stroke-width="3.60"/></svg><figcaption>one colour</figcaption></figure>
+      <figure class="smalls"><div class="small"><svg viewBox="-14 -14 128 128" width="48" height="48" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4s48w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="url(#v4s48w)" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="url(#v4s48w)" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="url(#v4s48w)" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="url(#v4s48w)" stroke-width="3.60"/></svg><span>48</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="32" height="32" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4s32w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="url(#v4s32w)" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="url(#v4s32w)" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="url(#v4s32w)" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="url(#v4s32w)" stroke-width="3.60"/></svg><span>32</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="16" height="16" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v4s16w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.80 78 A7.70 7.70 0 0 1 29.20 78" fill="none" stroke="url(#v4s16w)" stroke-width="3.60"/>
+<path d="M32.80 78 A7.70 7.70 0 0 1 48.20 78" fill="none" stroke="url(#v4s16w)" stroke-width="3.60"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.80 78 A7.70 7.70 0 0 1 67.20 78" fill="none" stroke="url(#v4s16w)" stroke-width="3.60"/>
+<path d="M70.80 78 A7.70 7.70 0 0 1 86.20 78" fill="none" stroke="url(#v4s16w)" stroke-width="3.60"/></svg><span>16</span></div><figcaption>favicon sizes</figcaption></figure>
+    </div>
+  </section>
+  <section class="card">
+    <header><span class="letter">F6</span><h2>Four levels</h2></header>
+    <p>One level deeper, for large use (a hero image, print, a T-shirt); paired with F1 or F2 for small sizes.</p>
+    <div class="row">
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5iw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v5iw)"/></svg><figcaption>icon, dark tile</figcaption></figure>
+      <figure><svg viewBox="-14 -14 128 128" width="168" height="168" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5lw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#f4f1ea"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v5lw)"/></svg><figcaption>icon, light tile</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v5aw)"/></svg><figcaption>on light</figcaption></figure>
+      <figure class="ink"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v5bw)"/></svg><figcaption>on dark</figcaption></figure>
+      <figure class="paper"><svg viewBox="4 26 92 66" width="150" height="108" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5mw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="#0b0f14"/></svg><figcaption>one colour</figcaption></figure>
+      <figure class="smalls"><div class="small"><svg viewBox="-14 -14 128 128" width="48" height="48" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5s48w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v5s48w)"/></svg><span>48</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="32" height="32" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5s32w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v5s32w)"/></svg><span>32</span></div><div class="small"><svg viewBox="-14 -14 128 128" width="16" height="16" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="v5s16w" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><rect x="-14" y="-14" width="128" height="128" rx="28" fill="#0b0f14"/><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M13.00 78 A3.75 3.75 0 0 1 20.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M22.50 78 A3.75 3.75 0 0 1 30.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.00 78 A3.75 3.75 0 0 1 39.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M41.50 78 A3.75 3.75 0 0 1 49.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M51.00 78 A3.75 3.75 0 0 1 58.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M60.50 78 A3.75 3.75 0 0 1 68.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.00 78 A3.75 3.75 0 0 1 77.50 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<path d="M79.50 78 A3.75 3.75 0 0 1 87.00 78" fill="none" stroke="currentColor" stroke-width="2.00"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#v5s16w)"/></svg><span>16</span></div><figcaption>favicon sizes</figcaption></figure>
+    </div>
+  </section>
+  <h3>The typeface</h3>
+  
+  <section class="card type">
+    <header><span class="letter">01</span><h2>Geist</h2><span class="note">neutral, contemporary; the family of Kishi</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t0aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t0aw)"/></svg><span style="font-family:'f0';font-weight:560;letter-spacing:-0.035em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t0bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t0bw)"/></svg><span style="font-family:'f0';font-weight:560;letter-spacing:-0.035em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t0cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t0cw)"/></svg><span style="font-family:'f0';font-weight:560;letter-spacing:-0.035em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f0';font-weight:560;letter-spacing:-0.035em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">02</span><h2>Geist Mono</h2><span class="note">engineered, code-adjacent</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t1aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t1aw)"/></svg><span style="font-family:'f1';font-weight:500;letter-spacing:-0.02em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t1bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t1bw)"/></svg><span style="font-family:'f1';font-weight:500;letter-spacing:-0.02em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t1cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t1cw)"/></svg><span style="font-family:'f1';font-weight:500;letter-spacing:-0.02em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f1';font-weight:500;letter-spacing:-0.02em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">03</span><h2>Inter</h2><span class="note">the default of modern software; very readable</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t2aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t2aw)"/></svg><span style="font-family:'f2';font-weight:620;letter-spacing:-0.04em;font-variation-settings:'opsz' 32;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t2bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t2bw)"/></svg><span style="font-family:'f2';font-weight:620;letter-spacing:-0.04em;font-variation-settings:'opsz' 32;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t2cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t2cw)"/></svg><span style="font-family:'f2';font-weight:620;letter-spacing:-0.04em;font-variation-settings:'opsz' 32;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f2';font-weight:620;letter-spacing:-0.04em;font-variation-settings:'opsz' 32;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">04</span><h2>IBM Plex Sans</h2><span class="note">engineered and institutional: the bank-and-insurer register</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t3aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t3aw)"/></svg><span style="font-family:'f3';font-weight:600;letter-spacing:-0.02em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t3bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t3bw)"/></svg><span style="font-family:'f3';font-weight:600;letter-spacing:-0.02em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t3cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t3cw)"/></svg><span style="font-family:'f3';font-weight:600;letter-spacing:-0.02em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f3';font-weight:600;letter-spacing:-0.02em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">05</span><h2>Space Grotesk</h2><span class="note">technical with character; quirky a and q</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t4aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t4aw)"/></svg><span style="font-family:'f4';font-weight:600;letter-spacing:-0.03em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t4bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t4bw)"/></svg><span style="font-family:'f4';font-weight:600;letter-spacing:-0.03em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t4cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t4cw)"/></svg><span style="font-family:'f4';font-weight:600;letter-spacing:-0.03em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f4';font-weight:600;letter-spacing:-0.03em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">06</span><h2>Manrope</h2><span class="note">geometric, calm, open</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t5aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t5aw)"/></svg><span style="font-family:'f5';font-weight:700;letter-spacing:-0.035em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t5bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t5bw)"/></svg><span style="font-family:'f5';font-weight:700;letter-spacing:-0.035em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t5cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t5cw)"/></svg><span style="font-family:'f5';font-weight:700;letter-spacing:-0.035em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f5';font-weight:700;letter-spacing:-0.035em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">07</span><h2>Sora</h2><span class="note">geometric and slightly futuristic</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t6aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t6aw)"/></svg><span style="font-family:'f6';font-weight:600;letter-spacing:-0.04em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t6bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t6bw)"/></svg><span style="font-family:'f6';font-weight:600;letter-spacing:-0.04em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t6cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t6cw)"/></svg><span style="font-family:'f6';font-weight:600;letter-spacing:-0.04em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f6';font-weight:600;letter-spacing:-0.04em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">08</span><h2>Outfit</h2><span class="note">round geometric; echoes the arches</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t7aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t7aw)"/></svg><span style="font-family:'f7';font-weight:550;letter-spacing:-0.03em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t7bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t7bw)"/></svg><span style="font-family:'f7';font-weight:550;letter-spacing:-0.03em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t7cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t7cw)"/></svg><span style="font-family:'f7';font-weight:550;letter-spacing:-0.03em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f7';font-weight:550;letter-spacing:-0.03em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">09</span><h2>Unbounded</h2><span class="note">wide and futuristic; strong as a logotype</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t8aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t8aw)"/></svg><span style="font-family:'f8';font-weight:500;letter-spacing:-0.03em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t8bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t8bw)"/></svg><span style="font-family:'f8';font-weight:500;letter-spacing:-0.03em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t8cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t8cw)"/></svg><span style="font-family:'f8';font-weight:500;letter-spacing:-0.03em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f8';font-weight:500;letter-spacing:-0.03em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">10</span><h2>Syne</h2><span class="note">expressive, art-school wide</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t9aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t9aw)"/></svg><span style="font-family:'f9';font-weight:700;letter-spacing:-0.02em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t9bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t9bw)"/></svg><span style="font-family:'f9';font-weight:700;letter-spacing:-0.02em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t9cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t9cw)"/></svg><span style="font-family:'f9';font-weight:700;letter-spacing:-0.02em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f9';font-weight:700;letter-spacing:-0.02em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">11</span><h2>JetBrains Mono</h2><span class="note">a coder's mono; very legible</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t10aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t10aw)"/></svg><span style="font-family:'f10';font-weight:600;letter-spacing:-0.03em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t10bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t10bw)"/></svg><span style="font-family:'f10';font-weight:600;letter-spacing:-0.03em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t10cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t10cw)"/></svg><span style="font-family:'f10';font-weight:600;letter-spacing:-0.03em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f10';font-weight:600;letter-spacing:-0.03em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">12</span><h2>Fraunces</h2><span class="note">a soft serif with warmth; literary, like the essay</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t11aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t11aw)"/></svg><span style="font-family:'f11';font-weight:520;letter-spacing:-0.03em;font-variation-settings:'opsz' 144,'SOFT' 40;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t11bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t11bw)"/></svg><span style="font-family:'f11';font-weight:520;letter-spacing:-0.03em;font-variation-settings:'opsz' 144,'SOFT' 40;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t11cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t11cw)"/></svg><span style="font-family:'f11';font-weight:520;letter-spacing:-0.03em;font-variation-settings:'opsz' 144,'SOFT' 40;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f11';font-weight:520;letter-spacing:-0.03em;font-variation-settings:'opsz' 144,'SOFT' 40;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">13</span><h2>Instrument Serif</h2><span class="note">elegant display serif; editorial</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t12aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t12aw)"/></svg><span style="font-family:'f12';font-weight:400;letter-spacing:-0.02em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t12bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t12bw)"/></svg><span style="font-family:'f12';font-weight:400;letter-spacing:-0.02em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t12cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t12cw)"/></svg><span style="font-family:'f12';font-weight:400;letter-spacing:-0.02em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f12';font-weight:400;letter-spacing:-0.02em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+  <section class="card type">
+    <header><span class="letter">14</span><h2>Cinzel</h2><span class="note">Roman inscriptional capitals: the aqueduct's own era</span></header>
+    <div class="row">
+      <div class="lockup light"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t13aw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t13aw)"/></svg><span style="font-family:'f13';font-weight:600;letter-spacing:0.02em;font-size:58px">aqueduct</span></div>
+      <div class="lockup dark"><svg viewBox="4 26 92 66" width="78" height="56" style="color:#f2efe8" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t13bw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t13bw)"/></svg><span style="font-family:'f13';font-weight:600;letter-spacing:0.02em;font-size:58px">Aqueduct</span></div>
+    </div>
+    <div class="row">
+      <div class="lockup light small-lockup"><svg viewBox="4 26 92 66" width="44" height="32" style="color:#0b0f14" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="t13cw" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5ee7df"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><path d="M16.00 78 A34.00 34.00 0 0 1 84.00 78" fill="none" stroke="currentColor" stroke-width="8.00"/>
+<path d="M14.50 78 A16.50 16.50 0 0 1 47.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M13.60 78 A7.90 7.90 0 0 1 29.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M32.60 78 A7.90 7.90 0 0 1 48.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M52.50 78 A16.50 16.50 0 0 1 85.50 78" fill="none" stroke="currentColor" stroke-width="5.00"/>
+<path d="M51.60 78 A7.90 7.90 0 0 1 67.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<path d="M70.60 78 A7.90 7.90 0 0 1 86.40 78" fill="none" stroke="currentColor" stroke-width="3.20"/>
+<rect x="10" y="80" width="80" height="7" rx="3.5" fill="url(#t13cw)"/></svg><span style="font-family:'f13';font-weight:600;letter-spacing:0.02em;font-size:26px;letter-spacing:0.24em;text-transform:uppercase">aqueduct</span></div>
+      <div class="sample" style="font-family:'f13';font-weight:600;letter-spacing:0.02em;font-size:22px">Durable execution for procedures that agents write and people approve.</div>
+    </div>
+  </section>
+</main></body></html>

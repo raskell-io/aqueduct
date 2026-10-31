@@ -119,6 +119,7 @@ fn open(dir: &str, seed: u64) -> Result<Engine, String> {
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut kills = 50u64;
     let mut seed = 1u64;
+    let mut startup = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = || -> Result<u64, String> {
@@ -130,12 +131,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
         match arg.as_str() {
             "--kills" => kills = value()?,
             "--seed" => seed = value()?,
+            "--startup" => startup = true,
             other => {
                 return Err(format!(
-                    "unknown argument {other}; use --kills N [--seed S]"
+                    "unknown argument {other}; use --kills N [--seed S] [--startup]"
                 ));
             }
         }
+    }
+    if startup {
+        return startup_kills(kills, seed);
     }
     let dir = std::env::temp_dir().join(format!("aqueduct-crash-engine-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -166,7 +171,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 }
             }
         });
-        std::thread::sleep(Duration::from_millis(30 + rng.below(150)));
+        // From 0 ms, so some kills land while the engine is still starting (creating its files, recovering).
+        std::thread::sleep(Duration::from_millis(rng.below(180)));
         child.kill().map_err(|e| format!("kill failed: {e}"))?;
         child.wait().map_err(|e| e.to_string())?;
         for line in receiver.try_iter() {
@@ -269,4 +275,48 @@ pub fn child(args: &[String]) -> Result<(), String> {
         }
         _ => Err("usage: crash-engine-child <dir> <seed> <first> | <dir> drain <last>".into()),
     }
+}
+
+/// `--startup`: every kill hits a brand-new engine within its first few milliseconds, while it creates
+/// its log and state store, and every data directory must open afterwards.
+fn startup_kills(kills: u64, seed: u64) -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!("aqueduct-crash-startup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut rng = Rng::new(seed);
+    let started = Instant::now();
+    let mut broken = Vec::new();
+    for kill in 0..kills {
+        let dir = root.join(kill.to_string());
+        let mut child = Command::new(&exe)
+            .args([
+                "crash-engine-child",
+                &dir.display().to_string(),
+                &rng.next_u64().to_string(),
+                "0",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot start the engine: {e}"))?;
+        std::thread::sleep(Duration::from_micros(rng.below(6_000)));
+        child.kill().map_err(|e| format!("kill failed: {e}"))?;
+        child.wait().map_err(|e| e.to_string())?;
+        if let Err(error) = open(&dir.display().to_string(), 0) {
+            broken.push(format!("kill {kill}: {error}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    if !broken.is_empty() {
+        return Err(format!(
+            "{} of {kills} data directories no longer open, first: {}",
+            broken.len(),
+            broken[0]
+        ));
+    }
+    println!(
+        "{kills} startup kills passed in {:.1} s: every data directory opens",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
