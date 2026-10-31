@@ -113,6 +113,12 @@ pub enum Entry {
         /// The value.
         value: Payload,
     },
+    /// The run was asked to stop. Every command without an outcome completes as failed and cancelled;
+    /// when none is pending, the next command the run issues does. At most once per run.
+    CancelRequested {
+        /// Why, as given by whoever cancelled.
+        reason: String,
+    },
     /// A timer fired: a sleep ended, or a signal wait timed out.
     TimerFired {
         /// The command whose timer fired.

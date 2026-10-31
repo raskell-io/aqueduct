@@ -153,6 +153,11 @@ pub enum Outbound {
         /// The run key.
         key: String,
     },
+    /// A cancellation was recorded (or dropped because the run had ended or was already cancelled).
+    Cancelled {
+        /// The run key.
+        key: String,
+    },
     /// A run reached a terminal status.
     Finished {
         /// The run key.
@@ -380,6 +385,31 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    /// Asks a run to stop (see [`Event::Cancel`]): every command it is waiting for fails as cancelled,
+    /// and the run decides what to do (undo work, then fail). Only the first cancellation counts; later
+    /// ones, and cancellations of ended runs, are acknowledged and dropped.
+    pub fn cancel(&mut self, key: &str, reason: &str) -> Result<(), PartitionError> {
+        let Some(run) = self.runs.get(key) else {
+            if self.lookup(key)?.is_none() {
+                return Err(PartitionError::UnknownRun(key.to_owned()));
+            }
+            self.send(Outbound::Cancelled {
+                key: key.to_owned(),
+            });
+            return Ok(());
+        };
+        let event = Event::Cancel {
+            reason: reason.to_owned(),
+        };
+        let transition = run.state.handle_at(event, self.now_ms);
+        let effects = self.append(key, transition)?;
+        self.perform(key, effects)?;
+        self.send(Outbound::Cancelled {
+            key: key.to_owned(),
+        });
+        Ok(())
     }
 
     /// Sends a signal to a run. A signal whose non-empty `id` the run has already recorded is dropped,

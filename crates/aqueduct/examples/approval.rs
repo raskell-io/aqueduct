@@ -34,7 +34,7 @@ async fn approve_expense(ctx: WorkflowContext, expense: Expense) -> Result<Strin
         .await?;
     let approved = match select(decision, ctx.sleep(Duration::from_secs(24 * 60 * 60))).await {
         Either::Left(decision) => decision?,
-        Either::Right(()) => false, // nobody answered within a day
+        Either::Right(slept) => slept.map(|()| false)?, // nobody answered within a day
     };
     if !approved {
         return Ok(format!("expense {} declined", expense.id));

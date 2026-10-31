@@ -64,6 +64,10 @@ pub enum WorkflowError {
     /// The workflow failed for its own reason.
     #[error("{0}")]
     Failed(String),
+    /// The run was cancelled while this call was waiting (`Engine::cancel`). The workflow may still
+    /// issue calls afterwards, for example to undo its work with a [`Saga`].
+    #[error("cancelled: {0}")]
+    Cancelled(String),
 }
 
 impl WorkflowError {
@@ -78,6 +82,9 @@ struct Activation {
     outcomes: Vec<Option<StepOutcome>>,
     /// Each command's position in the journal's completion order, if it has an outcome.
     ranks: Vec<Option<usize>>,
+    /// Which commands a cancellation completed.
+    cancelled: Vec<bool>,
+    cancel_reason: String,
     commands: Vec<Command>,
     env: Env,
     key: String,
@@ -87,6 +94,15 @@ struct Activation {
 }
 
 impl Activation {
+    /// The cancellation error, if a cancellation completed this command.
+    fn cancellation(&self, index: usize) -> Option<WorkflowError> {
+        self.cancelled
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+            .then(|| WorkflowError::Cancelled(self.cancel_reason.clone()))
+    }
+
     fn resolve(&mut self, index: usize) {
         let rank = self
             .ranks
@@ -236,15 +252,13 @@ impl WorkflowContext {
     }
 
     /// Sleeps durably. The wake time is journaled when the sleep is first issued, so a restart does not
-    /// extend it.
-    pub fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + use<> {
+    /// extend it. Fails only if the run is cancelled during the sleep.
+    pub fn sleep(
+        &self,
+        duration: Duration,
+    ) -> impl Future<Output = Result<(), WorkflowError>> + use<> {
         let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-        let call = self.call(Ok(Command::Sleep { duration_ms }), |_| {
-            Ok::<(), WorkflowError>(())
-        });
-        async move {
-            let _ = call.await;
-        }
+        self.call(Ok(Command::Sleep { duration_ms }), |_| Ok(()))
     }
 
     /// Waits for the next signal with this name and decodes its payload, or returns `None` when the
@@ -302,6 +316,13 @@ impl WorkflowContext {
         let context = self.clone();
         let mut outcome = outcome;
         let future = poll_fn(move |_| match outcome.take() {
+            Some(_) if context.activation.borrow().cancellation(index).is_some() => {
+                let mut activation = context.activation.borrow_mut();
+                activation.resolve(index);
+                Poll::Ready(Err(activation
+                    .cancellation(index)
+                    .unwrap_or_else(|| WorkflowError::Cancelled(String::new()))))
+            }
             Some(StepOutcome::Completed(payload)) => {
                 context.activation.borrow_mut().resolve(index);
                 Poll::Ready(
@@ -348,8 +369,15 @@ impl WorkflowContext {
             match outcome.as_mut().and_then(Option::take) {
                 Some(result) => match state.take() {
                     Some((_, finish)) => {
-                        context.activation.borrow_mut().resolve(index);
-                        Poll::Ready(finish(result))
+                        let mut activation = context.activation.borrow_mut();
+                        activation.resolve(index);
+                        match activation.cancellation(index) {
+                            Some(cancelled) => Poll::Ready(Err(cancelled)),
+                            None => {
+                                drop(activation);
+                                Poll::Ready(finish(result))
+                            }
+                        }
                     }
                     None => Poll::Pending,
                 },
@@ -431,10 +459,17 @@ impl Saga {
 
     /// Runs every registered compensation, last first, one after the other. A compensation that fails
     /// does not stop the others; the error names every one that failed.
+    ///
+    /// Compensations cannot be cancelled: one that a cancellation completes is issued again, and runs
+    /// (a run is cancelled at most once, so this happens at most once per saga).
     pub async fn compensate(self) -> Result<(), WorkflowError> {
         let mut failed = Vec::new();
         for (name, input) in self.compensations.into_iter().rev() {
-            if let Err(error) = self.ctx.step::<serde_json::Value, _>(&name, &input).await {
+            let mut outcome = self.ctx.step::<serde_json::Value, _>(&name, &input).await;
+            if matches!(outcome, Err(WorkflowError::Cancelled(_))) {
+                outcome = self.ctx.step::<serde_json::Value, _>(&name, &input).await;
+            }
+            if let Err(error) = outcome {
                 failed.push(error.to_string());
             }
         }
@@ -639,9 +674,14 @@ where
                 *slot = Some(rank);
             }
         }
+        let cancelled = (0..outcomes.len())
+            .map(|index| view.cancelled(aqueduct_core::CommandIndex(index as u32)))
+            .collect();
         let activation = Rc::new(RefCell::new(Activation {
             outcomes,
             ranks,
+            cancelled,
+            cancel_reason: view.cancel_reason().unwrap_or_default().to_owned(),
             commands: Vec::new(),
             env: view.env(),
             key: view.key().to_owned(),

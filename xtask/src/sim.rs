@@ -68,12 +68,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.duplicate_executions += report.duplicate_executions;
         total.completed += report.completed;
         total.failed += report.failed;
+        total.cancelled += report.cancelled;
     }
     println!(
         "{count} seeds ({from}..{}, {workload:?}) passed in {:.1} s\n\
          events {}, crashes {} (of which failed syncs {}), torn tails truncated {}, checkpoints {}\n\
          messages dropped {}, duplicated {}\n\
-         step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}",
+         step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}, cancelled {}",
         from + count,
         started.elapsed().as_secs_f64(),
         total.events,
@@ -88,6 +89,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.retries,
         total.completed,
         total.failed,
+        total.cancelled,
     );
     Ok(())
 }

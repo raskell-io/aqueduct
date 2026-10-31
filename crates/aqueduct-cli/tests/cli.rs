@@ -211,3 +211,39 @@ fn signals_and_awakeables_are_sent_while_the_engine_is_stopped() {
     drop(engine);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_run_is_cancelled_while_the_engine_is_stopped() {
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_str().unwrap();
+    let open = || {
+        Engine::builder(&dir)
+            .workflow(
+                "approval",
+                Arc::new(Procedure::compile("approval.star", APPROVAL).unwrap()),
+            )
+            .step("quote", |_: &Payload| {
+                Attempt::Completed(Payload::new(*b"42"))
+            })
+            .open()
+            .unwrap()
+    };
+    open().start("c", "approval", Payload::new(*b"1")).unwrap();
+    assert!(
+        cli(&["cancel", path, "c", "out of budget"])
+            .unwrap()
+            .contains("recorded")
+    );
+    assert!(cli(&["cancel", path, "nobody"]).is_err());
+    let engine = open();
+    let done = engine.wait("c", Duration::from_secs(10)).unwrap();
+    assert_eq!(done.error.as_deref(), Some("cancelled: out of budget"));
+    drop(engine);
+    assert!(
+        cli(&["journal", path, "c"])
+            .unwrap()
+            .contains("cancel requested: out of budget")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

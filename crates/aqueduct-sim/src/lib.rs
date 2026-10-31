@@ -90,6 +90,8 @@ pub struct Config {
     pub client_retry: u64,
     /// Interval at which the worker resends unacknowledged results.
     pub worker_resend: u64,
+    /// Every how many runs the client cancels one (0: none), retrying until acknowledged.
+    pub cancel_every: usize,
     /// Injected bugs.
     pub bugs: Bugs,
     /// The workload.
@@ -115,6 +117,7 @@ impl Default for Config {
             redispatch_interval: 150,
             client_retry: 80,
             worker_resend: 60,
+            cancel_every: 3,
             bugs: Bugs::default(),
             workload: WorkloadKind::default(),
         }
@@ -154,6 +157,8 @@ pub struct Report {
     pub completed: u64,
     /// Runs that failed (as the workload intends for some inputs).
     pub failed: u64,
+    /// Runs that were cancelled while running (and so failed as cancelled).
+    pub cancelled: u64,
     /// A fingerprint of the event sequence and the final chain heads. Equal for equal seeds.
     pub trace: u64,
 }

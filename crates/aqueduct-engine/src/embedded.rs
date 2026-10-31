@@ -303,6 +303,19 @@ impl Engine {
         answer.recv().map_err(|_| self.stopped())?
     }
 
+    /// Asks a run to stop. Returns once the request is durable. Every call the workflow is waiting for
+    /// fails with a cancellation; the workflow decides what to do next (typically undo its work with a
+    /// saga and fail). Only the first cancellation of a run counts.
+    pub fn cancel(&self, key: &str, reason: &str) -> Result<(), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Cancel {
+            key: key.to_owned(),
+            reason: reason.to_owned(),
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
     /// Completes an awakeable with a payload, given the id the workflow handed out. Returns once the
     /// completion is durable; completing it again records the first payload only.
     pub fn complete_awakeable(&self, id: &str, payload: Payload) -> Result<(), EngineError> {
@@ -381,6 +394,11 @@ enum Request {
         name: String,
         id: String,
         payload: Payload,
+        reply: Sender<Result<(), EngineError>>,
+    },
+    Cancel {
+        key: String,
+        reason: String,
         reply: Sender<Result<(), EngineError>>,
     },
     StepResult {
@@ -514,6 +532,13 @@ impl Processor {
                 }
                 Err(error) => return Err(error.to_string()),
             },
+            Request::Cancel { key, reason, reply } => match self.partition.cancel(&key, &reason) {
+                Ok(()) => self.signals.entry(key).or_default().push(reply),
+                Err(PartitionError::UnknownRun(key)) => {
+                    let _ = reply.send(Err(EngineError::UnknownRun(key)));
+                }
+                Err(error) => return Err(error.to_string()),
+            },
             Request::StepResult { key, cmd, outcome } => {
                 self.partition
                     .step_result(&key, cmd, outcome)
@@ -570,8 +595,8 @@ impl Processor {
                         input,
                     });
                 }
-                Outbound::Signaled { key } => {
-                    // One acknowledgement per signal, in the order they were sent.
+                Outbound::Signaled { key } | Outbound::Cancelled { key } => {
+                    // One acknowledgement per signal or cancellation, in the order they were sent.
                     if let Some(replies) = self.signals.get_mut(&key)
                         && !replies.is_empty()
                     {

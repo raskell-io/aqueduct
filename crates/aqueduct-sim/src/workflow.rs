@@ -124,11 +124,12 @@ pub async fn rust_pipeline(
     let _: String = ctx.step("stamp", &stamp.to_string()).await?;
     // A race whose winner depends on which result the journal recorded first. The winner feeds the next
     // step's input, so a replay that chose differently would diverge and park the run.
-    let (winner, _) = aqueduct_sdk::select_all(vec![
+    let (winner, probe) = aqueduct_sdk::select_all(vec![
         ctx.step::<String, _>("probe_a", &input),
         ctx.step::<String, _>("probe_b", &input),
     ])
     .await;
+    probe?; // a cancellation during the race surfaces here
     let _: String = ctx.step("winner", &winner.to_string()).await?;
     let extracted: String = ctx.step("extract", &input).await?;
     let (a, b) = aqueduct_sdk::join(
@@ -154,6 +155,9 @@ def run(input):
     go = wait(signal("go"))
     return step("validate", extracted + "#" + go)
 "##;
+
+/// Why the simulated client cancels runs.
+pub const CANCEL_REASON: &str = "the client gave up";
 
 /// The payload of the `go` signal the simulated client sends to every run.
 pub const GO: &[u8] = b"\"go\"";
