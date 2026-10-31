@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod crash;
+mod crash_engine;
 mod fsync;
 mod sim;
 
@@ -15,9 +16,12 @@ fn main() -> ExitCode {
         Some("sim") => sim::run(&args[1..]),
         Some("crash") => crash::run(&args[1..]),
         Some("crash-child") => crash::child(&args[1..]),
+        Some("crash-engine") => crash_engine::run(&args[1..]),
+        Some("crash-engine-child") => crash_engine::child(&args[1..]),
         _ => {
             eprintln!(
                 "usage: cargo xtask <task>\n\ntasks:\n  crash [--kills N] [--seed S]   kill a log writer at random moments and check for lost records
+  crash-engine [--kills N] [--seed S]   kill the embedded engine mid-run and check every run
   fsync [dir]                    measure fsync latency and group commit throughput\n  sim --seed N | --seeds N [--from S] [--workload native|starlark]   run the simulator"
             );
             return ExitCode::from(2);

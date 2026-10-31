@@ -4,16 +4,19 @@
 library inside your binary, grows into a replicated cluster without changing your code, and every run
 leaves a history you can replay and audit.
 
-> **Status: phase 0 (foundations).** Nothing here is usable as a library yet. The repository holds
-> the [build brief](BRIEF.md), the [architecture decision records](docs/adr/), the
-> [history format](docs/history-format.md), the pure core state machine, the history codec and a
-> deterministic simulator. Do not depend on it.
+> **Status: early phase 1.** Not usable as a library yet. The repository holds the
+> [build brief](BRIEF.md), the [architecture decision records](docs/adr/), the
+> [history format](docs/history-format.md), the pure core state machine, Starlark procedures, a
+> deterministic simulator, a durable file log and a first embedded engine that survives `kill -9`. Do not
+> depend on it.
 
 ## Try the simulator
 
 ```sh
 cargo xtask sim --seeds 10000   # every seed injects crashes, torn writes, fsync failures and lossy networks
 cargo xtask sim --seed 42       # reproduce one seed exactly
+cargo xtask crash --kills 1000  # SIGKILL a log writer at random moments; no acknowledged record may be lost
+cargo xtask crash-engine        # SIGKILL the embedded engine mid-run; every acknowledged run must end correctly
 cargo xtask fsync               # measure fsync latency and group commit throughput on this machine
 ```
 

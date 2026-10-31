@@ -44,6 +44,8 @@ pub enum StepOutcome {
 pub enum Entry {
     /// The run was started with an input. Always the first entry.
     Started {
+        /// The name of the workflow or procedure the run executes.
+        workflow: String,
         /// The run's input.
         input: Payload,
     },

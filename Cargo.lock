@@ -101,6 +101,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqueduct-engine"
+version = "0.0.0"
+dependencies = [
+ "aqueduct-codec",
+ "aqueduct-core",
+ "aqueduct-procedure",
+ "aqueduct-storage",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "aqueduct-procedure"
 version = "0.0.0"
 dependencies = [
@@ -124,6 +136,7 @@ version = "0.0.0"
 dependencies = [
  "aqueduct-codec",
  "aqueduct-core",
+ "aqueduct-engine",
  "aqueduct-procedure",
  "aqueduct-storage",
  "serde_json",
@@ -2070,6 +2083,9 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "aqueduct-core",
+ "aqueduct-engine",
+ "aqueduct-procedure",
  "aqueduct-sim",
  "aqueduct-storage",
 ]

@@ -7,7 +7,9 @@ use aqueduct_core::{CommandIndex, Entry, Payload, Status, StepOutcome};
 use aqueduct_storage::frame;
 
 use crate::disk::SimDisk;
-use crate::node::{Node, Outbound};
+use aqueduct_engine::Outbound;
+
+use crate::node::Node;
 use crate::rng::Rng;
 use crate::workflow::{self, Workload};
 use crate::{Config, Failure, Report};
@@ -121,7 +123,13 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         seq: 0,
         queue: BTreeMap::new(),
         faults: true,
-        node: Node::new(disk, config.bugs.ack_before_sync, workload.decider.clone()),
+        node: Node::new(disk, config.bugs.ack_before_sync, workload.decider.clone()).map_err(
+            |message| Failure {
+                seed,
+                time: 0,
+                message,
+            },
+        )?,
         workload,
         crash_pending: false,
         pre_crash: BTreeMap::new(),
@@ -161,7 +169,9 @@ impl World<'_> {
 
             if self.faults && self.now >= self.config.fault_window {
                 self.faults = false;
-                self.node.disk.set_faults(0, 0);
+                if let Some(disk) = self.node.disk_mut() {
+                    disk.set_faults(0, 0);
+                }
             }
             if self.now > self.config.max_time {
                 return Err(format!(
@@ -187,8 +197,8 @@ impl World<'_> {
             if !self.faults && self.quiescent() {
                 self.final_checks()?;
                 self.report.end_time = self.now;
-                self.report.syncs = self.node.disk.syncs;
-                self.report.torn_tails = self.node.disk.torn_tails;
+                self.report.syncs = self.node.disk().syncs;
+                self.report.torn_tails = self.node.disk().torn_tails;
                 self.report.step_executions = self.executions.values().sum();
                 self.report.duplicate_executions =
                     self.report.step_executions - self.executions.len() as u64;
@@ -312,7 +322,7 @@ impl World<'_> {
     fn deliver(&mut self, outbound: Vec<Outbound>) {
         for message in outbound {
             let ev = match message {
-                Outbound::StartAck { key } => Ev::ClientStartAck { key },
+                Outbound::Started { key } => Ev::ClientStartAck { key },
                 Outbound::Dispatch {
                     key,
                     cmd,
@@ -324,7 +334,8 @@ impl World<'_> {
                     name,
                     input,
                 },
-                Outbound::ResultAck { key, cmd } => Ev::WorkerResultAck { key, cmd },
+                Outbound::ResultRecorded { key, cmd } => Ev::WorkerResultAck { key, cmd },
+                Outbound::Finished { .. } => continue,
             };
             self.send(ev);
         }
@@ -333,9 +344,9 @@ impl World<'_> {
     fn crash(&mut self) {
         self.pre_crash = self
             .node
-            .runs
+            .runs()
             .iter()
-            .map(|(k, r)| (k.clone(), r.journal.clone()))
+            .map(|(k, r)| (k.clone(), r.journal().to_vec()))
             .collect();
         self.node.crash();
         self.report.crashes += 1;
@@ -347,11 +358,11 @@ impl World<'_> {
         self.node.recover()?;
 
         // Recovered journals are prefixes of what the node had in memory before the crash.
-        for (key, run) in &self.node.runs {
+        for (key, run) in self.node.runs() {
             let before = self.pre_crash.get(key).ok_or_else(|| {
                 format!("run {key} was recovered but did not exist before the crash")
             })?;
-            if !before.starts_with(&run.journal) {
+            if !before.starts_with(run.journal()) {
                 return Err(format!(
                     "run {key}: the recovered journal is not a prefix of the journal before the crash"
                 ));
@@ -372,23 +383,23 @@ impl World<'_> {
     /// Invariant: acknowledged work is never lost.
     fn check_acknowledged(&self) -> Result<(), String> {
         for key in &self.acked_starts {
-            if !self.node.runs.contains_key(key) {
+            if !self.node.runs().contains_key(key) {
                 return Err(format!("lost acknowledged start of {key}"));
             }
         }
         for (key, cmd) in &self.acked_results {
             let run = self
                 .node
-                .runs
+                .runs()
                 .get(key)
                 .ok_or_else(|| format!("lost run {key} with acknowledged results"))?;
             let index = usize::try_from(cmd.0).map_err(|e| e.to_string())?;
             let recorded = run
-                .state
+                .state()
                 .steps()
                 .get(index)
                 .is_some_and(|s| s.outcome.is_some());
-            if !recorded && !run.state.status().is_terminal() {
+            if !recorded && !run.state().status().is_terminal() {
                 return Err(format!("lost acknowledged result of {key} command {cmd}"));
             }
         }
@@ -401,9 +412,9 @@ impl World<'_> {
             && self.acked_starts.len() == self.wanted.len()
             && self.wanted.iter().all(|(key, _)| {
                 self.node
-                    .runs
+                    .runs()
                     .get(key)
-                    .is_some_and(|r| r.state.status().is_terminal())
+                    .is_some_and(|r| r.state().status().is_terminal())
             })
     }
 
@@ -414,10 +425,10 @@ impl World<'_> {
         for (key, input) in &self.wanted {
             let run = self
                 .node
-                .runs
+                .runs()
                 .get(key)
                 .ok_or_else(|| format!("run {key} missing at the end"))?;
-            let state = &run.state;
+            let state = &run.state();
             if state.status() == Status::Parked {
                 return Err(format!(
                     "run {key} was parked: {}",
@@ -442,8 +453,8 @@ impl World<'_> {
         }
 
         // The durable log holds exactly the in-memory journals, with valid chains.
-        let decoded = frame::decode_all(self.node.disk.durable());
-        if decoded.valid_len != self.node.disk.durable().len() {
+        let decoded = frame::decode_all(self.node.disk().durable());
+        if decoded.valid_len != self.node.disk().durable().len() {
             return Err("the durable log has an invalid tail after quiescence".into());
         }
         let mut by_run: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
@@ -454,7 +465,7 @@ impl World<'_> {
                 .or_default()
                 .push(record.to_vec());
         }
-        if by_run.len() != self.node.runs.len() {
+        if by_run.len() != self.node.runs().len() {
             return Err("the durable log and memory hold different runs".into());
         }
         for (key, records) in &by_run {
@@ -462,10 +473,10 @@ impl World<'_> {
                 verify_chain(key, records.iter().map(Vec::as_slice)).map_err(|e| e.to_string())?;
             let run = self
                 .node
-                .runs
+                .runs()
                 .get(key)
                 .ok_or_else(|| format!("run {key} only on disk"))?;
-            if verified.entries != run.journal {
+            if verified.entries != run.journal() {
                 return Err(format!("run {key}: durable journal differs from memory"));
             }
             for byte in verified.head {
@@ -482,9 +493,9 @@ impl World<'_> {
             .filter(|(key, _)| {
                 !self
                     .node
-                    .runs
+                    .runs()
                     .get(key)
-                    .is_some_and(|r| r.state.status().is_terminal())
+                    .is_some_and(|r| r.state().status().is_terminal())
             })
             .map(|(key, _)| key.clone())
             .collect();

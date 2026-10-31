@@ -11,5 +11,8 @@ publish = false
 workspace = true
 
 [dependencies]
+aqueduct-core.workspace = true
+aqueduct-engine.workspace = true
+aqueduct-procedure.workspace = true
 aqueduct-sim.workspace = true
 aqueduct-storage.workspace = true

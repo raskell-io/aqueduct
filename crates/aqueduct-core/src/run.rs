@@ -90,10 +90,13 @@ impl Transition {
     }
 }
 
-/// Starts a new run: the transition holds the `Started` entry and an activation.
-pub fn start(input: Payload) -> Transition {
+/// Starts a new run of a workflow: the transition holds the `Started` entry and an activation.
+pub fn start(workflow: impl Into<String>, input: Payload) -> Transition {
     Transition {
-        entries: vec![Entry::Started { input }],
+        entries: vec![Entry::Started {
+            workflow: workflow.into(),
+            input,
+        }],
         effects: vec![Effect::Activate],
     }
 }
@@ -135,6 +138,7 @@ pub enum JournalError {
 /// The state of one run: by definition, the fold of its journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunState {
+    workflow: String,
     status: Status,
     input: Payload,
     steps: Vec<ScheduledStep>,
@@ -148,10 +152,11 @@ impl RunState {
     /// Rebuilds a run's state from its journal, checking the journal rules.
     pub fn from_journal(journal: &[Entry]) -> Result<RunState, JournalError> {
         let (first, rest) = journal.split_first().ok_or(JournalError::Empty)?;
-        let Entry::Started { input } = first else {
+        let Entry::Started { workflow, input } = first else {
             return Err(JournalError::NotStarted);
         };
         let mut state = RunState {
+            workflow: workflow.clone(),
             status: Status::Running,
             input: input.clone(),
             steps: Vec::new(),
@@ -255,6 +260,11 @@ impl RunState {
     /// The view a decider sees.
     pub fn view(&self) -> RunView<'_> {
         RunView::new(self)
+    }
+
+    /// The name of the workflow or procedure the run executes.
+    pub fn workflow(&self) -> &str {
+        &self.workflow
     }
 
     /// The run's status.

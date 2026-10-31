@@ -16,7 +16,7 @@ fn payload() -> impl Strategy<Value = Payload> {
 fn entry() -> impl Strategy<Value = Entry> {
     let cmd = any::<u32>().prop_map(CommandIndex);
     prop_oneof![
-        payload().prop_map(|input| Entry::Started { input }),
+        (".{0,12}", payload()).prop_map(|(workflow, input)| Entry::Started { workflow, input }),
         (cmd.clone(), ".{0,12}", payload()).prop_map(|(cmd, name, input)| Entry::StepScheduled {
             cmd,
             name,

@@ -46,7 +46,7 @@
 //!     transition.effects
 //! }
 //!
-//! let first = start(Payload::new(*b"hello"));
+//! let first = start("test", Payload::new(*b"hello"));
 //! let mut journal = first.entries;
 //! let mut state = RunState::from_journal(&journal).expect("valid journal");
 //!

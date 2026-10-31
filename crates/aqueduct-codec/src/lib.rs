@@ -8,7 +8,7 @@
 //! use aqueduct_core::{Entry, Payload};
 //!
 //! let entries = [
-//!     Entry::Started { input: Payload::new(*b"in") },
+//!     Entry::Started { workflow: "orders".into(), input: Payload::new(*b"in") },
 //!     Entry::RunCompleted { output: Payload::new(*b"out") },
 //! ];
 //! let mut chain = ChainWriter::new("orders:42");
@@ -134,7 +134,10 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
     out.push(kind);
     out.extend_from_slice(prev);
     match entry {
-        Entry::Started { input } => put_bytes(&mut out, input.as_bytes()),
+        Entry::Started { workflow, input } => {
+            put_bytes(&mut out, workflow.as_bytes());
+            put_bytes(&mut out, input.as_bytes());
+        }
         Entry::StepScheduled { cmd, name, input } => {
             put_varint(&mut out, u64::from(cmd.0));
             put_bytes(&mut out, name.as_bytes());
@@ -166,6 +169,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
     let prev = reader.hash()?;
     let entry = match kind {
         kind::STARTED => Entry::Started {
+            workflow: reader.string()?,
             input: reader.payload()?,
         },
         kind::STEP_SCHEDULED => Entry::StepScheduled {

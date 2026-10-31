@@ -28,7 +28,7 @@ jobs:
       - run: cargo test --workspace --doc
 
   sim:
-    name: simulation (10,000 native + 2,000 Starlark seeds)
+    name: simulation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -38,13 +38,14 @@ jobs:
       - run: cargo xtask sim --seeds 2000 --workload starlark
 
   crash:
-    name: crash harness (200 kills)
+    name: crash harness
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask crash --kills 200
+      - run: cargo xtask crash-engine --kills 50
 
   msrv:
     name: MSRV (1.90)

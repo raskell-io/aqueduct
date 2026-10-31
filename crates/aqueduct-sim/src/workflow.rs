@@ -1,6 +1,6 @@
 //! The workload: a small pipeline with concurrent steps and a failure path, plus its reference model.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use aqueduct_procedure::Procedure;
 
@@ -130,7 +130,7 @@ pub fn execute_json(name: &str, input: &Payload) -> StepOutcome {
 /// Which decider and step bodies the simulated world runs.
 pub struct Workload {
     pub kind: WorkloadKind,
-    pub decider: Rc<dyn Decider>,
+    pub decider: Arc<dyn Decider + Send + Sync>,
     pub execute: fn(&str, &Payload) -> StepOutcome,
 }
 
@@ -139,12 +139,12 @@ impl Workload {
         Ok(match kind {
             WorkloadKind::Pipeline => Workload {
                 kind,
-                decider: Rc::new(Pipeline),
+                decider: Arc::new(Pipeline),
                 execute,
             },
             WorkloadKind::StarlarkPipeline => Workload {
                 kind,
-                decider: Rc::new(
+                decider: Arc::new(
                     Procedure::compile("pipeline.star", STARLARK_PIPELINE)
                         .map_err(|e| e.to_string())?,
                 ),
@@ -175,7 +175,7 @@ pub fn reference(
     workload: &Workload,
     input: &Payload,
 ) -> Result<(Status, Option<Payload>, Option<String>), String> {
-    let first = start(input.clone());
+    let first = start(crate::node::WORKFLOW, input.clone());
     let mut state = RunState::from_journal(&first.entries).map_err(|e| e.to_string())?;
     let mut work = first.effects;
     while let Some(effect) = work.pop() {

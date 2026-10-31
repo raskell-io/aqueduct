@@ -29,7 +29,7 @@
 //!     return {"greeting": "hello " + name}
 //! "#).unwrap();
 //!
-//! let journal = start(Payload::new(br#"{"user": "u-1"}"#.to_vec())).entries;
+//! let journal = start("test", Payload::new(br#"{"user": "u-1"}"#.to_vec())).entries;
 //! let state = RunState::from_journal(&journal).unwrap();
 //! let commands = procedure.decide(&state.view());
 //! assert_eq!(commands, vec![Command::ScheduleStep {
