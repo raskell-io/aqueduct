@@ -23,7 +23,10 @@
 //! Timers fire no earlier than their wake time, by the wall clock; signals are durable when
 //! [`Engine::signal`] returns.
 //!
-//! Not yet: retry policies (a failed step is terminal), a timer index (timers are found by scanning
+//! Steps return an [`Attempt`]: retryable failures are retried by the step's [`RetryPolicy`] with
+//! durable, journaled backoff; terminal failures fail the step at once.
+//!
+//! Not yet: a timer index (timers are found by scanning
 //! runs), a materialised state store
 //! (recovery replays the whole log; checkpoints in redb come with ADR 0009's state store).
 
@@ -38,10 +41,32 @@ use std::time::Duration;
 use aqueduct_core::{CommandIndex, Decider, Payload, Status, StepOutcome};
 use aqueduct_storage::{FileLog, FileLogOptions};
 
-use crate::{Deciders, Outbound, Partition, PartitionError};
+use crate::{Deciders, Outbound, Partition, PartitionError, RetryPolicy};
 
 /// A step implementation.
-pub type StepFn = Arc<dyn Fn(&Payload) -> StepOutcome + Send + Sync>;
+pub type StepFn = Arc<dyn Fn(&Payload) -> Attempt + Send + Sync>;
+
+/// The result of one attempt of a step (ADR 0012).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Attempt {
+    /// The step completed with a result.
+    Completed(Payload),
+    /// The attempt failed, but another attempt may succeed (a timeout, an unavailable service). The
+    /// step's retry policy decides whether and when it runs again.
+    Retry(String),
+    /// The step failed and retrying cannot help (invalid input, a rejected request).
+    Fail(String),
+}
+
+/// A step returning [`StepOutcome`] is unclassified: `Failed` is treated as retryable.
+impl From<StepOutcome> for Attempt {
+    fn from(outcome: StepOutcome) -> Self {
+        match outcome {
+            StepOutcome::Completed(result) => Attempt::Completed(result),
+            StepOutcome::Failed(error) => Attempt::Retry(error),
+        }
+    }
+}
 
 /// How a run ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +108,8 @@ pub struct Builder {
     redispatch: Duration,
     log: FileLogOptions,
     ack_before_sync: bool,
+    retry_policies: BTreeMap<String, RetryPolicy>,
+    default_retry: RetryPolicy,
 }
 
 impl Builder {
@@ -92,13 +119,30 @@ impl Builder {
         self
     }
 
-    /// Registers a step implementation.
-    pub fn step(
+    /// Registers a step implementation. It may return an [`Attempt`], or a [`StepOutcome`] whose
+    /// failures are treated as retryable.
+    pub fn step<R: Into<Attempt>>(
         mut self,
         name: &str,
-        step: impl Fn(&Payload) -> StepOutcome + Send + Sync + 'static,
+        step: impl Fn(&Payload) -> R + Send + Sync + 'static,
     ) -> Self {
-        self.steps.insert(name.to_owned(), Arc::new(step));
+        self.steps.insert(
+            name.to_owned(),
+            Arc::new(move |input: &Payload| step(input).into()),
+        );
+        self
+    }
+
+    /// Sets the retry policy of one step.
+    pub fn retry_policy(mut self, step: &str, policy: RetryPolicy) -> Self {
+        self.retry_policies.insert(step.to_owned(), policy);
+        self
+    }
+
+    /// Sets the retry policy for steps without their own (default: 3 attempts, 1 s backoff doubling up
+    /// to 60 s).
+    pub fn default_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.default_retry = policy;
         self
     }
 
@@ -134,6 +178,10 @@ impl Builder {
         let mut partition =
             Partition::recover(log, self.deciders).map_err(|e| EngineError::Open(e.to_string()))?;
         partition.inject_ack_before_sync(self.ack_before_sync);
+        partition.set_default_retry_policy(self.default_retry);
+        for (step, policy) in &self.retry_policies {
+            partition.set_retry_policy(step, *policy);
+        }
 
         let (requests, inbox) = mpsc::channel::<Request>();
         let (jobs, job_inbox) = mpsc::channel::<Job>();
@@ -182,6 +230,8 @@ impl Engine {
             redispatch: Duration::from_secs(30),
             log: FileLogOptions::default(),
             ack_before_sync: false,
+            retry_policies: BTreeMap::new(),
+            default_retry: RetryPolicy::default(),
         }
     }
 
@@ -288,6 +338,11 @@ enum Request {
         cmd: CommandIndex,
         outcome: StepOutcome,
     },
+    AttemptFailed {
+        key: String,
+        cmd: CommandIndex,
+        error: String,
+    },
     Shutdown,
 }
 
@@ -387,6 +442,11 @@ impl Processor {
                     .step_result(&key, cmd, outcome)
                     .map_err(|e| e.to_string())?;
             }
+            Request::AttemptFailed { key, cmd, error } => {
+                self.partition
+                    .step_attempt_failed(&key, cmd, error)
+                    .map_err(|e| e.to_string())?;
+            }
             Request::Shutdown => return Ok(false),
         }
         // Only non-empty under the injected acknowledge-before-sync bug.
@@ -434,7 +494,9 @@ impl Processor {
                         let _ = replies.remove(0).send(Ok(()));
                     }
                 }
-                Outbound::ResultRecorded { .. } | Outbound::Finished { .. } => {}
+                Outbound::ResultRecorded { .. }
+                | Outbound::AttemptRecorded { .. }
+                | Outbound::Finished { .. } => {}
             }
         }
     }
@@ -493,19 +555,27 @@ fn worker(
             },
             Err(_) => return,
         };
-        let outcome = match steps.get(&job.name) {
-            None => StepOutcome::Failed(format!("no step named `{}` is registered", job.name)),
+        let attempt = match steps.get(&job.name) {
+            // A deployment problem, not a property of the input: retry, so registering the step heals it.
+            None => Attempt::Retry(format!("no step named `{}` is registered", job.name)),
             Some(step) => catch_unwind(AssertUnwindSafe(|| step(&job.input)))
-                .unwrap_or_else(|_| StepOutcome::Failed(format!("step `{}` panicked", job.name))),
+                .unwrap_or_else(|_| Attempt::Retry(format!("step `{}` panicked", job.name))),
         };
-        if results
-            .send(Request::StepResult {
-                key: job.key,
-                cmd: job.cmd,
-                outcome,
-            })
-            .is_err()
-        {
+        let (key, cmd) = (job.key, job.cmd);
+        let request = match attempt {
+            Attempt::Completed(result) => Request::StepResult {
+                key,
+                cmd,
+                outcome: StepOutcome::Completed(result),
+            },
+            Attempt::Fail(error) => Request::StepResult {
+                key,
+                cmd,
+                outcome: StepOutcome::Failed(error),
+            },
+            Attempt::Retry(error) => Request::AttemptFailed { key, cmd, error },
+        };
+        if results.send(request).is_err() {
             return;
         }
     }

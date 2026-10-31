@@ -75,6 +75,8 @@ pub struct Config {
     pub torn_ppm: u32,
     /// Chance, per dispatch, that the worker forgets its unacknowledged results.
     pub worker_amnesia_ppm: u32,
+    /// Chance, per step execution while faults are on, of a transient (retryable) failure.
+    pub transient_ppm: u32,
     /// Group commit delay.
     pub flush_interval: u64,
     /// Interval at which the node re-dispatches steps without an outcome.
@@ -103,6 +105,7 @@ impl Default for Config {
             sync_fail_ppm: 20_000,
             torn_ppm: 300_000,
             worker_amnesia_ppm: 20_000,
+            transient_ppm: 100_000,
             flush_interval: 3,
             redispatch_interval: 150,
             client_retry: 80,
@@ -132,6 +135,8 @@ pub struct Report {
     pub dropped: u64,
     /// Messages duplicated.
     pub duplicated: u64,
+    /// Retries the engine scheduled after transient failures.
+    pub retries: u64,
     /// Recoveries that found and truncated a torn or corrupt tail.
     pub torn_tails: u64,
     /// Step executions, including repeats.

@@ -50,6 +50,50 @@ impl std::fmt::Debug for Deciders {
     }
 }
 
+/// How a step is retried after a retryable error (ADR 0012): exponential backoff, capped, up to
+/// `max_attempts` attempts in total. The last failure becomes the step's terminal failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Attempts in total, including the first. 1 means no retries.
+    pub max_attempts: u32,
+    /// Backoff after the first failed attempt, in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Factor applied to the backoff after each further failure.
+    pub multiplier: u32,
+    /// Upper bound on the backoff, in milliseconds.
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_attempts: 3,
+            initial_backoff_ms: 1_000,
+            multiplier: 2,
+            max_backoff_ms: 60_000,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// No retries: the first failure is terminal.
+    pub fn none() -> Self {
+        RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        }
+    }
+
+    /// The backoff after `failed` failed attempts (1 for the first failure).
+    pub fn backoff_ms(&self, failed: u32) -> u64 {
+        let exponent = failed.saturating_sub(1).min(32);
+        let factor = u64::from(self.multiplier.max(1)).saturating_pow(exponent);
+        self.initial_backoff_ms
+            .saturating_mul(factor)
+            .min(self.max_backoff_ms)
+    }
+}
+
 /// A run held by a partition: its state and its journal.
 #[derive(Debug)]
 pub struct PartitionRun {
@@ -91,6 +135,14 @@ pub enum Outbound {
     },
     /// A step result was recorded (or is no longer needed); the sender can stop resending it.
     ResultRecorded {
+        /// The run key.
+        key: String,
+        /// The command.
+        cmd: CommandIndex,
+    },
+    /// A retryable failure report was processed (a retry was scheduled, the step failed terminally,
+    /// or the report was no longer needed); the sender can stop resending it.
+    AttemptRecorded {
         /// The run key.
         key: String,
         /// The command.
@@ -140,6 +192,8 @@ pub struct Partition<L: LogStore> {
     immediate: Vec<Outbound>,
     ack_before_sync: bool,
     now_ms: u64,
+    retry_policies: BTreeMap<String, RetryPolicy>,
+    default_retry: RetryPolicy,
 }
 
 impl<L: LogStore> std::fmt::Debug for Partition<L> {
@@ -198,6 +252,8 @@ impl<L: LogStore> Partition<L> {
             immediate: Vec::new(),
             ack_before_sync: false,
             now_ms: 0,
+            retry_policies: BTreeMap::new(),
+            default_retry: RetryPolicy::default(),
         })
     }
 
@@ -311,6 +367,61 @@ impl<L: LogStore> Partition<L> {
             .flat_map(|run| run.state.timers())
             .map(|(_, wake_at)| wake_at)
             .min()
+    }
+
+    /// Sets the retry policy for one step name.
+    pub fn set_retry_policy(&mut self, step: &str, policy: RetryPolicy) {
+        self.retry_policies.insert(step.to_owned(), policy);
+    }
+
+    /// Sets the retry policy for steps without their own.
+    pub fn set_default_retry_policy(&mut self, policy: RetryPolicy) {
+        self.default_retry = policy;
+    }
+
+    /// Records that an attempt of a step failed with a retryable error. While the step's policy allows
+    /// another attempt, a durable retry is scheduled; otherwise the step fails terminally.
+    ///
+    /// Known limitation: reports carry no attempt number, so a delayed duplicate report of an earlier
+    /// attempt can count as one more failure.
+    pub fn step_attempt_failed(
+        &mut self,
+        key: &str,
+        cmd: CommandIndex,
+        error: String,
+    ) -> Result<(), PartitionError> {
+        let Some(run) = self.runs.get(key) else {
+            return Ok(());
+        };
+        let step = usize::try_from(cmd.0)
+            .ok()
+            .and_then(|i| run.state.steps().get(i));
+        let Some(step) = step else {
+            return Ok(());
+        };
+        let policy = self
+            .retry_policies
+            .get(&step.name)
+            .copied()
+            .unwrap_or(self.default_retry);
+        let attempt = step.failed_attempts.saturating_add(1);
+        if attempt >= policy.max_attempts {
+            self.step_result(key, cmd, StepOutcome::Failed(error))?;
+        } else {
+            let event = Event::StepAttemptFailed {
+                cmd,
+                error,
+                retry_after_ms: policy.backoff_ms(attempt),
+            };
+            let transition = run.state.handle_at(event, self.now_ms);
+            let effects = self.append(key, transition)?;
+            self.perform(key, effects)?;
+        }
+        self.send(Outbound::AttemptRecorded {
+            key: key.to_owned(),
+            cmd,
+        });
+        Ok(())
     }
 
     /// Records a step result (at most once per command).

@@ -5,7 +5,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aqueduct_core::{CommandIndex, Decider, Payload, StepOutcome};
-use aqueduct_engine::{Deciders, Outbound, Partition, PartitionRun};
+use aqueduct_engine::{Deciders, Outbound, Partition, PartitionRun, RetryPolicy};
+
+/// Retries never run out in the simulation, so every run still ends as the fault-free reference.
+const SIM_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: u32::MAX,
+    initial_backoff_ms: 20,
+    multiplier: 2,
+    max_backoff_ms: 200,
+};
 use aqueduct_storage::StorageError;
 
 use crate::disk::SimDisk;
@@ -35,6 +43,7 @@ impl Node {
         deciders.insert(WORKFLOW, decider);
         let mut partition = Partition::load(disk, deciders.clone()).map_err(|e| e.to_string())?;
         partition.inject_ack_before_sync(ack_before_sync);
+        partition.set_default_retry_policy(SIM_RETRY);
         Ok(Node {
             up: true,
             incarnation: 0,
@@ -124,6 +133,17 @@ impl Node {
         }
     }
 
+    pub fn on_attempt_failed(
+        &mut self,
+        key: &str,
+        cmd: CommandIndex,
+        error: String,
+    ) -> Result<(), String> {
+        self.partition()?
+            .step_attempt_failed(key, cmd, error)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn on_redispatch(&mut self) {
         if let Some(partition) = self.partition.as_mut() {
             partition.redispatch();
@@ -153,6 +173,7 @@ impl Node {
         let mut partition =
             Partition::load(disk, self.deciders.clone()).map_err(|e| e.to_string())?;
         partition.inject_ack_before_sync(self.ack_before_sync);
+        partition.set_default_retry_policy(SIM_RETRY);
         self.partition = Some(partition);
         self.up = true;
         self.incarnation += 1;

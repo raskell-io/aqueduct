@@ -50,6 +50,7 @@ mod kind {
     pub const SIGNAL_AWAITED: u8 = 9;
     pub const TIMER_FIRED: u8 = 10;
     pub const SIGNAL_RECEIVED: u8 = 11;
+    pub const STEP_RETRY_SCHEDULED: u8 = 12;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -138,6 +139,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::SignalAwaited { .. } => kind::SIGNAL_AWAITED,
         Entry::TimerFired { .. } => kind::TIMER_FIRED,
         Entry::SignalReceived { .. } => kind::SIGNAL_RECEIVED,
+        Entry::StepRetryScheduled { .. } => kind::STEP_RETRY_SCHEDULED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -183,6 +185,17 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_varint(&mut out, *wake_at);
         }
         Entry::TimerFired { cmd } => put_varint(&mut out, u64::from(cmd.0)),
+        Entry::StepRetryScheduled {
+            cmd,
+            attempt,
+            error,
+            wake_at,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_varint(&mut out, u64::from(*attempt));
+            put_bytes(&mut out, error.as_bytes());
+            put_varint(&mut out, *wake_at);
+        }
         Entry::SignalReceived { name, id, payload } => {
             put_bytes(&mut out, name.as_bytes());
             put_bytes(&mut out, id.as_bytes());
@@ -240,6 +253,12 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
             wake_at: reader.varint()?,
         },
         kind::TIMER_FIRED => Entry::TimerFired { cmd: reader.cmd()? },
+        kind::STEP_RETRY_SCHEDULED => Entry::StepRetryScheduled {
+            cmd: reader.cmd()?,
+            attempt: u32::try_from(reader.varint()?).map_err(|_| DecodeError::Overflow)?,
+            error: reader.string()?,
+            wake_at: reader.varint()?,
+        },
         kind::SIGNAL_RECEIVED => Entry::SignalReceived {
             name: reader.string()?,
             id: reader.string()?,
