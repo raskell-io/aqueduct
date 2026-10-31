@@ -1,0 +1,50 @@
+# Aqueduct
+
+**A deterministic engine for procedures that agents write and people approve.** Aqueduct starts as a
+library inside your binary, grows into a replicated cluster without changing your code, and every run
+leaves a history you can replay and audit.
+
+> **Status: design phase.** Nothing here is usable yet. The repository currently holds the
+> [build brief](BRIEF.md), the [architecture decision records](docs/adr/) and an empty Cargo workspace.
+> Do not depend on it.
+
+## The idea
+
+Agents are good at exploring: unfamiliar systems, ambiguous documents, cases nobody has seen before.
+Much of the work organisations do is the opposite: the same case, handled the same way, every time, with a
+record anyone can check afterwards. Aqueduct is built for the hand-over between the two:
+
+1. Agents explore new kinds of work.
+2. When work recurs, an agent writes it down as a **procedure**: short, typed, readable.
+3. The procedure is **replayed against past cases** before anyone trusts it.
+4. A named person **approves** it.
+5. Aqueduct **runs it deterministically**, with bounded, budgeted **agent steps** where judgement is
+   genuinely needed, and journals everything.
+6. Escalations and drift send it back to an agent for **repair**, or it is **retired**.
+
+Engineers who need full expressive power write **code workflows** in Rust instead; both share one engine,
+one journal format and one set of guarantees.
+
+## Planned guarantees
+
+- Acknowledged work is never lost; a step's result is recorded exactly once.
+- Procedures are deterministic by construction; code workflows are checked by replay.
+- Histories are tamper-evident, exportable and specified independently of the code.
+- The same semantics embedded, on a single server and in a cluster.
+- The whole engine is tested by deterministic simulation with fault injection in CI.
+
+See [BRIEF.md](BRIEF.md) for the full design and the phased plan.
+
+## Why "Aqueduct"
+
+An aqueduct carries water from wild sources across terrain nobody can change, on a gentle, constant
+gradient, and some have done so for two thousand years. See [ADR 0002](docs/adr/0002-project-name.md).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at
+your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this
+project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions. See [CONTRIBUTING.md](CONTRIBUTING.md).
