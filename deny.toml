@@ -2,6 +2,9 @@
 
 [graph]
 all-features = true
+# The storage benchmark is never published and pulls in fjall, which was not chosen (ADR 0009). Excluding it
+# keeps fjall's 0BSD and BSL-1.0 dependencies out of the policy for shipped crates.
+exclude = ["aqueduct-bench-storage"]
 
 [advisories]
 yanked = "deny"

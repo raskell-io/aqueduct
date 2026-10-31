@@ -518,9 +518,9 @@ trait StateStore {    // materialised state, transactional per partition
 }
 ```
 
-- **Embedded and single server:** one local storage engine for both log and state. Phase 0 benchmarks
-  **redb** (B-tree, ACID, stable format, Apache/MIT) and **fjall** (LSM tree, Apache/MIT) on the journal
-  append workload and the state read workload, and records the choice in an ADR. Use group commit (batch
+- **Embedded and single server:** the log is our own segmented file of framed records (the format in
+  `docs/history-format.md`), and materialised state lives in **redb**, committed without fsync and rebuilt
+  from the log after a crash (ADR 0009, chosen by the phase 0 benchmark of redb, fjall and the plain log). Use group commit (batch
   fsyncs) from day one; durability settings are explicit (`Durability::Fsync` default, `Durability::Os` for
   tests and tools).
 - **Cluster:** the log is replicated per partition with Raft (evaluate **openraft**, Apache/MIT). State is
@@ -748,7 +748,7 @@ runtime, invoker, timer service, outboxes), `aqueduct-procedure` (Starlark inter
 
 Standards:
 
-- Rust stable, edition 2024, MSRV 1.85 (documented in `Cargo.toml`, checked in CI), `tokio` as the async
+- Rust stable, edition 2024, MSRV 1.90 (raised from 1.85 for redb, ADR 0009; documented in `Cargo.toml`, checked in CI), `tokio` as the async
   runtime (see the runtime ADR in section 10.1), `tracing` for instrumentation.
 - `#![forbid(unsafe_code)]` in every crate. An exception needs an ADR and a safety comment per block.
 - `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo deny check`, and (from
@@ -870,9 +870,9 @@ ingress, the approval path and the cluster transport.
 ## 16. Open questions to settle by ADR
 
 1. Step bodies in the workflow's process by default, or always through task queues?
-2. redb or fjall as the embedded storage engine (phase 0 benchmark decides)?
-3. Default payload codec: JSON, a binary serde format, or JSON in development and binary in production?
-4. Fixed partition count with later resharding, or virtual partitions from the start?
+2. ~~redb or fjall as the embedded storage engine?~~ Own log plus redb for state (ADR 0009).
+3. ~~Default payload codec?~~ JSON by default, codec declared per run from history format v1 (ADR 0010).
+4. ~~Fixed partition count or virtual partitions?~~ 4,096 hash slots mapped to partitions (ADR 0011).
 5. openraft or an in-house Raft implementation tuned for the log workload?
 6. How much of the push endpoint and procedure formats to align with existing ecosystems (for example the
    CNCF Serverless Workflow specification), so that users can migrate in?
