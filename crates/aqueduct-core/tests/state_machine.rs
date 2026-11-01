@@ -331,6 +331,7 @@ fn invalid_journals_are_rejected() {
     let started = Entry::Started {
         workflow: "test".into(),
         input: Payload::default(),
+        budget_tokens: None,
     };
     let scheduled = |cmd| Entry::StepScheduled {
         cmd: CommandIndex(cmd),

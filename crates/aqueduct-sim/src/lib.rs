@@ -166,6 +166,10 @@ pub struct Report {
     pub cancelled: u64,
     /// Escalations resolved by the simulated reviewer.
     pub escalations_resolved: u64,
+    /// Agent calls that would have exceeded their run's budget and escalated.
+    pub budget_escalations: u64,
+    /// Budget escalations the reviewer approved.
+    pub budget_approvals: u64,
     /// Agent calls executed by the simulated model, including repeats before a result was recorded.
     pub agent_calls: u64,
     /// A fingerprint of the event sequence and the final chain heads. Equal for equal seeds.

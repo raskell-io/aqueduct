@@ -28,6 +28,10 @@ impl Status {
 /// The error of a signal wait whose timeout fired.
 pub const TIMED_OUT: &str = "timed out";
 
+/// The reason of the escalation an agent call raises when it would exceed the run's budget. Resolving it
+/// with `true` raises the budget enough for the call; anything else fails the call.
+pub const BUDGET_ESCALATION: &str = "budget";
+
 /// The error of a command that a cancellation completed: `cancelled: <reason>`.
 pub fn cancelled_error(reason: &str) -> String {
     format!("cancelled: {reason}")
@@ -89,6 +93,9 @@ pub struct ScheduledStep {
     pub retry_at: Option<u64>,
     /// Whether a cancellation completed this command (its outcome is then a failure).
     pub cancelled: bool,
+    /// For an agent call that would exceed the run's budget: what it needs and what was available, as
+    /// JSON (`{"needed": ..., "available": ...}`). The call waits for approval meanwhile.
+    pub awaiting_budget: Option<Payload>,
 }
 
 impl ScheduledStep {
@@ -249,10 +256,20 @@ impl Transition {
 
 /// Starts a new run of a workflow: the transition holds the `Started` entry and an activation.
 pub fn start(workflow: impl Into<String>, input: Payload) -> Transition {
+    start_with_budget(workflow, input, None)
+}
+
+/// Starts a new run with a token budget for its agent calls (see [`RunState::budget`]).
+pub fn start_with_budget(
+    workflow: impl Into<String>,
+    input: Payload,
+    budget_tokens: Option<u64>,
+) -> Transition {
     Transition {
         entries: vec![Entry::Started {
             workflow: workflow.into(),
             input,
+            budget_tokens,
         }],
         effects: vec![Effect::Activate],
     }
@@ -320,6 +337,8 @@ pub struct RunState {
     continued_with: Option<Payload>,
     /// Tokens used by the run's completed agent calls.
     tokens_used: u64,
+    /// The run's token budget for agent calls, if it has one.
+    budget: Option<u64>,
     /// A cancellation found no pending command; the next waiting command takes it.
     pending_cancel: bool,
 }
@@ -328,7 +347,12 @@ impl RunState {
     /// Rebuilds a run's state from its journal, checking the journal rules.
     pub fn from_journal(journal: &[Entry]) -> Result<RunState, JournalError> {
         let (first, rest) = journal.split_first().ok_or(JournalError::Empty)?;
-        let Entry::Started { workflow, input } = first else {
+        let Entry::Started {
+            workflow,
+            input,
+            budget_tokens,
+        } = first
+        else {
             return Err(JournalError::NotStarted);
         };
         let mut state = RunState {
@@ -345,6 +369,7 @@ impl RunState {
             cancel: None,
             continued_with: None,
             tokens_used: 0,
+            budget: *budget_tokens,
             pending_cancel: false,
         };
         for entry in rest {
@@ -444,6 +469,33 @@ impl RunState {
                     budget_tokens: *budget_tokens,
                 };
                 self.push_command(*cmd, name, request.clone(), kind)?;
+            }
+            Entry::AgentCallEscalated {
+                cmd,
+                name,
+                request,
+                budget_tokens,
+                available,
+            } => {
+                let kind = CommandKind::Agent {
+                    budget_tokens: *budget_tokens,
+                };
+                self.push_command(*cmd, name, request.clone(), kind)?;
+                let index = self.index(*cmd)?;
+                // A pending cancellation may have completed it already; then it does not wait.
+                if self.steps[index].outcome.is_none() {
+                    self.steps[index].awaiting_budget = Some(Payload::new(
+                        format!("{{\"needed\":{budget_tokens},\"available\":{available}}}")
+                            .into_bytes(),
+                    ));
+                }
+            }
+            Entry::BudgetApproved { cmd, tokens } => {
+                let index = self.index(*cmd)?;
+                if self.steps[index].awaiting_budget.take().is_none() {
+                    return Err(JournalError::InvalidCompletion(*cmd));
+                }
+                self.budget = Some(*tokens);
             }
             Entry::AgentCallCompleted { cmd, response } => {
                 self.expect_kind(*cmd, |kind| matches!(kind, CommandKind::Agent { .. }))?;
@@ -552,6 +604,30 @@ impl RunState {
                             effects: vec![Effect::Activate],
                         }
                     }
+                    Ok(step) if step.awaiting_budget.is_some() && step.outcome.is_none() => {
+                        let CommandKind::Agent { budget_tokens } = step.kind else {
+                            return Transition::none();
+                        };
+                        if outcome.as_bytes().trim_ascii() == b"true" {
+                            // Raise the budget exactly enough for this call, and make it.
+                            let tokens = self.committed_tokens().saturating_add(budget_tokens);
+                            Transition {
+                                entries: vec![Entry::BudgetApproved { cmd, tokens }],
+                                effects: step.dispatch(cmd).into_iter().collect(),
+                            }
+                        } else {
+                            Transition {
+                                entries: vec![Entry::StepFailed {
+                                    cmd,
+                                    error: format!(
+                                        "agent call `{}` would exceed the run's budget, and more was not approved",
+                                        step.name
+                                    ),
+                                }],
+                                effects: vec![Effect::Activate],
+                            }
+                        }
+                    }
                     // Unknown, not an escalation, or already resolved (or cancelled): dropped.
                     _ => Transition::none(),
                 }
@@ -610,7 +686,10 @@ impl RunState {
             .iter()
             .zip(0u32..)
             .filter(|(step, _)| {
-                step.outcome.is_none() && step.kind.is_dispatched() && step.retry_at.is_none()
+                step.outcome.is_none()
+                    && step.kind.is_dispatched()
+                    && step.retry_at.is_none()
+                    && step.awaiting_budget.is_none()
             })
             .filter_map(|(step, index)| step.dispatch(CommandIndex(index)))
             .collect()
@@ -671,14 +750,40 @@ impl RunState {
         self.steps
             .iter()
             .zip(0u32..)
-            .filter(|(step, _)| step.kind == CommandKind::Escalation && step.outcome.is_none())
-            .map(|(step, index)| (CommandIndex(index), step.name.as_str(), &step.input))
+            .filter(|(step, _)| step.outcome.is_none())
+            .filter_map(|(step, index)| match (&step.kind, &step.awaiting_budget) {
+                (CommandKind::Escalation, _) => {
+                    Some((CommandIndex(index), step.name.as_str(), &step.input))
+                }
+                (CommandKind::Agent { .. }, Some(needs)) => {
+                    Some((CommandIndex(index), BUDGET_ESCALATION, needs))
+                }
+                _ => None,
+            })
             .collect()
     }
 
     /// Tokens used by the run's completed agent calls.
     pub fn tokens_used(&self) -> u64 {
         self.tokens_used
+    }
+
+    /// The run's token budget for agent calls, if it has one.
+    pub fn budget(&self) -> Option<u64> {
+        self.budget
+    }
+
+    /// Tokens used, plus the budgets of agent calls in flight (made, not yet answered): what the run has
+    /// committed. A new call is made only if its budget fits on top.
+    pub fn committed_tokens(&self) -> u64 {
+        self.steps
+            .iter()
+            .filter(|step| step.outcome.is_none() && step.awaiting_budget.is_none())
+            .filter_map(|step| match step.kind {
+                CommandKind::Agent { budget_tokens } => Some(budget_tokens),
+                _ => None,
+            })
+            .fold(self.tokens_used, u64::saturating_add)
     }
 
     /// The next run's input, if the run continued as new.
@@ -729,6 +834,7 @@ impl RunState {
             failed_attempts: 0,
             retry_at: None,
             cancelled: false,
+            awaiting_budget: None,
         });
         // A cancellation that found nothing pending is taken by the next command that waits.
         if self.pending_cancel && kind != CommandKind::Recorded {
@@ -929,6 +1035,8 @@ impl RunState {
         let total = commands.len();
         let mut transition = Transition::none();
         let mut steps_seen = 0usize;
+        // Tokens committed so far, including agent calls made earlier in this decision.
+        let mut committed = self.committed_tokens();
         // A cancellation waiting for the next command: that command is recorded but never started.
         let mut cancel_next = self.pending_cancel;
         // Signals already received that new waits in this decision will take, by name.
@@ -982,6 +1090,7 @@ impl RunState {
                     failed_attempts: 0,
                     retry_at: None,
                     cancelled: false,
+                    awaiting_budget: None,
                 };
                 if let Some(recorded) = self.steps.get(steps_seen) {
                     if !same_command(recorded, &issued) {
@@ -1068,20 +1177,33 @@ impl RunState {
                                 wake_at,
                             });
                         }
-                        CommandKind::Agent { budget_tokens } => {
-                            transition.entries.push(Entry::AgentCallScheduled {
-                                cmd,
-                                name: issued.name.clone(),
-                                request: issued.input.clone(),
-                                budget_tokens,
-                            });
-                            transition.effects.push(Effect::DispatchAgent {
-                                cmd,
-                                name: issued.name,
-                                request: issued.input,
-                                budget_tokens,
-                            });
-                        }
+                        CommandKind::Agent { budget_tokens } => match self.budget {
+                            // Over the run's budget: not made; escalated for approval instead.
+                            Some(limit) if committed.saturating_add(budget_tokens) > limit => {
+                                transition.entries.push(Entry::AgentCallEscalated {
+                                    cmd,
+                                    name: issued.name,
+                                    request: issued.input,
+                                    budget_tokens,
+                                    available: limit.saturating_sub(committed),
+                                });
+                            }
+                            _ => {
+                                committed = committed.saturating_add(budget_tokens);
+                                transition.entries.push(Entry::AgentCallScheduled {
+                                    cmd,
+                                    name: issued.name.clone(),
+                                    request: issued.input.clone(),
+                                    budget_tokens,
+                                });
+                                transition.effects.push(Effect::DispatchAgent {
+                                    cmd,
+                                    name: issued.name,
+                                    request: issued.input,
+                                    budget_tokens,
+                                });
+                            }
+                        },
                         CommandKind::Escalation => {
                             transition.entries.push(Entry::Escalated {
                                 cmd,

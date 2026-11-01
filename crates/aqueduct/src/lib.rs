@@ -30,7 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub use aqueduct_core::{Payload, Status, StepOutcome};
-pub use aqueduct_engine::{RetryPolicy, ReusePolicy};
+pub use aqueduct_engine::{RetryPolicy, ReusePolicy, StartOptions};
 pub use aqueduct_procedure::Procedure;
 pub use aqueduct_sdk::{
     AgentOptions, Either, Saga, WorkflowContext, WorkflowError, join, join_all, select, select_all,

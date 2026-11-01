@@ -334,7 +334,19 @@ fn starts_commands(entry: &Entry) -> bool {
 
 fn describe_entry(entry: &Entry) -> String {
     match entry {
-        Entry::Started { workflow, input } => format!("started {workflow} with {}", text(input)),
+        Entry::Started {
+            workflow,
+            input,
+            budget_tokens: None,
+        } => format!("started {workflow} with {}", text(input)),
+        Entry::Started {
+            workflow,
+            input,
+            budget_tokens: Some(tokens),
+        } => format!(
+            "started {workflow} with {} (budget {tokens} tokens)",
+            text(input)
+        ),
         Entry::StepScheduled { cmd, name, input } => {
             format!("[{cmd}] step {name} scheduled with {}", text(input))
         }
@@ -371,6 +383,18 @@ fn describe_entry(entry: &Entry) -> String {
         }
         Entry::RunCompleted { output } => format!("run completed with {}", text(output)),
         Entry::ContinuedAsNew { input } => format!("continued as new with {}", text(input)),
+        Entry::AgentCallEscalated {
+            cmd,
+            name,
+            budget_tokens,
+            available,
+            ..
+        } => format!(
+            "[{cmd}] agent call {name} over budget: needs {budget_tokens} tokens, {available} available; escalated"
+        ),
+        Entry::BudgetApproved { cmd, tokens } => {
+            format!("[{cmd}] budget raised to {tokens} tokens")
+        }
         Entry::AgentCallScheduled {
             cmd,
             name,
@@ -407,8 +431,12 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
     use serde_json::json;
     let cmd = |c: &aqueduct_core::CommandIndex| c.0;
     match entry {
-        Entry::Started { workflow, input } => {
-            json!({"kind": "Started", "workflow": workflow, "input": payload(input)})
+        Entry::Started {
+            workflow,
+            input,
+            budget_tokens,
+        } => {
+            json!({"kind": "Started", "workflow": workflow, "input": payload(input), "budget_tokens": budget_tokens})
         }
         Entry::StepScheduled {
             cmd: c,
@@ -466,6 +494,19 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         }
         Entry::ContinuedAsNew { input } => {
             json!({"kind": "ContinuedAsNew", "input": payload(input)})
+        }
+        Entry::AgentCallEscalated {
+            cmd: c,
+            name,
+            request,
+            budget_tokens,
+            available,
+        } => json!({
+            "kind": "AgentCallEscalated", "cmd": cmd(c), "name": name, "request": payload(request),
+            "budget_tokens": budget_tokens, "available": available
+        }),
+        Entry::BudgetApproved { cmd: c, tokens } => {
+            json!({"kind": "BudgetApproved", "cmd": cmd(c), "tokens": tokens})
         }
         Entry::AgentCallScheduled {
             cmd: c,

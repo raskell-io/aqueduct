@@ -133,8 +133,12 @@ impl Node {
     }
 
     pub fn on_start(&mut self, key: &str, input: Payload) -> Result<(), String> {
+        let options = aqueduct_engine::StartOptions {
+            budget_tokens: crate::workflow::run_budget(&input),
+            ..aqueduct_engine::StartOptions::default()
+        };
         self.partition()?
-            .start(key, WORKFLOW, input)
+            .start_with(key, WORKFLOW, input, options)
             .map_err(|e| e.to_string())
     }
 
@@ -191,15 +195,15 @@ impl Node {
         }
     }
 
-    /// Open escalations, as an operator's dashboard would list them: (run id, command).
-    pub fn open_escalations(&self) -> Vec<(String, CommandIndex)> {
+    /// Open escalations, as an operator's dashboard would list them: (run id, command, reason).
+    pub fn open_escalations(&self) -> Vec<(String, CommandIndex, String)> {
         self.partition
             .as_ref()
             .map(|partition| {
                 partition
                     .open_escalations()
                     .into_iter()
-                    .map(|(run, cmd, _, _)| (run, cmd))
+                    .map(|(run, cmd, reason, _)| (run, cmd, reason))
                     .collect()
             })
             .unwrap_or_default()

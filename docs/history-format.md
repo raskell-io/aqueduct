@@ -55,6 +55,9 @@ record = version:u8  kind:u8  prev:hash  fields
 | 17 | `ContinuedAsNew` | `input:bytes` |
 | 18 | `AgentCallScheduled` | `cmd:cmd`, `name:string`, `request:bytes`, `budget_tokens:varint` |
 | 19 | `AgentCallCompleted` | `cmd:cmd`, `model:string`, `params:bytes`, `response:bytes`, `input_tokens:varint`, `output_tokens:varint` |
+| 20 | `AgentCallEscalated` | `cmd:cmd`, `name:string`, `request:bytes`, `budget_tokens:varint`, `available:varint` |
+| 21 | `BudgetApproved` | `cmd:cmd`, `tokens:varint` |
+| 22 | `Started` (with a budget) | `workflow:string`, `input:bytes`, `budget_tokens:varint` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
@@ -91,8 +94,9 @@ codecs.
 A decoded history is a valid journal if:
 
 1. The first entry is `Started`, and it occurs only once.
-2. `StepScheduled`, `TimerStarted`, `SignalAwaited`, `ValueRecorded`, `Escalated` and
-   `AgentCallScheduled` share one sequence of command indexes: 0, 1, 2, ... in order, without gaps.
+2. `StepScheduled`, `TimerStarted`, `SignalAwaited`, `ValueRecorded`, `Escalated`,
+   `AgentCallScheduled` and `AgentCallEscalated` share one sequence of command indexes: 0, 1, 2, ... in
+   order, without gaps.
 3. Each command has at most one outcome. `StepCompleted` and `StepFailed` complete a step. `TimerFired`
    completes a sleep (outcome `null`) or times out a signal wait that has a timeout. A `SignalReceived`
    completes the oldest signal wait with the same name that has no outcome yet; if there is none, the
@@ -102,6 +106,10 @@ A decoded history is a valid journal if:
    cancellation. `AgentCallCompleted` completes an agent call (outcome `response`); `StepFailed` fails
    one; retries (rule 4) apply to agent calls as to steps. An `AgentCallCompleted` has
    `input_tokens + output_tokens <= budget_tokens`: an answer that cost more is recorded as `StepFailed`.
+   A run started with kind 22 has a token budget. `AgentCallEscalated` is an agent call that did not fit
+   in what was left of it (the run's answered tokens plus the budgets of its calls in flight): it waits,
+   without being made, until `BudgetApproved` (the run's new budget) releases it, or `StepFailed`
+   declines it, or a cancellation closes it.
    `CancelRequested` occurs at most once. It completes every command that has no outcome yet (a step,
    including one waiting to retry, a sleep or a signal wait) as failed with the error
    `cancelled: <reason>`, in command order, and marks them cancelled. If no command is waiting, the next

@@ -72,6 +72,9 @@ pub enum Entry {
         workflow: String,
         /// The run's input.
         input: Payload,
+        /// The run's token budget for agent calls, if it has one. Part of the start itself, so a crash
+        /// can never keep the start and lose the budget.
+        budget_tokens: Option<u64>,
     },
     /// The run issued a step command.
     StepScheduled {
@@ -100,6 +103,28 @@ pub enum Entry {
         cmd: CommandIndex,
         /// What answered and what it cost.
         response: AgentResponse,
+    },
+    /// The run issued an agent call that would exceed the run's budget: it is scheduled but not made, and
+    /// waits for a person or an agent to approve more (an escalation with reason `budget`). One record,
+    /// so a crash can never keep the call and lose the fact that it must wait.
+    AgentCallEscalated {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The agent call's name.
+        name: String,
+        /// The request (JSON).
+        request: Payload,
+        /// The most tokens the call may use: what it needs from the run's budget.
+        budget_tokens: u64,
+        /// The tokens the run had left for it.
+        available: u64,
+    },
+    /// More budget was approved for a waiting agent call; the call is made.
+    BudgetApproved {
+        /// The agent call's command.
+        cmd: CommandIndex,
+        /// The run's new budget.
+        tokens: u64,
     },
     /// A step completed. Recorded at most once per command.
     StepCompleted {

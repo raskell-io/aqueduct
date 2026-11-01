@@ -8,7 +8,7 @@
 //! use aqueduct_core::{Entry, Payload};
 //!
 //! let entries = [
-//!     Entry::Started { workflow: "orders".into(), input: Payload::new(*b"in") },
+//!     Entry::Started { workflow: "orders".into(), input: Payload::new(*b"in"), budget_tokens: None },
 //!     Entry::RunCompleted { output: Payload::new(*b"out") },
 //! ];
 //! let mut chain = ChainWriter::new("orders:42");
@@ -58,6 +58,9 @@ mod kind {
     pub const CONTINUED_AS_NEW: u8 = 17;
     pub const AGENT_CALL_SCHEDULED: u8 = 18;
     pub const AGENT_CALL_COMPLETED: u8 = 19;
+    pub const AGENT_CALL_ESCALATED: u8 = 20;
+    pub const BUDGET_APPROVED: u8 = 21;
+    pub const STARTED_WITH_BUDGET: u8 = 22;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -135,7 +138,14 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.push(FORMAT_VERSION);
     let kind = match entry {
-        Entry::Started { .. } => kind::STARTED,
+        Entry::Started {
+            budget_tokens: None,
+            ..
+        } => kind::STARTED,
+        Entry::Started {
+            budget_tokens: Some(_),
+            ..
+        } => kind::STARTED_WITH_BUDGET,
         Entry::StepScheduled { .. } => kind::STEP_SCHEDULED,
         Entry::StepCompleted { .. } => kind::STEP_COMPLETED,
         Entry::StepFailed { .. } => kind::STEP_FAILED,
@@ -154,13 +164,22 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::ContinuedAsNew { .. } => kind::CONTINUED_AS_NEW,
         Entry::AgentCallScheduled { .. } => kind::AGENT_CALL_SCHEDULED,
         Entry::AgentCallCompleted { .. } => kind::AGENT_CALL_COMPLETED,
+        Entry::AgentCallEscalated { .. } => kind::AGENT_CALL_ESCALATED,
+        Entry::BudgetApproved { .. } => kind::BUDGET_APPROVED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
     match entry {
-        Entry::Started { workflow, input } => {
+        Entry::Started {
+            workflow,
+            input,
+            budget_tokens,
+        } => {
             put_bytes(&mut out, workflow.as_bytes());
             put_bytes(&mut out, input.as_bytes());
+            if let Some(tokens) = budget_tokens {
+                put_varint(&mut out, *tokens);
+            }
         }
         Entry::StepScheduled { cmd, name, input } => {
             put_varint(&mut out, u64::from(cmd.0));
@@ -187,6 +206,23 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_bytes(&mut out, name.as_bytes());
             put_bytes(&mut out, request.as_bytes());
             put_varint(&mut out, *budget_tokens);
+        }
+        Entry::AgentCallEscalated {
+            cmd,
+            name,
+            request,
+            budget_tokens,
+            available,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, name.as_bytes());
+            put_bytes(&mut out, request.as_bytes());
+            put_varint(&mut out, *budget_tokens);
+            put_varint(&mut out, *available);
+        }
+        Entry::BudgetApproved { cmd, tokens } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_varint(&mut out, *tokens);
         }
         Entry::AgentCallCompleted { cmd, response } => {
             put_varint(&mut out, u64::from(cmd.0));
@@ -272,6 +308,12 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         kind::STARTED => Entry::Started {
             workflow: reader.string()?,
             input: reader.payload()?,
+            budget_tokens: None,
+        },
+        kind::STARTED_WITH_BUDGET => Entry::Started {
+            workflow: reader.string()?,
+            input: reader.payload()?,
+            budget_tokens: Some(reader.varint()?),
         },
         kind::STEP_SCHEDULED => Entry::StepScheduled {
             cmd: reader.cmd()?,
@@ -331,6 +373,17 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         kind::ESCALATION_RESOLVED => Entry::EscalationResolved {
             cmd: reader.cmd()?,
             outcome: reader.payload()?,
+        },
+        kind::AGENT_CALL_ESCALATED => Entry::AgentCallEscalated {
+            cmd: reader.cmd()?,
+            name: reader.string()?,
+            request: reader.payload()?,
+            budget_tokens: reader.varint()?,
+            available: reader.varint()?,
+        },
+        kind::BUDGET_APPROVED => Entry::BudgetApproved {
+            cmd: reader.cmd()?,
+            tokens: reader.varint()?,
         },
         kind::AGENT_CALL_SCHEDULED => Entry::AgentCallScheduled {
             cmd: reader.cmd()?,
