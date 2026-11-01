@@ -21,9 +21,10 @@ pub enum StepEnd {
 pub trait Observer: Send + Sync {
     /// A journal entry of a run became durable. Called once per entry, in journal order per run, after
     /// the flush that made it durable; entries recovered from the log after a restart are not observed
-    /// again. `now_ms` is the engine's clock at the flush.
-    fn entry(&self, key: &str, workflow: &str, entry: &Entry, now_ms: u64) {
-        let _ = (key, workflow, entry, now_ms);
+    /// again. `version` is the version the run is pinned to, if any (ADR 0029). `now_ms` is the engine's
+    /// clock at the flush.
+    fn entry(&self, key: &str, workflow: &str, version: Option<&str>, entry: &Entry, now_ms: u64) {
+        let _ = (key, workflow, version, entry, now_ms);
     }
 
     /// A worker executed a step (at least once execution: a step may be executed more than once).
