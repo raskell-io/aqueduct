@@ -11,6 +11,7 @@ mod agent;
 pub mod counterfactual;
 pub mod drift;
 pub mod embedded;
+pub mod metrics;
 mod observe;
 mod partition;
 mod schema;

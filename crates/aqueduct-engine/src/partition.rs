@@ -380,7 +380,7 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     runs: BTreeMap<String, PartitionRun>,
     batch: Vec<Vec<u8>>,
     /// Entries of the batch for the observer: (run key, workflow, entry).
-    observed: Vec<(String, String, Entry)>,
+    observed: Vec<(String, String, Option<String>, Entry)>,
     observer: Option<std::sync::Arc<dyn crate::Observer>>,
     deferred: Vec<Outbound>,
     immediate: Vec<Outbound>,
@@ -1145,8 +1145,8 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             written?;
             if let Some(observer) = &self.observer {
                 observer.flush(records, started.elapsed());
-                for (key, workflow, entry) in &observed {
-                    observer.entry(key, workflow, entry, self.now_ms);
+                for (key, workflow, version, entry) in &observed {
+                    observer.entry(key, workflow, version.as_deref(), entry, self.now_ms);
                 }
             }
         }
@@ -1309,6 +1309,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             self.observed.push((
                 key.to_owned(),
                 run.state.workflow().to_owned(),
+                run.state.version().map(str::to_owned),
                 entry.clone(),
             ));
         }

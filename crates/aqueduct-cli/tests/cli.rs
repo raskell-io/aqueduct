@@ -854,6 +854,30 @@ def run(claim):
     ])
     .unwrap();
 
+    let metrics = cli(&["metrics", path, "claims"]).unwrap();
+    assert!(
+        metrics.contains(&format!(
+            "claims  {}  retired\n  runs        3: 0 running, 3 completed, 0 failed, 0 parked, 0 continued (0 cancelled)\n",
+            &id1[..12]
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "claims  {}  active\n  runs        1: 0 running, 1 completed",
+            &id2[..12]
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("  cost        3 steps, 0 retries, 0 agent calls, 0 tokens (0 per run)\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("  replay      3 runs: 2 same, 1 different, 0 unresolved\n"),
+        "{metrics}"
+    );
+
     let diff = cli(&["versions", "diff", path, "claims", &id1[..10], &id2[..10]]).unwrap();
     assert!(
         diff.contains("-     if score > 50:\n+     if score > 80:\n"),

@@ -64,7 +64,8 @@ impl Telemetry {
 
 fn open(dir: &std::path::Path, telemetry: &Telemetry, calls: Arc<AtomicUsize>) -> Engine {
     Engine::builder(dir)
-        .workflow("approve", Arc::new(workflow(approve)))
+        .workflow_version("approve", "build-2026-11-01", Arc::new(workflow(approve)))
+        .active_version("approve", "build-2026-11-01")
         .step("quote", move |_: &Payload| {
             // The first attempt fails and is retried.
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -202,6 +203,15 @@ fn a_run_is_one_trace_across_a_restart_and_is_counted() {
     let before = first.metrics.get_finished_metrics().unwrap();
     let after = second.metrics.get_finished_metrics().unwrap();
     assert_eq!(counter(&before, "aqueduct.runs.started", None), 1);
+    // Run metrics carry the version the run is pinned to (its first twelve characters).
+    assert_eq!(
+        counter(
+            &before,
+            "aqueduct.runs.started",
+            Some(("aqueduct.version", "build-2026-1"))
+        ),
+        1
+    );
     assert_eq!(
         counter(
             &before,
@@ -232,6 +242,14 @@ fn a_run_is_one_trace_across_a_restart_and_is_counted() {
             &after,
             "aqueduct.runs.ended",
             Some(("aqueduct.status", "completed"))
+        ),
+        1
+    );
+    assert_eq!(
+        counter(
+            &after,
+            "aqueduct.runs.ended",
+            Some(("aqueduct.version", "build-2026-1"))
         ),
         1
     );

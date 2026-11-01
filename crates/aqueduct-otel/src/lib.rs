@@ -28,7 +28,8 @@
 //!
 //! **Metrics.** `aqueduct.runs.started` and `aqueduct.runs.ended` (by workflow, and status),
 //! `aqueduct.step.executions` (by step and how it ended) and `aqueduct.step.duration` (seconds),
-//! `aqueduct.escalations` (by workflow and reason), `aqueduct.signals.received` (by workflow),
+//! `aqueduct.escalations` (by workflow and reason), `aqueduct.signals.received` (by workflow); run
+//! metrics also carry `aqueduct.version` for runs pinned to a version (ADR 0029);
 //! `aqueduct.log.flush.duration` (seconds) and `aqueduct.log.flush.records`.
 
 #![forbid(unsafe_code)]
@@ -215,15 +216,27 @@ fn at_ms(ms: u64) -> SystemTime {
 }
 
 impl Observer for OtelObserver {
-    fn entry(&self, key: &str, workflow: &str, entry: &Entry, now_ms: u64) {
+    fn entry(&self, key: &str, workflow: &str, version: Option<&str>, entry: &Entry, now_ms: u64) {
         let now = at_ms(now_ms);
-        let flow = || KeyValue::new("aqueduct.workflow", workflow.to_owned());
+        // Run metrics are by workflow and, for a pinned run, by version (the first twelve characters of
+        // its id, as the CLI shows it).
+        let labels = |extra: &[KeyValue]| {
+            let mut labels = vec![KeyValue::new("aqueduct.workflow", workflow.to_owned())];
+            if let Some(version) = version {
+                labels.push(KeyValue::new(
+                    "aqueduct.version",
+                    version.get(..12).unwrap_or(version).to_owned(),
+                ));
+            }
+            labels.extend_from_slice(extra);
+            labels
+        };
         let point = |name: String, attributes: Vec<KeyValue>, error: Option<String>| {
             self.span(key, name, now, now, attributes, error);
         };
         match entry {
             Entry::Started { .. } => {
-                self.runs_started.add(1, &[flow()]);
+                self.runs_started.add(1, &labels(&[]));
                 self.root_span(key, workflow, now);
             }
             Entry::StepRetryScheduled {
@@ -263,7 +276,7 @@ impl Observer for OtelObserver {
                 None,
             ),
             Entry::SignalReceived { name, id, .. } => {
-                self.signals.add(1, &[flow()]);
+                self.signals.add(1, &labels(&[]));
                 point(
                     format!("signal {name}"),
                     vec![KeyValue::new("aqueduct.signal.id", id.clone())],
@@ -276,7 +289,7 @@ impl Observer for OtelObserver {
             Entry::Escalated { cmd, reason, .. } => {
                 self.escalations.add(
                     1,
-                    &[flow(), KeyValue::new("aqueduct.reason", reason.clone())],
+                    &labels(&[KeyValue::new("aqueduct.reason", reason.clone())]),
                 );
                 point(
                     format!("escalated {reason}"),
@@ -298,22 +311,22 @@ impl Observer for OtelObserver {
             ),
             Entry::RunCompleted { .. } => {
                 self.runs_ended
-                    .add(1, &[flow(), KeyValue::new("aqueduct.status", "completed")]);
+                    .add(1, &labels(&[KeyValue::new("aqueduct.status", "completed")]));
                 point("run completed".into(), Vec::new(), None);
             }
             Entry::ContinuedAsNew { .. } => {
                 self.runs_ended
-                    .add(1, &[flow(), KeyValue::new("aqueduct.status", "continued")]);
+                    .add(1, &labels(&[KeyValue::new("aqueduct.status", "continued")]));
                 point("continued as new".into(), Vec::new(), None);
             }
             Entry::RunFailed { error } => {
                 self.runs_ended
-                    .add(1, &[flow(), KeyValue::new("aqueduct.status", "failed")]);
+                    .add(1, &labels(&[KeyValue::new("aqueduct.status", "failed")]));
                 point("run failed".into(), Vec::new(), Some(error.clone()));
             }
             Entry::Parked { reason } => {
                 self.runs_ended
-                    .add(1, &[flow(), KeyValue::new("aqueduct.status", "parked")]);
+                    .add(1, &labels(&[KeyValue::new("aqueduct.status", "parked")]));
                 point("run parked".into(), Vec::new(), Some(reason.clone()));
             }
             Entry::AgentCallCompleted { cmd, response } => point(
@@ -333,10 +346,10 @@ impl Observer for OtelObserver {
             } => {
                 self.escalations.add(
                     1,
-                    &[
-                        flow(),
-                        KeyValue::new("aqueduct.reason", aqueduct_core::BUDGET_ESCALATION),
-                    ],
+                    &labels(&[KeyValue::new(
+                        "aqueduct.reason",
+                        aqueduct_core::BUDGET_ESCALATION,
+                    )]),
                 );
                 point(
                     "over budget, escalated".into(),
@@ -350,10 +363,10 @@ impl Observer for OtelObserver {
             Entry::AgentAnswerEscalated { cmd, error, .. } => {
                 self.escalations.add(
                     1,
-                    &[
-                        flow(),
-                        KeyValue::new("aqueduct.reason", aqueduct_core::SCHEMA_ESCALATION),
-                    ],
+                    &labels(&[KeyValue::new(
+                        "aqueduct.reason",
+                        aqueduct_core::SCHEMA_ESCALATION,
+                    )]),
                 );
                 point(
                     "answer rejected, escalated".into(),

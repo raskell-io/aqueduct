@@ -15,6 +15,7 @@ use aqueduct_engine::counterfactual::{CounterfactualOptions, Outcome, replay_cou
 use aqueduct_engine::drift::{
     DriftOptions, DriftReport, Recorded, Replayed, Verdict, agent_calls, replay_agent_calls,
 };
+use aqueduct_engine::metrics::version_metrics;
 use aqueduct_engine::{Deciders, Partition};
 use aqueduct_procedure::Procedure;
 use aqueduct_registry::{Action, Provenance, Registry, RegistryError, ReplayEvidence, State};
@@ -32,6 +33,7 @@ commands:
   counterfactual <dir> <procedure.star> (<key>... | --workflow <name>) [--stubs <file.json>]
                                       replay past runs against a new procedure version, answering it
                                       with their recorded results, and report where outcomes differ
+  metrics <dir> [<workflow>]          per version: runs, escalation and timeout rates, cost, replay
   versions <subcommand> <dir> ...     procedure versions and their lifecycle (see below)
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
@@ -100,6 +102,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
             &args[3..],
         ),
         Some("versions") => versions(&args[1..]),
+        Some("metrics") => metrics(
+            Path::new(arg(1, "data directory")?),
+            args.get(2).map(String::as_str),
+        ),
         Some("drift") => drift(Path::new(arg(1, "data directory")?), &args[2..]),
         Some("signal") => signal(
             Path::new(arg(1, "data directory")?),
@@ -384,6 +390,83 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
         "{note}replays without divergence: {} entries, {activations} activations checked\n",
         journal.len()
     ))
+}
+
+/// Per-version metrics (ADR 0031), with each version's registry state and replay evidence if the data
+/// directory has a registry.
+fn metrics(dir: &Path, workflow: Option<&str>) -> Result<String, String> {
+    let partition = load(dir)?;
+    let registry = if dir.join("registry").is_dir() {
+        Some(Registry::open(dir).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let all = version_metrics(
+        partition
+            .runs()
+            .values()
+            .map(|run| (run.state(), run.journal())),
+    );
+    let percent = |rate: f64| format!("{:.0}%", rate * 100.0);
+    let mut out = String::new();
+    for m in all
+        .iter()
+        .filter(|m| workflow.is_none_or(|w| m.workflow == w))
+    {
+        let known = m.version.as_ref().and_then(|id| {
+            registry
+                .as_ref()
+                .and_then(|r| r.version(&m.workflow, id).ok())
+        });
+        out.push_str(&format!(
+            "{}  {}{}\n",
+            m.workflow,
+            m.version.as_deref().map_or("(unversioned)", short_version),
+            known.map_or(String::new(), |v| format!("  {}", v.state.as_str()))
+        ));
+        out.push_str(&format!(
+            "  runs        {}: {} running, {} completed, {} failed, {} parked, {} continued ({} cancelled)\n",
+            m.runs, m.running, m.completed, m.failed, m.parked, m.continued, m.cancelled
+        ));
+        let reasons: Vec<String> = m
+            .escalations
+            .iter()
+            .map(|(reason, n)| format!("{reason} {n}"))
+            .collect();
+        out.push_str(&format!(
+            "  escalated   {} of runs ({}){}\n",
+            percent(m.escalation_rate()),
+            m.escalated_runs,
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", reasons.join(", "))
+            }
+        ));
+        out.push_str(&format!(
+            "  timed out   {} of runs ({})\n",
+            percent(m.timeout_rate()),
+            m.timed_out_runs
+        ));
+        out.push_str(&format!(
+            "  cost        {} steps, {} retries, {} agent calls, {} tokens ({:.0} per run)\n",
+            m.steps,
+            m.retries,
+            m.agent_calls,
+            m.input_tokens + m.output_tokens,
+            m.tokens_per_run()
+        ));
+        if let Some(replay) = known.and_then(|v| v.replay.as_ref()) {
+            out.push_str(&format!(
+                "  replay      {} runs: {} same, {} different, {} unresolved\n",
+                replay.runs, replay.same, replay.different, replay.unresolved
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("no runs\n");
+    }
+    Ok(out)
 }
 
 /// The version registry's commands (ADR 0030).
