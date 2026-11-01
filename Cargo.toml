@@ -20,6 +20,7 @@ aqueduct-procedure = { path = "crates/aqueduct-procedure" }
 aqueduct-storage = { path = "crates/aqueduct-storage" }
 aqueduct-sim = { path = "crates/aqueduct-sim" }
 aqueduct-sdk = { path = "crates/aqueduct-sdk" }
+aqueduct-ai = { path = "crates/aqueduct-ai" }
 crc32fast = "1"
 proptest = "1"
 sha2 = "0.10"

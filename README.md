@@ -160,7 +160,9 @@ What holds today, for the embedded engine, and how it is checked:
   replay never calls the model again, under a hard token budget
   ([ADR 0023](docs/adr/0023-agent-steps.md)). A run can have a budget of its own, and escalates to a
   person instead of overspending it ([ADR 0024](docs/adr/0024-run-budgets.md)); answers are checked
-  against their output schema ([ADR 0025](docs/adr/0025-output-schemas.md)). `aqueduct-ai` runs them on Claude or any OpenAI-compatible
+  against their output schema ([ADR 0025](docs/adr/0025-output-schemas.md)) When a model or prompt changes,
+  model-drift replay asks past runs' calls again and reports which answers changed
+  ([ADR 0027](docs/adr/0027-model-drift-replay.md)). `aqueduct-ai` runs them on Claude or any OpenAI-compatible
   endpoint, Ollama and vLLM included ([ADR 0026](docs/adr/0026-provider-adapters.md)).
 - **Observable:** `aqueduct-otel` turns runs into OpenTelemetry traces (one trace per run, across
   restarts) and metrics ([ADR 0021](docs/adr/0021-opentelemetry.md)); the CLI shows any run's journal
@@ -195,6 +197,8 @@ cargo run -p aqueduct-cli -- journal ./quickstart-data onboard:ada    # the jour
 cargo run -p aqueduct-cli -- verify ./quickstart-data                 # check every hash chain, print each run's head
 cargo run -p aqueduct-cli -- export ./quickstart-data onboard:ada     # the journal as JSON Lines
 cargo run -p aqueduct-cli -- replay ./data claim-7 claims-v2.star     # would this procedure version diverge from the run?
+cargo run -p aqueduct-cli -- drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
+                                                                      # ask past agent calls again: same answers?
 ```
 
 ## The name and the mark
