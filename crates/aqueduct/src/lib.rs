@@ -25,7 +25,10 @@
 //! # Ok::<(), aqueduct::embedded::EngineError>(())
 //! ```
 //!
-//! The project is in phase 1 (BRIEF.md): the API will change.
+//! Procedure versions are pinned (ADR 0029) and go through a lifecycle in the [`registry`] (ADR 0030):
+//! `Registry::open(dir)?.deploy(Engine::builder(dir))` registers the deployable ones.
+//!
+//! The project is in phase 2 (BRIEF.md): the API will change.
 
 #![forbid(unsafe_code)]
 
@@ -36,6 +39,15 @@ pub use aqueduct_sdk::{
     AgentOptions, Either, Saga, WorkflowContext, WorkflowError, join, join_all, select, select_all,
     workflow,
 };
+
+/// The version registry: procedure versions with provenance, replay evidence, approvals and a
+/// lifecycle.
+pub mod registry {
+    pub use aqueduct_registry::{
+        Action, Approval, Event, Policy, Provenance, Registry, RegistryError, ReplayEvidence,
+        State, Version, diff,
+    };
+}
 
 /// The embedded engine: a durable engine inside your process.
 pub mod embedded {

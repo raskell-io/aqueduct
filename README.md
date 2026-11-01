@@ -157,6 +157,9 @@ What holds today, for the embedded engine, and how it is checked:
 - **Version pinning:** every run is pinned to the version it started on (a procedure's version is the
   SHA-256 of its source). New runs start on the active version, and old runs finish on theirs
   ([ADR 0029](docs/adr/0029-version-pinning.md)).
+- **A version lifecycle:** procedure versions are registered with their provenance, proven by replay
+  against past runs, approved under a policy (four eyes by default), activated, drained and retired, in
+  a hash-chained registry log (`aqueduct versions ...`; [ADR 0030](docs/adr/0030-version-registry.md)).
 - **Counterfactual replay:** a new procedure version is replayed against past runs, answered with their
   recorded results, and the runs it would decide differently are reported with where they diverge
   ([ADR 0028](docs/adr/0028-counterfactual-replay.md)).
@@ -176,9 +179,8 @@ What holds today, for the embedded engine, and how it is checked:
 - **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the
   code ([history format](docs/history-format.md)).
 
-Planned: the same semantics on a single server and in a replicated cluster, and the
-procedure lifecycle (proposal, approval, draining, retirement). The full design and
-phased plan are in [BRIEF.md](BRIEF.md).
+Planned: the same semantics on a single server and in a replicated cluster, signed approvals, and
+per-version metrics. The full design and phased plan are in [BRIEF.md](BRIEF.md).
 
 ## Testing it yourself
 
@@ -205,6 +207,7 @@ cargo run -p aqueduct-cli -- export ./quickstart-data onboard:ada     # the jour
 cargo run -p aqueduct-cli -- replay ./data claim-7 claims-v2.star     # would this procedure version diverge from the run?
 cargo run -p aqueduct-cli -- counterfactual ./data claims-v3.star --workflow claims
                                                                       # how would a new version have decided past runs?
+cargo run -p aqueduct-cli -- versions list ./data                      # procedure versions: state, approvals, replay, runs on them
 cargo run -p aqueduct-cli -- drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
                                                                       # ask past agent calls again: same answers?
 ```

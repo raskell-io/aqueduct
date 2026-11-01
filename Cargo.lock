@@ -92,6 +92,7 @@ dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
+ "aqueduct-registry",
  "aqueduct-sdk",
  "serde",
  "serde_json",
@@ -138,6 +139,7 @@ dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
+ "aqueduct-registry",
  "aqueduct-sdk",
  "aqueduct-storage",
  "serde_json",
@@ -197,6 +199,17 @@ dependencies = [
  "serde_json",
  "sha2",
  "starlark",
+ "thiserror",
+]
+
+[[package]]
+name = "aqueduct-registry"
+version = "0.0.0"
+dependencies = [
+ "aqueduct-engine",
+ "aqueduct-procedure",
+ "serde_json",
+ "sha2",
  "thiserror",
 ]
 
