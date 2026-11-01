@@ -227,12 +227,15 @@ fn runs(dir: &Path) -> Result<String, String> {
 
 fn describe(dir: &Path, key: &str) -> Result<String, String> {
     let (state, _) = run_state(dir, key)?;
-    let mut out = format!(
-        "run       {key}\nworkflow  {}\nstatus    {}\ninput     {}\n",
-        state.workflow(),
+    let mut out = format!("run       {key}\nworkflow  {}\n", state.workflow());
+    if let Some(version) = state.version() {
+        out.push_str(&format!("version   {version}\n"));
+    }
+    out.push_str(&format!(
+        "status    {}\ninput     {}\n",
         format!("{:?}", state.status()).to_lowercase(),
         text(state.input())
-    );
+    ));
     if let Some(output) = state.output() {
         out.push_str(&format!("output    {}\n", text(output)));
     }
@@ -325,6 +328,15 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
         .unwrap_or("procedure");
     let procedure = Procedure::compile(name, &source).map_err(|e| e.to_string())?;
     let mut state = RunState::from_journal(&journal[..1]).map_err(|e| e.to_string())?;
+    // A pinned run is decided by its own version only; checking another one is allowed, and said.
+    let note = match state.version() {
+        Some(pinned) if pinned != procedure.version() => format!(
+            "note: the run is pinned to version {}; this procedure is version {}\n",
+            short_version(pinned),
+            short_version(&procedure.version())
+        ),
+        _ => String::new(),
+    };
     let mut activations = 0;
     for (position, entry) in journal.iter().enumerate().skip(1) {
         // Before every entry the logic wrote, ask the procedure what it does now.
@@ -332,7 +344,9 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
             activations += 1;
             let transition = state.handle(Event::Decision(procedure.decide(&state.view())));
             if let Some(Entry::Parked { reason }) = transition.entries.first() {
-                return Ok(format!("diverges at journal entry {position}: {reason}\n"));
+                return Ok(format!(
+                    "{note}diverges at journal entry {position}: {reason}\n"
+                ));
             }
         }
         state
@@ -341,10 +355,12 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
     }
     let transition = state.handle(Event::Decision(procedure.decide(&state.view())));
     if let Some(Entry::Parked { reason }) = transition.entries.first() {
-        return Ok(format!("diverges at the end of the journal: {reason}\n"));
+        return Ok(format!(
+            "{note}diverges at the end of the journal: {reason}\n"
+        ));
     }
     Ok(format!(
-        "replays without divergence: {} entries, {activations} activations checked\n",
+        "{note}replays without divergence: {} entries, {activations} activations checked\n",
         journal.len()
     ))
 }
@@ -615,6 +631,11 @@ fn drift_report(report: &DriftReport) -> String {
     out
 }
 
+/// A version id as reports print it: the first twelve characters of a hash.
+fn short_version(version: &str) -> &str {
+    version.get(..12).unwrap_or(version)
+}
+
 /// A payload for a one-line report: its text, cut at 60 characters.
 fn short(payload: &Payload) -> String {
     let text = text(payload);
@@ -643,16 +664,19 @@ fn describe_entry(entry: &Entry) -> String {
         Entry::Started {
             workflow,
             input,
-            budget_tokens: None,
-        } => format!("started {workflow} with {}", text(input)),
-        Entry::Started {
-            workflow,
-            input,
-            budget_tokens: Some(tokens),
-        } => format!(
-            "started {workflow} with {} (budget {tokens} tokens)",
-            text(input)
-        ),
+            budget_tokens,
+            version,
+        } => {
+            let mut line = format!("started {workflow}");
+            if let Some(version) = version {
+                line.push_str(&format!(" version {}", short_version(version)));
+            }
+            line.push_str(&format!(" with {}", text(input)));
+            if let Some(tokens) = budget_tokens {
+                line.push_str(&format!(" (budget {tokens} tokens)"));
+            }
+            line
+        }
         Entry::StepScheduled { cmd, name, input } => {
             format!("[{cmd}] step {name} scheduled with {}", text(input))
         }
@@ -747,8 +771,9 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
             workflow,
             input,
             budget_tokens,
+            version,
         } => {
-            json!({"kind": "Started", "workflow": workflow, "input": payload(input), "budget_tokens": budget_tokens})
+            json!({"kind": "Started", "workflow": workflow, "version": version, "input": payload(input), "budget_tokens": budget_tokens})
         }
         Entry::StepScheduled {
             cmd: c,

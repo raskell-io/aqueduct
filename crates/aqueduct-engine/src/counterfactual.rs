@@ -303,6 +303,7 @@ pub fn replay_counterfactual(
         workflow,
         input,
         budget_tokens,
+        ..
     }) = journal.first()
     else {
         return Err(format!(
@@ -650,6 +651,7 @@ mod tests {
                 workflow: "w".into(),
                 input: payload("5"),
                 budget_tokens: None,
+                version: None,
             },
             Entry::StepScheduled {
                 cmd: CommandIndex(0),

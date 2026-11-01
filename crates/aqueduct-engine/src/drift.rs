@@ -363,6 +363,7 @@ mod tests {
                 workflow: "w".into(),
                 input: payload("1"),
                 budget_tokens: None,
+                version: None,
             },
             scheduled(0, "one"),
             Entry::AgentCallCompleted {

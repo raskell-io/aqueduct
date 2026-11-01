@@ -195,6 +195,7 @@ dependencies = [
  "anyhow",
  "aqueduct-core",
  "serde_json",
+ "sha2",
  "starlark",
  "thiserror",
 ]

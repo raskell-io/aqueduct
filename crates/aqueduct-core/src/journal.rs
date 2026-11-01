@@ -75,6 +75,11 @@ pub enum Entry {
         /// The run's token budget for agent calls, if it has one. Part of the start itself, so a crash
         /// can never keep the start and lose the budget.
         budget_tokens: Option<u64>,
+
+        /// The version of the workflow or procedure the run is pinned to, if it was started on a
+        /// registered version (for a procedure, the SHA-256 of its source). Part of the start itself, so
+        /// a run can never lose the version it must resume on.
+        version: Option<String>,
     },
     /// The run issued a step command.
     StepScheduled {

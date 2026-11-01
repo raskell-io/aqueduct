@@ -326,11 +326,23 @@ pub fn start_with_budget(
     input: Payload,
     budget_tokens: Option<u64>,
 ) -> Transition {
+    start_version(workflow, input, budget_tokens, None)
+}
+
+/// Starts a new run pinned to a version of its workflow (see [`RunState::version`]), with an optional
+/// token budget.
+pub fn start_version(
+    workflow: impl Into<String>,
+    input: Payload,
+    budget_tokens: Option<u64>,
+    version: Option<String>,
+) -> Transition {
     Transition {
         entries: vec![Entry::Started {
             workflow: workflow.into(),
             input,
             budget_tokens,
+            version,
         }],
         effects: vec![Effect::Activate],
     }
@@ -400,6 +412,8 @@ pub struct RunState {
     tokens_used: u64,
     /// The run's token budget for agent calls, if it has one.
     budget: Option<u64>,
+    /// The version the run is pinned to, if any.
+    version: Option<String>,
     /// A cancellation found no pending command; the next waiting command takes it.
     pending_cancel: bool,
 }
@@ -412,6 +426,7 @@ impl RunState {
             workflow,
             input,
             budget_tokens,
+            version,
         } = first
         else {
             return Err(JournalError::NotStarted);
@@ -431,6 +446,7 @@ impl RunState {
             continued_with: None,
             tokens_used: 0,
             budget: *budget_tokens,
+            version: version.clone(),
             pending_cancel: false,
         };
         for entry in rest {
@@ -823,6 +839,12 @@ impl RunState {
     /// The name of the workflow or procedure the run executes.
     pub fn workflow(&self) -> &str {
         &self.workflow
+    }
+
+    /// The version of its workflow the run is pinned to: it is only ever decided by that version. `None`
+    /// for a run started on an unversioned workflow.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
     }
 
     /// The run's status.

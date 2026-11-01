@@ -17,14 +17,25 @@ use std::sync::Arc;
 use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
 use aqueduct_core::{
     CommandIndex, Decider, Effect, Entry, Env, Event, Payload, RunState, Status, StepOutcome,
-    Transition, run_id, split_run_id, start_with_budget, valid_key,
+    Transition, run_id, split_run_id, start_version, valid_key,
 };
 use aqueduct_storage::{LogStore, NoStateStore, StateStore, StorageError};
 
 /// The deciders a partition can run, by workflow name.
 #[derive(Clone, Default)]
 pub struct Deciders {
-    by_name: BTreeMap<String, Arc<dyn Decider + Send + Sync>>,
+    by_name: BTreeMap<String, Registered>,
+}
+
+type SharedDecider = Arc<dyn Decider + Send + Sync>;
+
+/// What is registered under one workflow name: an unversioned decider (code workflows), versions, and
+/// which version new runs start on.
+#[derive(Clone, Default)]
+struct Registered {
+    unversioned: Option<SharedDecider>,
+    versions: BTreeMap<String, SharedDecider>,
+    active: Option<String>,
 }
 
 impl Deciders {
@@ -33,20 +44,117 @@ impl Deciders {
         Deciders::default()
     }
 
-    /// Registers a decider under a workflow name, replacing any earlier one.
-    pub fn insert(&mut self, workflow: impl Into<String>, decider: Arc<dyn Decider + Send + Sync>) {
-        self.by_name.insert(workflow.into(), decider);
+    /// Registers an unversioned decider under a workflow name, replacing any earlier one. Its runs are
+    /// not pinned: they are decided by whatever is registered under the name when they resume.
+    pub fn insert(&mut self, workflow: impl Into<String>, decider: SharedDecider) {
+        self.by_name.entry(workflow.into()).or_default().unversioned = Some(decider);
     }
 
-    /// The decider for a workflow, if registered.
+    /// Registers a version of a workflow (ADR 0029). Runs started on it are pinned to it: they are only
+    /// ever decided by the decider registered under this version. Registering does not activate it.
+    pub fn insert_version(
+        &mut self,
+        workflow: impl Into<String>,
+        version: impl Into<String>,
+        decider: SharedDecider,
+    ) {
+        self.by_name
+            .entry(workflow.into())
+            .or_default()
+            .versions
+            .insert(version.into(), decider);
+    }
+
+    /// Makes a registered version the one new runs of the workflow start on.
+    pub fn activate(&mut self, workflow: &str, version: &str) -> Result<(), PartitionError> {
+        let registered = self
+            .by_name
+            .get_mut(workflow)
+            .filter(|r| r.versions.contains_key(version))
+            .ok_or_else(|| PartitionError::UnknownVersion {
+                workflow: workflow.to_owned(),
+                version: version.to_owned(),
+            })?;
+        registered.active = Some(version.to_owned());
+        Ok(())
+    }
+
+    /// The version new runs of the workflow start on, if one is active.
+    pub fn active_version(&self, workflow: &str) -> Option<&str> {
+        self.by_name.get(workflow)?.active.as_deref()
+    }
+
+    /// The registered versions of a workflow.
+    pub fn versions(&self, workflow: &str) -> Vec<&str> {
+        self.by_name
+            .get(workflow)
+            .map(|r| r.versions.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// The decider new runs of a workflow start with: the active version's, otherwise the unversioned
+    /// one.
     pub fn get(&self, workflow: &str) -> Option<&(dyn Decider + Send + Sync)> {
-        self.by_name.get(workflow).map(|d| d.as_ref())
+        let registered = self.by_name.get(workflow)?;
+        match &registered.active {
+            Some(version) => registered.versions.get(version).map(|d| d.as_ref()),
+            None => registered.unversioned.as_deref(),
+        }
+    }
+
+    /// The decider for a run of `workflow` pinned to `version`: that version's, and nothing else. A run
+    /// without a version gets the unversioned decider, or the active version's.
+    pub fn for_run(
+        &self,
+        workflow: &str,
+        version: Option<&str>,
+    ) -> Option<&(dyn Decider + Send + Sync)> {
+        let registered = self.by_name.get(workflow)?;
+        match version {
+            Some(version) => registered.versions.get(version).map(|d| d.as_ref()),
+            None => registered.unversioned.as_deref().or_else(|| {
+                let active = registered.active.as_ref()?;
+                registered.versions.get(active).map(|d| d.as_ref())
+            }),
+        }
+    }
+
+    /// The version a new run is pinned to: `requested` if given (it must be registered), otherwise the
+    /// active version, otherwise none (an unversioned workflow).
+    fn version_for_start(
+        &self,
+        workflow: &str,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, PartitionError> {
+        let registered = self
+            .by_name
+            .get(workflow)
+            .ok_or_else(|| PartitionError::UnknownWorkflow(workflow.to_owned()))?;
+        match requested {
+            Some(version) if registered.versions.contains_key(version) => {
+                Ok(Some(version.to_owned()))
+            }
+            Some(version) => Err(PartitionError::UnknownVersion {
+                workflow: workflow.to_owned(),
+                version: version.to_owned(),
+            }),
+            None if registered.active.is_some() => Ok(registered.active.clone()),
+            None if registered.unversioned.is_some() => Ok(None),
+            None => Err(PartitionError::UnknownWorkflow(workflow.to_owned())),
+        }
     }
 }
 
 impl std::fmt::Debug for Deciders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_set().entries(self.by_name.keys()).finish()
+        let mut map = f.debug_map();
+        for (name, registered) in &self.by_name {
+            map.entry(
+                name,
+                &(registered.active.as_deref(), registered.versions.keys()),
+            );
+        }
+        map.finish()
     }
 }
 
@@ -191,6 +299,14 @@ pub enum PartitionError {
     /// The workflow is not registered.
     #[error("unknown workflow `{0}`")]
     UnknownWorkflow(String),
+    /// The workflow has no version with this id.
+    #[error("workflow `{workflow}` has no version `{version}`")]
+    UnknownVersion {
+        /// The workflow.
+        workflow: String,
+        /// The version asked for.
+        version: String,
+    },
     /// No run with this key exists.
     #[error("no run `{0}`")]
     UnknownRun(String),
@@ -218,20 +334,22 @@ pub enum PartitionError {
 }
 
 /// How a run is started.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StartOptions {
     /// What to do if the key already has a run.
     pub reuse: ReusePolicy,
     /// The run's token budget for agent calls, if it has one. An agent call that would exceed it is not
     /// made; it escalates for approval (reason [`aqueduct_core::BUDGET_ESCALATION`]).
     pub budget_tokens: Option<u64>,
+    /// The version to start the run on; by default the workflow's active version (ADR 0029).
+    pub version: Option<String>,
 }
 
 impl From<ReusePolicy> for StartOptions {
     fn from(reuse: ReusePolicy) -> Self {
         StartOptions {
             reuse,
-            budget_tokens: None,
+            ..StartOptions::default()
         }
     }
 }
@@ -418,7 +536,8 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             let (base, generation) = split_run_id(key);
             let next = run_id(base, generation + 1);
             if !self.runs.contains_key(&next) && self.lookup_run(&next)?.is_none() {
-                self.create_run(&next, &workflow, input, budget)?;
+                let version = self.successor_version(&workflow);
+                self.create_run(&next, &workflow, input, budget, version)?;
             }
         }
         Ok(())
@@ -445,6 +564,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         let StartOptions {
             reuse: policy,
             budget_tokens,
+            version,
         } = options.into();
         if !valid_key(key) {
             return Err(PartitionError::InvalidKey(key.to_owned()));
@@ -476,10 +596,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             }
         };
         if let Some(generation) = next {
-            if self.deciders.get(workflow).is_none() {
-                return Err(PartitionError::UnknownWorkflow(workflow.to_owned()));
-            }
-            self.create_run(&run_id(key, generation), workflow, input, budget_tokens)?;
+            let version = self
+                .deciders
+                .version_for_start(workflow, version.as_deref())?;
+            self.create_run(
+                &run_id(key, generation),
+                workflow,
+                input,
+                budget_tokens,
+                version,
+            )?;
         }
         self.send(Outbound::Started {
             key: key.to_owned(),
@@ -494,8 +620,9 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         workflow: &str,
         input: Payload,
         budget: Option<u64>,
+        version: Option<String>,
     ) -> Result<(), PartitionError> {
-        let first = start_with_budget(workflow, input, budget);
+        let first = start_version(workflow, input, budget, version);
         let state = RunState::from_journal(&first.entries)
             .map_err(|e| PartitionError::Internal(e.to_string()))?;
         self.runs.insert(
@@ -510,6 +637,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             self.log_entry(id, entry)?;
         }
         self.perform(id, first.effects)
+    }
+
+    /// The version a run continued as new starts on: the workflow's active version (how a long-lived run
+    /// moves to new code), or none for an unversioned workflow.
+    fn successor_version(&self, workflow: &str) -> Option<String> {
+        self.deciders.active_version(workflow).map(str::to_owned)
     }
 
     /// The id of the latest run (highest generation) of `key`, if it has any run.
@@ -1215,8 +1348,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                         .runs
                         .get(key)
                         .ok_or_else(|| PartitionError::Internal(format!("run {key} vanished")))?;
-                    // A run whose workflow is no longer registered waits until it is.
-                    let Some(decider) = self.deciders.get(run.state.workflow()) else {
+                    // A run whose workflow or version is not registered waits until it is: a pinned run
+                    // is only ever decided by its own version.
+                    let Some(decider) = self
+                        .deciders
+                        .for_run(run.state.workflow(), run.state.version())
+                    else {
                         continue;
                     };
                     let commands = decider.decide(&run.state.view_at(key, env));
@@ -1247,7 +1384,8 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                         .ok_or_else(|| PartitionError::Internal(format!("run {key} vanished")))?;
                     let (base, generation) = split_run_id(key);
                     let next = run_id(base, generation + 1);
-                    self.create_run(&next, &workflow, input, budget)?;
+                    let version = self.successor_version(&workflow);
+                    self.create_run(&next, &workflow, input, budget, version)?;
                 }
             }
         }

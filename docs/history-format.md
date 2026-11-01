@@ -59,6 +59,8 @@ record = version:u8  kind:u8  prev:hash  fields
 | 21 | `BudgetApproved` | `cmd:cmd`, `tokens:varint` |
 | 22 | `Started` (with a budget) | `workflow:string`, `input:bytes`, `budget_tokens:varint` |
 | 23 | `AgentAnswerEscalated` | `cmd:cmd`, `error:string`, `answer:bytes` |
+| 24 | `Started` (pinned to a version) | `workflow:string`, `input:bytes`, `version:string` |
+| 25 | `Started` (pinned to a version, with a budget) | `workflow:string`, `input:bytes`, `version:string`, `budget_tokens:varint` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
@@ -107,7 +109,9 @@ A decoded history is a valid journal if:
    cancellation. `AgentCallCompleted` completes an agent call (outcome `response`); `StepFailed` fails
    one; retries (rule 4) apply to agent calls as to steps. An `AgentCallCompleted` has
    `input_tokens + output_tokens <= budget_tokens`: an answer that cost more is recorded as `StepFailed`.
-   A run started with kind 22 has a token budget. `AgentCallEscalated` is an agent call that did not fit
+   A run started with kind 22 or 25 has a token budget. A run started with kind 24 or 25 is pinned to a
+   version of its workflow (for a procedure, the lowercase hex SHA-256 of its source): only that version
+   decides it. `AgentCallEscalated` is an agent call that did not fit
    in what was left of it (the run's answered tokens plus the budgets of its calls in flight): it waits,
    without being made, until `BudgetApproved` (the run's new budget) releases it, or `StepFailed`
    declines it, or a cancellation closes it. `AgentAnswerEscalated` holds an agent call whose answers did

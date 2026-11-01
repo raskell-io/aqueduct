@@ -590,3 +590,47 @@ def run(claim):
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_pinned_run_shows_its_version() {
+    let v1 = "def run(x):\n    return step(\"double\", x)\n";
+    let v2 = "def run(x):\n    return step(\"triple\", x)\n";
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-pin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_str().unwrap();
+    let procedure = Arc::new(Procedure::compile("math.star", v1).unwrap());
+    let version = procedure.version();
+    {
+        let engine = Engine::builder(&dir)
+            .workflow_version("math", &version, procedure)
+            .active_version("math", &version)
+            .step("double", |_: &Payload| {
+                Attempt::Completed(Payload::new(*b"4"))
+            })
+            .open()
+            .unwrap();
+        engine.start("m-1", "math", Payload::new(*b"2")).unwrap();
+        engine.wait("m-1", Duration::from_secs(10)).unwrap();
+    }
+    assert!(
+        cli(&["describe", path, "m-1"])
+            .unwrap()
+            .contains(&format!("version   {version}\n"))
+    );
+    assert!(
+        cli(&["journal", path, "m-1"])
+            .unwrap()
+            .contains(&format!("started math version {} with 2", &version[..12]))
+    );
+    let other = dir.join("v2.star");
+    std::fs::write(&other, v2).unwrap();
+    let replayed = cli(&["replay", path, "m-1", other.to_str().unwrap()]).unwrap();
+    assert!(
+        replayed.starts_with(&format!(
+            "note: the run is pinned to version {}",
+            &version[..12]
+        )),
+        "{replayed}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -86,6 +86,8 @@ pub struct RunResult {
     pub output: Option<Payload>,
     /// The error or parking reason, if the run failed or was parked.
     pub error: Option<String>,
+    /// The version the run was pinned to, if it ran on a registered version (ADR 0029).
+    pub version: Option<String>,
 }
 
 /// An escalation waiting for a person or an agent.
@@ -118,6 +120,14 @@ pub enum EngineError {
     /// The workflow is not registered.
     #[error("unknown workflow `{0}`")]
     UnknownWorkflow(String),
+    /// The workflow has no version with this id.
+    #[error("workflow `{workflow}` has no version `{version}`")]
+    UnknownVersion {
+        /// The workflow.
+        workflow: String,
+        /// The version asked for.
+        version: String,
+    },
     /// No run with this key exists.
     #[error("no run `{0}`")]
     UnknownRun(String),
@@ -164,6 +174,7 @@ pub struct Builder {
     default_retry: RetryPolicy,
     observer: Option<Arc<dyn Observer>>,
     agents: Option<Arc<dyn AgentExecutor>>,
+    activations: Vec<(String, String)>,
 }
 
 impl Builder {
@@ -181,9 +192,30 @@ impl Builder {
         self
     }
 
-    /// Registers a workflow (a procedure or any other decider).
+    /// Registers a workflow (a procedure or any other decider), unversioned: its runs are decided by
+    /// whatever is registered under the name when they resume.
     pub fn workflow(mut self, name: &str, decider: Arc<dyn Decider + Send + Sync>) -> Self {
         self.deciders.insert(name, decider);
+        self
+    }
+
+    /// Registers a version of a workflow (ADR 0029; for a procedure, `procedure.version()`). Runs
+    /// started on it are pinned to it, and wait while it is not registered. Several versions of one
+    /// workflow can be registered at once, so old runs finish on the version they started on.
+    pub fn workflow_version(
+        mut self,
+        name: &str,
+        version: &str,
+        decider: Arc<dyn Decider + Send + Sync>,
+    ) -> Self {
+        self.deciders.insert_version(name, version, decider);
+        self
+    }
+
+    /// Makes a registered version the one new runs of the workflow start on. Opening fails if the
+    /// version is not registered.
+    pub fn active_version(mut self, name: &str, version: &str) -> Self {
+        self.activations.push((name.to_owned(), version.to_owned()));
         self
     }
 
@@ -254,7 +286,12 @@ impl Builder {
     }
 
     /// Opens the engine: recovers the log, resumes every run, and starts the threads.
-    pub fn open(self) -> Result<Engine, EngineError> {
+    pub fn open(mut self) -> Result<Engine, EngineError> {
+        for (name, version) in std::mem::take(&mut self.activations) {
+            self.deciders
+                .activate(&name, &version)
+                .map_err(|e| EngineError::Open(e.to_string()))?;
+        }
         let log = FileLog::open(self.dir.join("log"), self.log)
             .map_err(|e| EngineError::Open(e.to_string()))?;
         let state = RedbStateStore::open(&self.dir.join("state.redb"))
@@ -336,6 +373,7 @@ impl Engine {
             default_retry: RetryPolicy::default(),
             observer: None,
             agents: None,
+            activations: Vec::new(),
         }
     }
 
@@ -636,6 +674,9 @@ impl Processor {
                 Err(PartitionError::UnknownWorkflow(name)) => {
                     let _ = reply.send(Err(EngineError::UnknownWorkflow(name)));
                 }
+                Err(PartitionError::UnknownVersion { workflow, version }) => {
+                    let _ = reply.send(Err(EngineError::UnknownVersion { workflow, version }));
+                }
                 Err(PartitionError::KeyConflict(key)) => {
                     let _ = reply.send(Err(EngineError::KeyConflict(key)));
                 }
@@ -663,6 +704,7 @@ impl Processor {
                             status: state.status(),
                             output: state.output().cloned(),
                             error: state.error().map(str::to_owned),
+                            version: state.version().map(str::to_owned),
                         }),
                         None => Err(EngineError::UnknownRun(key)),
                     };
@@ -861,6 +903,7 @@ impl Processor {
                 status: state.status(),
                 output: state.output().cloned(),
                 error: state.error().map(str::to_owned),
+                version: state.version().map(str::to_owned),
             };
             for reply in self.waiters.remove(&key).unwrap_or_default() {
                 let _ = reply.send(Ok(result.clone()));

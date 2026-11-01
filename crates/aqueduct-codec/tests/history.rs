@@ -16,15 +16,20 @@ fn payload() -> impl Strategy<Value = Payload> {
 fn entry() -> impl Strategy<Value = Entry> {
     let cmd = any::<u32>().prop_map(CommandIndex);
     prop_oneof![
-        (".{0,12}", payload(), any::<Option<u64>>()).prop_map(
-            |(workflow, input, budget_tokens)| {
+        (
+            ".{0,12}",
+            payload(),
+            any::<Option<u64>>(),
+            proptest::option::of("[0-9a-f]{0,64}")
+        )
+            .prop_map(|(workflow, input, budget_tokens, version)| {
                 Entry::Started {
                     workflow,
                     input,
                     budget_tokens,
+                    version,
                 }
-            }
-        ),
+            }),
         (cmd.clone(), ".{0,12}", payload()).prop_map(|(cmd, name, input)| Entry::StepScheduled {
             cmd,
             name,

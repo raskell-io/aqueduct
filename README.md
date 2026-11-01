@@ -154,6 +154,9 @@ What holds today, for the embedded engine, and how it is checked:
   a run whose code changed under it is parked, never silently corrupted. The time, random numbers and
   UUIDs come from the context (`ctx.now()`, `ctx.random()`, `ctx.uuid()`): recorded the first time,
   read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)).
+- **Version pinning:** every run is pinned to the version it started on (a procedure's version is the
+  SHA-256 of its source). New runs start on the active version, and old runs finish on theirs
+  ([ADR 0029](docs/adr/0029-version-pinning.md)).
 - **Counterfactual replay:** a new procedure version is replayed against past runs, answered with their
   recorded results, and the runs it would decide differently are reported with where they diverge
   ([ADR 0028](docs/adr/0028-counterfactual-replay.md)).
@@ -174,7 +177,7 @@ What holds today, for the embedded engine, and how it is checked:
   code ([history format](docs/history-format.md)).
 
 Planned: the same semantics on a single server and in a replicated cluster, and the
-procedure lifecycle (proposal, approval, retirement). The full design and
+procedure lifecycle (proposal, approval, draining, retirement). The full design and
 phased plan are in [BRIEF.md](BRIEF.md).
 
 ## Testing it yourself
