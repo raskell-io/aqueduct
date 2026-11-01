@@ -347,6 +347,20 @@ impl Observer for OtelObserver {
                     None,
                 );
             }
+            Entry::AgentAnswerEscalated { cmd, error, .. } => {
+                self.escalations.add(
+                    1,
+                    &[
+                        flow(),
+                        KeyValue::new("aqueduct.reason", aqueduct_core::SCHEMA_ESCALATION),
+                    ],
+                );
+                point(
+                    "answer rejected, escalated".into(),
+                    vec![cmd_attribute(*cmd)],
+                    Some(error.clone()),
+                );
+            }
             Entry::BudgetApproved { cmd, tokens } => point(
                 "budget raised".into(),
                 vec![

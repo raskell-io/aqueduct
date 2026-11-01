@@ -738,3 +738,103 @@ fn an_agent_call_is_made_once_and_its_answer_survives_a_restart() {
     drop(engine);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+mod output_schemas {
+    use super::*;
+    use aqueduct_engine::embedded::EngineError;
+    use aqueduct_engine::{AgentAttempt, AgentCall, AgentExecutor, RetryPolicy};
+    use aqueduct_sdk::AgentOptions;
+    use std::sync::Mutex;
+
+    /// Answers with the next of `answers`, then repeats the last.
+    struct Scripted(Mutex<Vec<&'static str>>);
+    impl AgentExecutor for Scripted {
+        fn call(&self, _: &AgentCall<'_>) -> AgentAttempt {
+            let mut answers = self.0.lock().unwrap();
+            let answer = if answers.len() > 1 {
+                answers.remove(0)
+            } else {
+                answers[0]
+            };
+            AgentAttempt::Completed(aqueduct_core::AgentResponse {
+                model: "test/model".into(),
+                params: json("{}"),
+                response: json(answer),
+                input_tokens: 10,
+                output_tokens: 5,
+            })
+        }
+    }
+
+    async fn label(ctx: WorkflowContext, _: ()) -> Result<String, WorkflowError> {
+        let options = AgentOptions {
+            prompt: "label it".into(),
+            output_schema: Some(serde_json::json!({"enum": ["invoice", "receipt"]})),
+            budget_tokens: 100,
+        };
+        ctx.agent("label", &"doc", &options).await
+    }
+
+    fn open(dir: &std::path::Path, answers: Vec<&'static str>) -> Engine {
+        Engine::builder(dir)
+            .workflow("label", Arc::new(workflow(label)))
+            .agent_executor(Arc::new(Scripted(Mutex::new(answers))))
+            .default_retry_policy(RetryPolicy {
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                multiplier: 1,
+                max_backoff_ms: 10,
+            })
+            .open()
+            .unwrap()
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aqueduct-schema-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn answers_that_do_not_match_are_retried() {
+        let dir = temp("retry");
+        let engine = open(&dir, vec!["\"poem\"", "not json", "\"receipt\""]);
+        engine.start("l", "label", json("null")).unwrap();
+        let done = engine.wait("l", Duration::from_secs(10)).unwrap();
+        assert_eq!(done.output, Some(json("\"receipt\"")));
+        drop(engine);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn when_retries_are_spent_a_person_supplies_the_answer() {
+        let dir = temp("escalate");
+        let engine = open(&dir, vec!["\"poem\""]);
+        engine.start("l", "label", json("null")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let open = loop {
+            if let Some(open) = engine.escalations().unwrap().into_iter().next() {
+                break open;
+            }
+            assert!(Instant::now() < deadline, "never escalated");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(open.reason, "schema");
+        let payload: serde_json::Value = serde_json::from_slice(open.payload.as_bytes()).unwrap();
+        assert_eq!(payload["answer"], "\"poem\"");
+        assert!(!payload["error"].as_str().unwrap().is_empty());
+        // A supplied answer must match the schema too.
+        assert!(matches!(
+            engine.resolve_escalation(&open.id, json("\"sonnet\"")),
+            Err(EngineError::InvalidResolution(_))
+        ));
+        engine
+            .resolve_escalation(&open.id, json("\"invoice\""))
+            .unwrap();
+        let done = engine.wait("l", Duration::from_secs(10)).unwrap();
+        assert_eq!(done.output, Some(json("\"invoice\"")));
+        drop(engine);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

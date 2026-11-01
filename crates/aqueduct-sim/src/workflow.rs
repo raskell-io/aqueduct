@@ -106,7 +106,8 @@ pub fn execute(name: &str, input: &Payload) -> StepOutcome {
 pub const STARLARK_PIPELINE: &str = r##"
 def run(input):
     extracted = step("extract", input)
-    label = agent("classify", extracted, prompt = "prompts/classify.md", budget_tokens = 1000)
+    label = agent("classify", extracted, prompt = "prompts/classify.md", budget_tokens = 1000,
+                  output_schema = {"type": "string", "pattern": "^classify:"})
     a, b = parallel([["map_a", extracted], ["map_b", extracted]])
     merged = step("merge", a + "#" + b + "#" + label)
     return step("validate", merged)

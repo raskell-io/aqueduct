@@ -50,6 +50,13 @@ fn entry() -> impl Strategy<Value = Entry> {
                     available,
                 }
             }),
+        (any::<u32>(), ".{0,12}", payload()).prop_map(|(cmd, error, answer)| {
+            Entry::AgentAnswerEscalated {
+                cmd: CommandIndex(cmd),
+                error,
+                answer,
+            }
+        }),
         (any::<u32>(), any::<u64>()).prop_map(|(cmd, tokens)| Entry::BudgetApproved {
             cmd: CommandIndex(cmd),
             tokens

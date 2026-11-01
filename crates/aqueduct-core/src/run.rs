@@ -32,6 +32,10 @@ pub const TIMED_OUT: &str = "timed out";
 /// with `true` raises the budget enough for the call; anything else fails the call.
 pub const BUDGET_ESCALATION: &str = "budget";
 
+/// The reason of the escalation an agent call raises when its answers do not match its output schema and
+/// its retries are spent. Resolved with the answer to use.
+pub const SCHEMA_ESCALATION: &str = "schema";
+
 /// The error of a command that a cancellation completed: `cancelled: <reason>`.
 pub fn cancelled_error(reason: &str) -> String {
     format!("cancelled: {reason}")
@@ -93,9 +97,56 @@ pub struct ScheduledStep {
     pub retry_at: Option<u64>,
     /// Whether a cancellation completed this command (its outcome is then a failure).
     pub cancelled: bool,
-    /// For an agent call that would exceed the run's budget: what it needs and what was available, as
-    /// JSON (`{"needed": ..., "available": ...}`). The call waits for approval meanwhile.
-    pub awaiting_budget: Option<Payload>,
+    /// For an agent call held for a person or an agent (an open escalation): why, and what they need to
+    /// know. The call is not made, or its answer not accepted, meanwhile.
+    pub held: Option<Hold>,
+}
+
+/// Why an agent call is held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// It would exceed the run's budget: `{"needed": ..., "available": ...}`. Resolved with `true` to
+    /// raise the budget and make the call; anything else fails it.
+    Budget(Payload),
+    /// Its answers did not match its output schema: `{"error": ..., "answer": ...}`. Resolved with the
+    /// answer to use.
+    Answer(Payload),
+}
+
+impl Hold {
+    /// The escalation reason: [`BUDGET_ESCALATION`] or [`SCHEMA_ESCALATION`].
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Hold::Budget(_) => BUDGET_ESCALATION,
+            Hold::Answer(_) => SCHEMA_ESCALATION,
+        }
+    }
+
+    /// What the resolver needs to know (JSON).
+    pub fn payload(&self) -> &Payload {
+        match self {
+            Hold::Budget(payload) | Hold::Answer(payload) => payload,
+        }
+    }
+}
+
+/// A JSON string literal for `text`.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl ScheduledStep {
@@ -155,6 +206,16 @@ pub enum Event {
         cmd: CommandIndex,
         /// The response, or the failure.
         outcome: Result<AgentResponse, String>,
+    },
+    /// An agent call's answer did not match its output schema, and its retries are spent: the call is
+    /// held for a person or an agent to supply an answer (checked by the engine, which knows JSON).
+    AgentAnswerRejected {
+        /// The agent call's command.
+        cmd: CommandIndex,
+        /// Why the answer was rejected.
+        error: String,
+        /// The answer.
+        answer: Payload,
     },
     /// A step attempt failed with a retryable error, and the engine's retry policy allows another
     /// attempt after `retry_after_ms`. (When it does not, the engine reports a terminal
@@ -399,7 +460,13 @@ impl RunState {
                 self.push_command(*cmd, reason, payload.clone(), CommandKind::Escalation)?;
             }
             Entry::EscalationResolved { cmd, outcome } => {
-                self.expect_kind(*cmd, |kind| kind == CommandKind::Escalation)?;
+                let index = self.index(*cmd)?;
+                // An escalation, or an agent call whose answer was held: the resolution is the answer.
+                let held_answer = matches!(self.steps[index].held, Some(Hold::Answer(_)));
+                if self.steps[index].kind != CommandKind::Escalation && !held_answer {
+                    return Err(JournalError::InvalidCompletion(*cmd));
+                }
+                self.steps[index].held = None;
                 self.record(*cmd, StepOutcome::Completed(outcome.clone()))?;
             }
             Entry::CancelRequested { reason } => {
@@ -484,22 +551,45 @@ impl RunState {
                 let index = self.index(*cmd)?;
                 // A pending cancellation may have completed it already; then it does not wait.
                 if self.steps[index].outcome.is_none() {
-                    self.steps[index].awaiting_budget = Some(Payload::new(
+                    self.steps[index].held = Some(Hold::Budget(Payload::new(
                         format!("{{\"needed\":{budget_tokens},\"available\":{available}}}")
                             .into_bytes(),
-                    ));
+                    )));
                 }
             }
             Entry::BudgetApproved { cmd, tokens } => {
                 let index = self.index(*cmd)?;
-                if self.steps[index].awaiting_budget.take().is_none() {
+                if !matches!(self.steps[index].held.take(), Some(Hold::Budget(_))) {
                     return Err(JournalError::InvalidCompletion(*cmd));
                 }
                 self.budget = Some(*tokens);
             }
+            Entry::AgentAnswerEscalated { cmd, error, answer } => {
+                let index = self.index(*cmd)?;
+                let step = &mut self.steps[index];
+                if !matches!(step.kind, CommandKind::Agent { .. })
+                    || step.outcome.is_some()
+                    || step.held.is_some()
+                {
+                    return Err(JournalError::InvalidCompletion(*cmd));
+                }
+                let answer = String::from_utf8_lossy(answer.as_bytes());
+                step.retry_at = None;
+                step.held = Some(Hold::Answer(Payload::new(
+                    format!(
+                        "{{\"error\":{},\"answer\":{}}}",
+                        json_string(error),
+                        json_string(&answer)
+                    )
+                    .into_bytes(),
+                )));
+            }
             Entry::AgentCallCompleted { cmd, response } => {
                 self.expect_kind(*cmd, |kind| matches!(kind, CommandKind::Agent { .. }))?;
                 self.record(*cmd, StepOutcome::Completed(response.response.clone()))?;
+                // A late answer of an earlier attempt completes a call held for its answer.
+                let index = self.index(*cmd)?;
+                self.steps[index].held = None;
                 self.tokens_used = self.tokens_used.saturating_add(response.tokens());
             }
             Entry::StepFailed { cmd, error } => {
@@ -588,6 +678,19 @@ impl RunState {
         match event {
             Event::StepResult { cmd, outcome } => self.handle_result(cmd, outcome),
             Event::AgentResult { cmd, outcome } => self.handle_agent_result(cmd, outcome),
+            Event::AgentAnswerRejected { cmd, error, answer } => match self.command(cmd) {
+                Ok(step)
+                    if matches!(step.kind, CommandKind::Agent { .. })
+                        && step.outcome.is_none()
+                        && step.held.is_none() =>
+                {
+                    Transition {
+                        entries: vec![Entry::AgentAnswerEscalated { cmd, error, answer }],
+                        effects: Vec::new(),
+                    }
+                }
+                _ => Transition::none(),
+            },
             Event::Decision(commands) => self.handle_decision(commands, now_ms),
             Event::TimerFired { cmd } => self.handle_timer(cmd),
             Event::StepAttemptFailed {
@@ -604,7 +707,17 @@ impl RunState {
                             effects: vec![Effect::Activate],
                         }
                     }
-                    Ok(step) if step.awaiting_budget.is_some() && step.outcome.is_none() => {
+                    Ok(step)
+                        if matches!(step.held, Some(Hold::Answer(_))) && step.outcome.is_none() =>
+                    {
+                        Transition {
+                            entries: vec![Entry::EscalationResolved { cmd, outcome }],
+                            effects: vec![Effect::Activate],
+                        }
+                    }
+                    Ok(step)
+                        if matches!(step.held, Some(Hold::Budget(_))) && step.outcome.is_none() =>
+                    {
                         let CommandKind::Agent { budget_tokens } = step.kind else {
                             return Transition::none();
                         };
@@ -689,7 +802,7 @@ impl RunState {
                 step.outcome.is_none()
                     && step.kind.is_dispatched()
                     && step.retry_at.is_none()
-                    && step.awaiting_budget.is_none()
+                    && step.held.is_none()
             })
             .filter_map(|(step, index)| step.dispatch(CommandIndex(index)))
             .collect()
@@ -751,12 +864,12 @@ impl RunState {
             .iter()
             .zip(0u32..)
             .filter(|(step, _)| step.outcome.is_none())
-            .filter_map(|(step, index)| match (&step.kind, &step.awaiting_budget) {
+            .filter_map(|(step, index)| match (&step.kind, &step.held) {
                 (CommandKind::Escalation, _) => {
                     Some((CommandIndex(index), step.name.as_str(), &step.input))
                 }
-                (CommandKind::Agent { .. }, Some(needs)) => {
-                    Some((CommandIndex(index), BUDGET_ESCALATION, needs))
+                (CommandKind::Agent { .. }, Some(hold)) => {
+                    Some((CommandIndex(index), hold.reason(), hold.payload()))
                 }
                 _ => None,
             })
@@ -778,7 +891,7 @@ impl RunState {
     pub fn committed_tokens(&self) -> u64 {
         self.steps
             .iter()
-            .filter(|step| step.outcome.is_none() && step.awaiting_budget.is_none())
+            .filter(|step| step.outcome.is_none() && !matches!(step.held, Some(Hold::Budget(_))))
             .filter_map(|step| match step.kind {
                 CommandKind::Agent { budget_tokens } => Some(budget_tokens),
                 _ => None,
@@ -834,7 +947,7 @@ impl RunState {
             failed_attempts: 0,
             retry_at: None,
             cancelled: false,
-            awaiting_budget: None,
+            held: None,
         });
         // A cancellation that found nothing pending is taken by the next command that waits.
         if self.pending_cancel && kind != CommandKind::Recorded {
@@ -1090,7 +1203,7 @@ impl RunState {
                     failed_attempts: 0,
                     retry_at: None,
                     cancelled: false,
-                    awaiting_budget: None,
+                    held: None,
                 };
                 if let Some(recorded) = self.steps.get(steps_seen) {
                     if !same_command(recorded, &issued) {

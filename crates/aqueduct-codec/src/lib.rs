@@ -61,6 +61,7 @@ mod kind {
     pub const AGENT_CALL_ESCALATED: u8 = 20;
     pub const BUDGET_APPROVED: u8 = 21;
     pub const STARTED_WITH_BUDGET: u8 = 22;
+    pub const AGENT_ANSWER_ESCALATED: u8 = 23;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -166,6 +167,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::AgentCallCompleted { .. } => kind::AGENT_CALL_COMPLETED,
         Entry::AgentCallEscalated { .. } => kind::AGENT_CALL_ESCALATED,
         Entry::BudgetApproved { .. } => kind::BUDGET_APPROVED,
+        Entry::AgentAnswerEscalated { .. } => kind::AGENT_ANSWER_ESCALATED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -219,6 +221,11 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_bytes(&mut out, request.as_bytes());
             put_varint(&mut out, *budget_tokens);
             put_varint(&mut out, *available);
+        }
+        Entry::AgentAnswerEscalated { cmd, error, answer } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, error.as_bytes());
+            put_bytes(&mut out, answer.as_bytes());
         }
         Entry::BudgetApproved { cmd, tokens } => {
             put_varint(&mut out, u64::from(cmd.0));
@@ -380,6 +387,11 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
             request: reader.payload()?,
             budget_tokens: reader.varint()?,
             available: reader.varint()?,
+        },
+        kind::AGENT_ANSWER_ESCALATED => Entry::AgentAnswerEscalated {
+            cmd: reader.cmd()?,
+            error: reader.string()?,
+            answer: reader.payload()?,
         },
         kind::BUDGET_APPROVED => Entry::BudgetApproved {
             cmd: reader.cmd()?,

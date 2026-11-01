@@ -119,6 +119,16 @@ pub enum Entry {
         /// The tokens the run had left for it.
         available: u64,
     },
+    /// An agent call's answers did not match its output schema, and its retries are spent: it waits for
+    /// a person or an agent to supply an answer (an escalation with reason `schema`).
+    AgentAnswerEscalated {
+        /// The agent call's command.
+        cmd: CommandIndex,
+        /// Why the last answer was rejected.
+        error: String,
+        /// The last answer, as the model gave it.
+        answer: Payload,
+    },
     /// More budget was approved for a waiting agent call; the call is made.
     BudgetApproved {
         /// The agent call's command.
