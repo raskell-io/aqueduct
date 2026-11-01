@@ -154,6 +154,9 @@ What holds today, for the embedded engine, and how it is checked:
   a run whose code changed under it is parked, never silently corrupted. The time, random numbers and
   UUIDs come from the context (`ctx.now()`, `ctx.random()`, `ctx.uuid()`): recorded the first time,
   read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)).
+- **Counterfactual replay:** a new procedure version is replayed against past runs, answered with their
+  recorded results, and the runs it would decide differently are reported with where they diverge
+  ([ADR 0028](docs/adr/0028-counterfactual-replay.md)).
 - **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
   once per signal id.** **Retries** follow a policy with journaled backoff.
 - **Agent steps:** a model call is a step whose answer, model identity and token cost are journaled, so
@@ -171,7 +174,7 @@ What holds today, for the embedded engine, and how it is checked:
   code ([history format](docs/history-format.md)).
 
 Planned: the same semantics on a single server and in a replicated cluster, and the
-procedure lifecycle (proposal, replay against past cases, approval, retirement). The full design and
+procedure lifecycle (proposal, approval, retirement). The full design and
 phased plan are in [BRIEF.md](BRIEF.md).
 
 ## Testing it yourself
@@ -197,6 +200,8 @@ cargo run -p aqueduct-cli -- journal ./quickstart-data onboard:ada    # the jour
 cargo run -p aqueduct-cli -- verify ./quickstart-data                 # check every hash chain, print each run's head
 cargo run -p aqueduct-cli -- export ./quickstart-data onboard:ada     # the journal as JSON Lines
 cargo run -p aqueduct-cli -- replay ./data claim-7 claims-v2.star     # would this procedure version diverge from the run?
+cargo run -p aqueduct-cli -- counterfactual ./data claims-v3.star --workflow claims
+                                                                      # how would a new version have decided past runs?
 cargo run -p aqueduct-cli -- drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
                                                                       # ask past agent calls again: same answers?
 ```
