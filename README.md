@@ -151,6 +151,9 @@ What holds today, for the embedded engine, and how it is checked:
   read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)).
 - **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
   once per signal id.** **Retries** follow a policy with journaled backoff.
+- **Observable:** `aqueduct-otel` turns runs into OpenTelemetry traces (one trace per run, across
+  restarts) and metrics ([ADR 0021](docs/adr/0021-opentelemetry.md)); the CLI shows any run's journal
+  without setup.
 - **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the
   code ([history format](docs/history-format.md)).
 

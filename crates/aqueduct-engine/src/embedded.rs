@@ -47,7 +47,7 @@ use std::time::Duration;
 use aqueduct_core::{CommandIndex, Decider, Payload, Status, StepOutcome};
 use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore};
 
-use crate::{Deciders, Outbound, Partition, PartitionError, RetryPolicy, ReusePolicy};
+use crate::{Deciders, Observer, Outbound, Partition, PartitionError, RetryPolicy, ReusePolicy};
 
 /// A step implementation.
 pub type StepFn = Arc<dyn Fn(&Payload) -> Attempt + Send + Sync>;
@@ -153,9 +153,17 @@ pub struct Builder {
     ack_before_sync: bool,
     retry_policies: BTreeMap<String, RetryPolicy>,
     default_retry: RetryPolicy,
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl Builder {
+    /// Tells `observer` about durable entries, step executions and flushes, for telemetry
+    /// (`aqueduct-otel` turns them into OpenTelemetry traces and metrics).
+    pub fn observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     /// Registers a workflow (a procedure or any other decider).
     pub fn workflow(mut self, name: &str, decider: Arc<dyn Decider + Send + Sync>) -> Self {
         self.deciders.insert(name, decider);
@@ -239,6 +247,9 @@ impl Builder {
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(self.default_retry);
         partition.set_evict_finished(true);
+        if let Some(observer) = &self.observer {
+            partition.set_observer(Arc::clone(observer));
+        }
         for (step, policy) in &self.retry_policies {
             partition.set_retry_policy(step, *policy);
         }
@@ -252,7 +263,8 @@ impl Builder {
                 let inbox = Arc::clone(&job_inbox);
                 let steps = Arc::clone(&steps);
                 let results = requests.clone();
-                std::thread::spawn(move || worker(&inbox, &steps, &results))
+                let observer = self.observer.clone();
+                std::thread::spawn(move || worker(&inbox, &steps, &results, observer.as_deref()))
             })
             .collect();
         let last_checkpoint = partition.log().next_lsn();
@@ -296,6 +308,7 @@ impl Engine {
             ack_before_sync: false,
             retry_policies: BTreeMap::new(),
             default_retry: RetryPolicy::default(),
+            observer: None,
         }
     }
 
@@ -763,6 +776,7 @@ fn worker(
     inbox: &Mutex<Receiver<Job>>,
     steps: &BTreeMap<String, StepFn>,
     results: &Sender<Request>,
+    observer: Option<&dyn Observer>,
 ) {
     loop {
         let job = match inbox.lock() {
@@ -772,12 +786,21 @@ fn worker(
             },
             Err(_) => return,
         };
+        let (started, clock) = (std::time::SystemTime::now(), std::time::Instant::now());
         let attempt = match steps.get(&job.name) {
             // A deployment problem, not a property of the input: retry, so registering the step heals it.
             None => Attempt::Retry(format!("no step named `{}` is registered", job.name)),
             Some(step) => catch_unwind(AssertUnwindSafe(|| step(&job.input)))
                 .unwrap_or_else(|_| Attempt::Retry(format!("step `{}` panicked", job.name))),
         };
+        if let Some(observer) = observer {
+            let end = match &attempt {
+                Attempt::Completed(_) => crate::StepEnd::Completed,
+                Attempt::Fail(_) => crate::StepEnd::Failed,
+                Attempt::Retry(_) => crate::StepEnd::Retry,
+            };
+            observer.step(&job.key, job.cmd, &job.name, started, clock.elapsed(), end);
+        }
         let (key, cmd) = (job.key, job.cmd);
         let request = match attempt {
             Attempt::Completed(result) => Request::StepResult {
