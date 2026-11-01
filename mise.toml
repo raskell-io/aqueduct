@@ -1,0 +1,145 @@
+# Aqueduct - mise configuration
+# https://mise.jdx.dev/
+#
+# The tasks are the project's gates, exactly as CI runs them: `mise run ci` locally is what a pull request
+# must pass. Rust itself comes from rust-toolchain.toml (stable, with rustfmt and clippy) through rustup;
+# the MSRV (1.90) is checked in CI.
+
+[tools]
+cargo-deny = "0.20.2"
+
+[env]
+CARGO_TERM_COLOR = "always"
+RUST_BACKTRACE = "1"
+
+# =============================================================================
+# Build
+# =============================================================================
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build --workspace"
+
+[tasks.check]
+description = "Type-check every crate and target without a full build"
+run = "cargo check --workspace --all-targets"
+
+[tasks.doc]
+description = "Build the API documentation (warnings are errors)"
+run = "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps"
+
+# =============================================================================
+# Development
+# =============================================================================
+
+[tasks.fmt]
+description = "Format code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting"
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "Clippy on every target, warnings are errors"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.deny]
+description = "Licences, advisories, bans and sources (deny.toml)"
+run = "cargo deny check"
+
+# =============================================================================
+# Test
+# =============================================================================
+
+[tasks.test]
+description = "Unit, integration and property tests"
+run = "cargo test --workspace"
+
+[tasks."test:doc"]
+description = "Documentation tests"
+run = "cargo test --workspace --doc"
+
+[tasks.examples]
+description = "Run the examples non-interactively, as CI does"
+run = """
+cargo run --release -p aqueduct --example quickstart
+cargo run --release -p aqueduct --example approval -- --auto
+cargo run --release -p aqueduct --example order_saga
+cargo run --release -p aqueduct --example ingest -- --auto
+"""
+
+# =============================================================================
+# Simulation and crashes
+# =============================================================================
+
+[tasks.sim]
+description = "The deterministic simulator; pass arguments, e.g. `mise run sim -- --seed 31 --workload rust`"
+run = "cargo xtask sim"
+
+[tasks."sim:ci"]
+description = "Every simulator workload, with the seed counts CI runs"
+run = """
+cargo xtask sim --seeds 10000
+cargo xtask sim --seeds 2000 --workload starlark
+cargo xtask sim --seeds 2000 --workload timers
+cargo xtask sim --seeds 2000 --workload rust
+"""
+
+[tasks."crash:ci"]
+description = "Real kill -9 against the log and the engine, in every mode CI runs"
+run = """
+cargo xtask crash --kills 200
+cargo xtask crash-engine --kills 50
+cargo xtask crash-engine --kills 30 --os
+cargo xtask crash-engine --startup --kills 200
+"""
+
+# =============================================================================
+# Benchmarks
+# =============================================================================
+
+[tasks.bench]
+description = "End-to-end engine benchmark against ADR 0003's targets (results: docs/measurements/)"
+run = "cargo run --release -p aqueduct-bench-engine"
+
+[tasks."bench:storage"]
+description = "Storage benchmark: plain log, redb and fjall (ADR 0009)"
+run = "cargo run --release -p aqueduct-bench-storage"
+
+# =============================================================================
+# CI
+# =============================================================================
+
+[tasks.ci]
+description = "Everything CI checks, one after the other"
+run = """
+mise run fmt:check
+mise run lint
+mise run test
+mise run test:doc
+mise run doc
+mise run deny
+mise run examples
+mise run sim:ci
+mise run crash:ci
+"""
+
+[tasks."ci:quick"]
+description = "Quick check before pushing: format, clippy, tests"
+run = """
+mise run fmt:check
+mise run lint
+mise run test
+"""
+
+# =============================================================================
+# Maintenance
+# =============================================================================
+
+[tasks.clean]
+description = "Remove build artifacts and the examples' data directories"
+run = """
+cargo clean
+rm -rf quickstart-data approval-data order-saga-data ingest-data
+"""
