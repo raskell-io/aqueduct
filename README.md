@@ -36,11 +36,13 @@ one journal format and one set of guarantees.
 
 ## Quick start
 
-Aqueduct is not on crates.io yet; depend on the repository:
+Aqueduct is not on crates.io yet; depend on the repository (and on `serde_json`, which the example uses
+to read and write step payloads):
 
-```toml
-[dependencies]
-aqueduct = { git = "https://github.com/raskell-io/aqueduct" }
+```sh
+cargo new hello-aqueduct && cd hello-aqueduct
+cargo add aqueduct --git https://github.com/raskell-io/aqueduct
+cargo add serde_json
 ```
 
 A workflow is an ordinary `async fn`. Everything it does with the world goes through its context, so the
@@ -67,12 +69,12 @@ engine.start("onboard:ada", "onboard", Payload::new(br#""ada""#.to_vec()))?; // 
 let result = engine.wait("onboard:ada", Duration::from_secs(60))?;
 ```
 
-The complete program is [`crates/aqueduct/examples/quickstart.rs`](crates/aqueduct/examples/quickstart.rs).
-Run it, kill it during the sleep, and run it again: the run continues where it stopped, and the sleep ends
-at its original time.
+The complete program is [`crates/aqueduct/examples/quickstart.rs`](crates/aqueduct/examples/quickstart.rs):
+copy it to `src/main.rs`. Run it, kill it during the five second sleep (Ctrl-C, or `kill -9`), and run it
+again: the run continues where it stopped, and the sleep ends at its original time.
 
 ```sh
-cargo run -p aqueduct --example quickstart
+cargo run    # in a clone of this repository: cargo run -p aqueduct --example quickstart
 ```
 
 Waiting for people works the same way. [`approval.rs`](crates/aqueduct/examples/approval.rs) asks for
