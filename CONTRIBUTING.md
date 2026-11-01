@@ -103,5 +103,6 @@ Only Apache-2.0, MIT, BSD-2/3-Clause, ISC, Zlib and Unicode-3.0 licensed depende
 
 ## Reporting security issues
 
-Please do not open a public issue for a vulnerability. Email hello@raskell.io with a description and, if
-you can, a way to reproduce it.
+Please do not open a public issue for a vulnerability. Report it privately through GitHub
+([Security, "Report a vulnerability"](https://github.com/raskell-io/aqueduct/security/advisories/new)), or
+email hello@raskell.io, with a description and, if you can, a way to reproduce it.
