@@ -29,12 +29,27 @@ pub struct FileLogOptions {
     /// Size after which the next sync starts a new segment. A single sync never splits its records
     /// across segments, so a segment can exceed this size.
     pub segment_bytes: u64,
+    /// What a sync waits for (ADR 0003).
+    pub durability: Durability,
+}
+
+/// What [`LogStore::sync`] waits for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// The data is on stable storage (`F_FULLFSYNC` on macOS, `fdatasync` on Linux): it survives a power
+    /// loss. The default; never weakened silently.
+    #[default]
+    Fsync,
+    /// The data is written to the operating system, not synced: it survives a crash of the process, not
+    /// of the machine. For tests, tools and measurements.
+    Os,
 }
 
 impl Default for FileLogOptions {
     fn default() -> Self {
         FileLogOptions {
             segment_bytes: 64 << 20,
+            durability: Durability::Fsync,
         }
     }
 }
@@ -123,8 +138,10 @@ impl FileLog {
 
     fn start_segment(&mut self, base: u64) -> Result<(), StorageError> {
         let segment = self.open_segment(base, 0)?;
-        segment.file.sync_all()?;
-        sync_dir(&self.dir)?;
+        if self.options.durability == Durability::Fsync {
+            segment.file.sync_all()?;
+            sync_dir(&self.dir)?;
+        }
         self.current = Some(segment);
         Ok(())
     }
@@ -158,10 +175,12 @@ impl LogStore for FileLog {
             .file
             .write_all(&self.pending)
             .map_err(|e| StorageError::SyncFailed(e.to_string()))?;
-        segment
-            .file
-            .sync_data()
-            .map_err(|e| StorageError::SyncFailed(e.to_string()))?;
+        if self.options.durability == Durability::Fsync {
+            segment
+                .file
+                .sync_data()
+                .map_err(|e| StorageError::SyncFailed(e.to_string()))?;
+        }
         segment.len += self.pending.len() as u64;
         self.next_lsn += self.pending_records;
         self.pending.clear();
@@ -294,7 +313,10 @@ mod tests {
     #[test]
     fn round_trip_across_segments_and_reopens() {
         let dir = temp_dir();
-        let options = FileLogOptions { segment_bytes: 300 };
+        let options = FileLogOptions {
+            segment_bytes: 300,
+            ..FileLogOptions::default()
+        };
         let mut log = FileLog::open(&dir, options).unwrap();
         assert!(log.recover().unwrap().is_empty());
         for batch in 0..20u64 {
@@ -363,7 +385,10 @@ mod tests {
     #[test]
     fn damage_in_an_older_segment_is_reported() {
         let dir = temp_dir();
-        let options = FileLogOptions { segment_bytes: 50 };
+        let options = FileLogOptions {
+            segment_bytes: 50,
+            ..FileLogOptions::default()
+        };
         let mut log = FileLog::open(&dir, options).unwrap();
         log.recover().unwrap();
         for n in 0..10 {
@@ -384,7 +409,10 @@ mod tests {
     #[test]
     fn recovery_from_an_lsn_and_trimming() {
         let dir = temp_dir();
-        let options = FileLogOptions { segment_bytes: 200 };
+        let options = FileLogOptions {
+            segment_bytes: 200,
+            ..FileLogOptions::default()
+        };
         let mut log = FileLog::open(&dir, options).unwrap();
         log.recover().unwrap();
         for n in 0..60 {
@@ -413,6 +441,28 @@ mod tests {
             FileLog::open(&dir, options).unwrap().recover_from(61),
             Err(StorageError::Corrupt(_))
         ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn os_durability_writes_without_syncing_and_reads_back() {
+        let dir = temp_dir();
+        let options = FileLogOptions {
+            segment_bytes: 100,
+            durability: Durability::Os,
+        };
+        let mut log = FileLog::open(&dir, options).unwrap();
+        log.recover().unwrap();
+        for n in 0..20 {
+            log.append(&[record(n)]).unwrap();
+            log.sync().unwrap();
+        }
+        drop(log);
+        let mut log = FileLog::open(&dir, options).unwrap();
+        assert_eq!(
+            log.recover().unwrap(),
+            (0..20).map(record).collect::<Vec<_>>()
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

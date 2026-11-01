@@ -1,0 +1,16 @@
+[package]
+name = "aqueduct-bench-engine"
+description = "End-to-end embedded engine benchmark against the targets of ADR 0003"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+aqueduct-core.workspace = true
+aqueduct-engine.workspace = true
+aqueduct-sdk.workspace = true

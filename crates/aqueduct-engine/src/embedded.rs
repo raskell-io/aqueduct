@@ -192,6 +192,13 @@ impl Builder {
         self
     }
 
+    /// What an acknowledgement waits for: `Durability::Fsync` (the default; survives a power loss) or
+    /// `Durability::Os` (written to the operating system; survives a crash of the process only).
+    pub fn durability(mut self, durability: aqueduct_storage::Durability) -> Self {
+        self.log.durability = durability;
+        self
+    }
+
     /// Log segment size (default 64 MiB).
     pub fn segment_bytes(mut self, bytes: u64) -> Self {
         self.log.segment_bytes = bytes;
