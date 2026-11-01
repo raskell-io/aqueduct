@@ -128,6 +128,11 @@ def run(claim):
 ```
 
 Register it with `.workflow("claims", Arc::new(aqueduct::Procedure::compile("claims.star", source)?))`.
+`escalate` hands the claim to a person and waits, durably, for their decision; list open escalations
+with `engine.escalations()` or `aqueduct escalations`, and resolve them with `resolve_escalation`
+([ADR 0020](docs/adr/0020-escalations.md)). [`ingest.rs`](crates/aqueduct/examples/ingest.rs) is the
+reference pipeline with all of it: concurrent steps, a review through an awakeable with a deadline, and
+an escalation when nobody reviews in time.
 
 ## Guarantees
 

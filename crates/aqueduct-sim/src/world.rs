@@ -522,6 +522,7 @@ impl World<'_> {
                 Outbound::Started { key } => Ev::ClientStartAck { key },
                 Outbound::Signaled { key } => Ev::ClientSignalAck { key },
                 Outbound::Cancelled { key } => Ev::ClientCancelAck { key },
+                Outbound::Resolved { .. } => continue,
                 Outbound::Dispatch {
                     key,
                     cmd,

@@ -85,6 +85,19 @@ pub struct RunResult {
     pub error: Option<String>,
 }
 
+/// An escalation waiting for a person or an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Escalation {
+    /// The id to resolve it with: `<run key>#<command index>`.
+    pub id: String,
+    /// The run key.
+    pub key: String,
+    /// Why the run escalated.
+    pub reason: String,
+    /// What the resolver needs to decide.
+    pub payload: Payload,
+}
+
 /// A snapshot of the engine's size, for operations and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineStats {
@@ -117,6 +130,9 @@ pub enum EngineError {
     /// A run with this key exists, and the start used [`ReusePolicy::Reject`].
     #[error("run `{0}` already exists")]
     AlreadyStarted(String),
+    /// The id is not an escalation id (`<run key>#<command index>`).
+    #[error("`{0}` is not an escalation id")]
+    InvalidEscalation(String),
     /// The id is not an awakeable id (`<run key>#<command index>`).
     #[error("`{0}` is not an awakeable id")]
     InvalidAwakeable(String),
@@ -341,6 +357,28 @@ impl Engine {
         answer.recv().map_err(|_| self.stopped())?
     }
 
+    /// Escalations waiting for a resolution, across all runs.
+    pub fn escalations(&self) -> Result<Vec<Escalation>, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Escalations { reply })?;
+        answer.recv().map_err(|_| self.stopped())
+    }
+
+    /// Resolves an escalation by id; the run continues with `outcome`. Returns once the resolution is
+    /// durable. Only the first resolution counts.
+    pub fn resolve_escalation(&self, id: &str, outcome: Payload) -> Result<(), EngineError> {
+        let (key, cmd) = aqueduct_core::parse_command_id(id)
+            .ok_or_else(|| EngineError::InvalidEscalation(id.to_owned()))?;
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Resolve {
+            key: key.to_owned(),
+            cmd,
+            outcome,
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
     /// Completes an awakeable with a payload, given the id the workflow handed out. Returns once the
     /// completion is durable; completing it again records the first payload only.
     pub fn complete_awakeable(&self, id: &str, payload: Payload) -> Result<(), EngineError> {
@@ -426,6 +464,15 @@ enum Request {
         key: String,
         reason: String,
         reply: Sender<Result<(), EngineError>>,
+    },
+    Resolve {
+        key: String,
+        cmd: CommandIndex,
+        outcome: Payload,
+        reply: Sender<Result<(), EngineError>>,
+    },
+    Escalations {
+        reply: Sender<Vec<Escalation>>,
     },
     StepResult {
         key: String,
@@ -565,6 +612,32 @@ impl Processor {
                 }
                 Err(error) => return Err(error.to_string()),
             },
+            Request::Resolve {
+                key,
+                cmd,
+                outcome,
+                reply,
+            } => match self.partition.resolve_escalation(&key, cmd, outcome) {
+                Ok(()) => self.signals.entry(key).or_default().push(reply),
+                Err(PartitionError::UnknownRun(key)) => {
+                    let _ = reply.send(Err(EngineError::UnknownRun(key)));
+                }
+                Err(error) => return Err(error.to_string()),
+            },
+            Request::Escalations { reply } => {
+                let open = self
+                    .partition
+                    .open_escalations()
+                    .into_iter()
+                    .map(|(key, cmd, reason, payload)| Escalation {
+                        id: aqueduct_core::awakeable_id(&key, cmd),
+                        key,
+                        reason,
+                        payload,
+                    })
+                    .collect();
+                let _ = reply.send(open);
+            }
             Request::Cancel { key, reason, reply } => match self.partition.cancel(&key, &reason) {
                 Ok(()) => self.signals.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownRun(key)) => {
@@ -628,7 +701,9 @@ impl Processor {
                         input,
                     });
                 }
-                Outbound::Signaled { key } | Outbound::Cancelled { key } => {
+                Outbound::Signaled { key }
+                | Outbound::Cancelled { key }
+                | Outbound::Resolved { key } => {
                     // One acknowledgement per signal or cancellation, in the order they were sent.
                     if let Some(replies) = self.signals.get_mut(&key)
                         && !replies.is_empty()

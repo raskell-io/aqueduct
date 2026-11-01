@@ -113,6 +113,22 @@ pub enum Entry {
         /// The value.
         value: Payload,
     },
+    /// The run escalated a decision to a person or an agent and waits for it to be resolved.
+    Escalated {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// Why (for example `review-timeout`); what escalations are counted by.
+        reason: String,
+        /// What the resolver needs to decide.
+        payload: Payload,
+    },
+    /// An escalation was resolved; `outcome` is what the run continues with.
+    EscalationResolved {
+        /// The escalation's command.
+        cmd: CommandIndex,
+        /// The resolution.
+        outcome: Payload,
+    },
     /// The run was asked to stop. Every command without an outcome completes as failed and cancelled;
     /// when none is pending, the next command the run issues does. At most once per run.
     CancelRequested {

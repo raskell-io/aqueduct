@@ -40,6 +40,6 @@ pub use aqueduct_sdk::{
 pub mod embedded {
     pub use aqueduct_engine::Durability;
     pub use aqueduct_engine::embedded::{
-        Attempt, Builder, Engine, EngineError, EngineStats, RunResult,
+        Attempt, Builder, Engine, EngineError, EngineStats, Escalation, RunResult,
     };
 }

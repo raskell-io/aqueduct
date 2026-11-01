@@ -11,8 +11,8 @@
 //!   the order given.
 //! - `agent(name, input, prompt = ..., output_schema = ..., budget_tokens = ...)` runs a bounded agent
 //!   step (in this spike, a step named `agent:<name>`).
-//! - `escalate(reason, payload = None)` ends the run with an escalation (in this spike, a failure
-//!   whose error starts with `escalated:`).
+//! - `escalate(reason, payload = None)` hands a decision to a person or an agent, waits durably for
+//!   the resolution and returns it (ADR 0020).
 //! - `sleep(seconds)` sleeps durably; `wait(signal(name), timeout = seconds)` returns the next signal's
 //!   payload, or `None` when the timeout passes first. `minutes(n)`, `hours(n)` and `days(n)` give
 //!   seconds.
@@ -228,9 +228,6 @@ impl Decider for Procedure {
             (Err(_), Some(Stop::StepFailed(error) | Stop::Cancelled(error))) => {
                 Some(Command::FailRun { error })
             }
-            (Err(_), Some(Stop::Escalate(reason))) => Some(Command::FailRun {
-                error: format!("escalated: {reason}"),
-            }),
             (Err(ScriptError::Fail(error)), None) => Some(Command::FailRun { error }),
             (Err(ScriptError::Other(reason)), None) => Some(Command::Park {
                 reason: format!("procedure {}: {reason}", self.name),
@@ -248,8 +245,6 @@ enum Stop {
     Suspend,
     /// A step failed and was not `fallible`.
     StepFailed(String),
-    /// The script escalated.
-    Escalate(String),
     /// The run was cancelled while the script waited for this call. Procedures cannot catch it.
     Cancelled(String),
 }
@@ -264,7 +259,9 @@ enum ScriptError {
 
 fn classify(error: starlark::Error) -> ScriptError {
     match error.kind() {
-        starlark::ErrorKind::Fail(message) => ScriptError::Fail(message.to_string()),
+        starlark::ErrorKind::Fail(message) => {
+            ScriptError::Fail(message.to_string().trim().to_owned())
+        }
         _ => ScriptError::Other(error.to_string()),
     }
 }
@@ -317,7 +314,6 @@ impl Activation {
         let message = match &stop {
             Stop::Suspend => "suspended: waiting for a step".to_owned(),
             Stop::StepFailed(error) => format!("step failed: {error}"),
-            Stop::Escalate(reason) => format!("escalated: {reason}"),
             Stop::Cancelled(error) => error.clone(),
         };
         self.stop = Some(stop);
@@ -522,14 +518,23 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
             .ok_or_else(|| anyhow::anyhow!("duration too long"))
     }
 
-    /// Ends the run with an escalation.
+    /// Escalates a decision to a person or an agent and waits for the resolution, which it returns.
     fn escalate<'v>(
         reason: &str,
         #[starlark(default = NoneType)] payload: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<NoneType> {
-        let _ = (payload, eval);
-        suspend_or_fail(Stop::Escalate(reason.to_owned()))
+    ) -> anyhow::Result<Value<'v>> {
+        let command = Command::Escalate {
+            reason: reason.to_owned(),
+            payload: to_payload(payload)?,
+        };
+        match with_activation(|act| act.issue_command(command))? {
+            None => suspend_or_fail(Stop::Suspend),
+            Some(StepOutcome::Completed(resolution)) => {
+                Ok(eval.heap().alloc(from_payload(&resolution)?))
+            }
+            Some(StepOutcome::Failed(error)) => suspend_or_fail(Stop::StepFailed(error)),
+        }
     }
 }
 

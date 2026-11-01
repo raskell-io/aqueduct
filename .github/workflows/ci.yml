@@ -29,6 +29,7 @@ jobs:
       - run: cargo run --release -p aqueduct --example quickstart
       - run: cargo run --release -p aqueduct --example approval -- --auto
       - run: cargo run --release -p aqueduct --example order_saga
+      - run: cargo run --release -p aqueduct --example ingest -- --auto
 
   sim:
     name: simulation

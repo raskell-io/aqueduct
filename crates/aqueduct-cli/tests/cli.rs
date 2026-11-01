@@ -247,3 +247,65 @@ fn a_run_is_cancelled_while_the_engine_is_stopped() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn escalations_are_listed_and_resolved_while_the_engine_is_stopped() {
+    let source = r#"
+def run(claim):
+    decision = escalate("manual-review", claim)
+    if decision != "settle":
+        fail("declined: " + decision)
+    return "settled"
+"#;
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-esc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_str().unwrap();
+    let open = || {
+        Engine::builder(&dir)
+            .workflow(
+                "claims",
+                Arc::new(Procedure::compile("claims.star", source).unwrap()),
+            )
+            .open()
+            .unwrap()
+    };
+    {
+        let engine = open();
+        engine
+            .start("c-7", "claims", Payload::new(*b"{\"amount\":9000}"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while engine.escalations().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let open = engine.escalations().unwrap();
+        assert_eq!(
+            (open[0].id.as_str(), open[0].reason.as_str()),
+            ("c-7#0", "manual-review")
+        );
+    }
+    let listed = cli(&["escalations", path]).unwrap();
+    assert!(
+        listed.contains("c-7#0  manual-review  {\"amount\":9000}"),
+        "{listed}"
+    );
+    assert!(
+        cli(&["resolve", path, "c-7#0", "settle"])
+            .unwrap_err()
+            .contains("not JSON")
+    );
+    assert!(
+        cli(&["resolve", path, "c-7", "1"])
+            .unwrap_err()
+            .contains("not an escalation id")
+    );
+    cli(&["resolve", path, "c-7#0", "\"settle\""]).unwrap();
+    cli(&["resolve", path, "c-7#0", "\"decline\""]).unwrap(); // only the first counts
+    assert!(cli(&["escalations", path]).unwrap().is_empty());
+    let engine = open();
+    let done = engine.wait("c-7", Duration::from_secs(10)).unwrap();
+    assert_eq!(done.output, Some(Payload::new(*b"\"settled\"")));
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

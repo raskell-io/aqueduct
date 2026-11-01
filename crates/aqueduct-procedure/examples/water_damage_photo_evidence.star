@@ -1,7 +1,6 @@
 # The claims procedure from BRIEF.md section 4.4, as a Starlark procedure.
-# Not yet supported in the phase 0 spike: wait() for signals with timeouts, call() for child runs and
-# a real escalation outcome. Here the customer's photos arrive through a step, settlement is a step,
-# and escalate() ends the run.
+# Here the customer's photos arrive through a step and settlement is a step. escalate() hands the claim
+# to a person and waits for their decision: "settle" goes on to settlement, anything else declines it.
 
 PROCEDURE = {
     "name": "claims/water-damage-photo-evidence",
@@ -26,9 +25,13 @@ def run(claim):
         step("notify.customer", {"template": "claims/missing-photos", "to": claim["customer"]})
         photos = step("customer.photos", claim["id"], fallible = True)
         if not photos["ok"]:
-            escalate("no-photos", claim)
+            decision = escalate("no-photos", claim)
+            if decision != "settle":
+                fail("declined: " + decision)
 
     if claim["amount"] > 5000 or docs["confidence"] < 0.8:
-        escalate("manual-review", claim)
+        decision = escalate("manual-review", claim)
+        if decision != "settle":
+            fail("declined: " + decision)
 
     return step("claims.settle@v2", {"claim": claim["id"], "coverage": coverage})
