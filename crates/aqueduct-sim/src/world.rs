@@ -221,6 +221,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         },
     };
     world.node.forget_dirty_runs = config.bugs.checkpoint_forgets_recovered_runs;
+    world.node.skip_successor_repair = config.bugs.skip_successor_repair;
     if config.cancel_every > 0 {
         world.to_cancel = (0..config.runs)
             .filter(|i| i % config.cancel_every == config.cancel_every - 1)
@@ -584,6 +585,17 @@ impl World<'_> {
         Ok(())
     }
 
+    /// A key's latest run (the last generation: a run may continue as new), as a client sees it.
+    fn latest(&self, key: &str) -> Option<&aqueduct_engine::PartitionRun> {
+        let prefix = format!("{key}\0");
+        self.node
+            .runs()
+            .range::<str, _>((std::ops::Bound::Included(key), std::ops::Bound::Unbounded))
+            .take_while(|(id, _)| id.as_str() == key || id.starts_with(&prefix))
+            .max_by_key(|(id, _)| aqueduct_core::split_run_id(id).1)
+            .map(|(_, run)| run)
+    }
+
     /// Invariant: acknowledged work is never lost.
     fn check_acknowledged(&self) -> Result<(), String> {
         for key in &self.acked_starts {
@@ -592,7 +604,7 @@ impl World<'_> {
             }
         }
         for key in &self.acked_cancels {
-            let Some(run) = self.node.runs().get(key) else {
+            let Some(run) = self.latest(key) else {
                 return Err(format!("lost run {key} with an acknowledged cancellation"));
             };
             // A cancellation of a run that had already ended is dropped, as specified.
@@ -601,7 +613,7 @@ impl World<'_> {
             }
         }
         for key in &self.acked_signals {
-            let Some(run) = self.node.runs().get(key) else {
+            let Some(run) = self.latest(key) else {
                 return Err(format!("lost run {key} with an acknowledged signal"));
             };
             let has = |f: fn(&aqueduct_core::Entry) -> bool| run.journal().iter().any(f);
@@ -680,9 +692,7 @@ impl World<'_> {
             && (!self.workload.signals || self.acked_signals.len() == self.wanted.len())
             && self.acked_cancels.len() == self.to_cancel.len()
             && self.wanted.iter().all(|(key, _)| {
-                self.node
-                    .runs()
-                    .get(key)
+                self.latest(key)
                     .is_some_and(|r| r.state().status().is_terminal())
             })
     }
@@ -734,9 +744,7 @@ impl World<'_> {
         // Every run ended as the sequential reference says it should.
         for (key, input) in &self.wanted {
             let run = self
-                .node
-                .runs()
-                .get(key)
+                .latest(key)
                 .ok_or_else(|| format!("run {key} missing at the end"))?;
             let state = &run.state();
             if state.status() == Status::Parked {
@@ -826,9 +834,7 @@ impl World<'_> {
             .iter()
             .filter(|(key, _)| {
                 !self
-                    .node
-                    .runs()
-                    .get(key)
+                    .latest(key)
                     .is_some_and(|r| r.state().status().is_terminal())
             })
             .map(|(key, _)| key.clone())

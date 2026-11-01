@@ -52,6 +52,7 @@ record = version:u8  kind:u8  prev:hash  fields
 | 14 | `CancelRequested` | `reason:string` |
 | 15 | `Escalated` | `cmd:cmd`, `reason:string`, `payload:bytes` |
 | 16 | `EscalationResolved` | `cmd:cmd`, `outcome:bytes` |
+| 17 | `ContinuedAsNew` | `input:bytes` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
@@ -67,9 +68,15 @@ Their encoding is declared by the SDK's codec.
 
 ## 4. The hash chain
 
-- `genesis(run_key) = SHA-256("aqueduct-history-v0" || 0x00 || run_key)`, where `run_key` is the run key's
+A key can have several runs over time, one after another (continue-as-new, or a start allowed after the
+previous run ended); each is a **generation**, 0 for the first. A run is identified by its **run id**: the
+run key for generation 0, and `run_key || 0x00 || generation` (the generation in decimal) after that. Run
+keys never contain `0x00`, so run ids are unambiguous, and histories of generation 0 are exactly those of
+runs before generations existed (ADR 0022).
+
+- `genesis(run_id) = SHA-256("aqueduct-history-v0" || 0x00 || run_id)`, where `run_id` is the run id's
   UTF-8 bytes.
-- The first record of a run has `prev = genesis(run_key)`.
+- The first record of a run has `prev = genesis(run_id)`.
 - Every later record has `prev = SHA-256(previous record's complete bytes)`.
 - The run's **head** is `SHA-256(last record's complete bytes)`. Storing or publishing the head commits to
   the whole history; changing, removing or reordering any record changes it.
@@ -99,19 +106,20 @@ A decoded history is a valid journal if:
 4. `StepRetryScheduled` records a failed, retryable attempt of a step that has no outcome and no pending
    retry; `attempt` counts 1, 2, 3, ... per step. The next `TimerFired` for that step dispatches it again
    and gives it no outcome. A step's outcome may still arrive while a retry is pending (a late attempt).
-5. Nothing follows `RunCompleted`, `RunFailed` or `Parked` (in version 0; operator resume of parked runs is
-   specified in a later version).
+5. Nothing follows `RunCompleted`, `RunFailed`, `Parked` or `ContinuedAsNew` (in version 0; operator
+   resume of parked runs is specified in a later version). After `ContinuedAsNew`, the key's next
+   generation starts with `Started`, for the same workflow and with `input` as its input.
 
 The order of completions may differ from the order of commands; it is the order in which the outcomes
 were recorded.
 
 ## 6. Partition log records
 
-On a partition's log, each journal record is wrapped with its run key, because the records of many runs are
-interleaved:
+On a partition's log, each journal record is wrapped with its run id (section 4), because the records of
+many runs are interleaved:
 
 ```text
-log_record = version:u8 (0)  run_key:string  record:bytes
+log_record = version:u8 (0)  run_id:string  record:bytes
 ```
 
 The storage layer adds its own framing (length and CRC-32) around each log record. Framing is not part of the

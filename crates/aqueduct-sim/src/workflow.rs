@@ -115,7 +115,8 @@ def run(input):
 /// [`STARLARK_PIPELINE`], replayed by re-running the `async fn` on every activation. It first stamps
 /// the run with a recorded UUID, passed to a step: a value used before it was durable, then recorded
 /// again differently after a crash, shows up as one command dispatched with two inputs. Then it races
-/// two steps with `select_all`, and undoes `merge` with a saga when validation fails.
+/// two steps with `select_all`, continues as new once (the second run of the key does the rest), and
+/// undoes `merge` with a saga when validation fails.
 pub async fn rust_pipeline(
     ctx: aqueduct_sdk::WorkflowContext,
     input: String,
@@ -131,6 +132,11 @@ pub async fn rust_pipeline(
     .await;
     probe?; // a cancellation during the race surfaces here
     let _: String = ctx.step("winner", &winner.to_string()).await?;
+    // The first run continues as new: the key's next run does the rest, with a marked input. Its
+    // commands, timers and results must never mix with the first run's.
+    if !input.starts_with('>') {
+        return Err(ctx.continue_as_new(&format!(">{input}")));
+    }
     let extracted: String = ctx.step("extract", &input).await?;
     let (a, b) = aqueduct_sdk::join(
         ctx.step::<String, _>("map_a", &extracted),
@@ -259,6 +265,13 @@ pub fn reference(
                 outcome: (workload.execute)(&name, &input),
             },
             Some(Effect::Finished(_)) => continue,
+            // The run continued as new: the key's next run takes over.
+            Some(Effect::ContinueAsNew { input }) => {
+                let next = start(crate::node::WORKFLOW, input);
+                state = RunState::from_journal(&next.entries).map_err(|e| e.to_string())?;
+                work = next.effects;
+                continue;
+            }
             None if state.status().is_terminal() => break,
             // Nothing to do but wait: let time pass (fire timers), or deliver the client's signal.
             None => match state.timers().first() {

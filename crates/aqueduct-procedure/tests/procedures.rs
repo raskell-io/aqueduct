@@ -65,7 +65,7 @@ fn run(
                 };
                 Event::StepResult { cmd, outcome }
             }
-            Effect::Finished(_) => continue,
+            Effect::Finished(_) | Effect::ContinueAsNew { .. } => continue,
         };
         let transition = state.handle(event);
         for entry in &transition.entries {

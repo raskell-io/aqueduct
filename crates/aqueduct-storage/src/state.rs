@@ -28,6 +28,25 @@ pub trait StateStore {
     fn load_run(&mut self, key: &str) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
         Ok(self.load()?.runs.remove(key))
     }
+
+    /// The generations of a run key saved in the last checkpoint: its run ids are the key itself
+    /// (generation 0) and `<key>\0<generation>` (see `aqueduct_core::run_id`).
+    fn generations(&mut self, key: &str) -> Result<Vec<u32>, StorageError> {
+        Ok(self
+            .load()?
+            .runs
+            .keys()
+            .filter_map(|id| generation_of(id, key))
+            .collect())
+    }
+}
+
+/// The generation of run id `id` if it is a run of `key`.
+fn generation_of(id: &str, key: &str) -> Option<u32> {
+    if id == key {
+        return Some(0);
+    }
+    id.strip_prefix(key)?.strip_prefix('\0')?.parse().ok()
 }
 
 /// No state store: recovery always replays the whole log.
@@ -139,6 +158,20 @@ impl StateStore for RedbStateStore {
         Ok(())
     }
 
+    fn generations(&mut self, key: &str) -> Result<Vec<u32>, StorageError> {
+        use redb::ReadableDatabase;
+        let txn = self.db.begin_read().map_err(io)?;
+        let table = txn.open_table(RUNS).map_err(io)?;
+        // The key, then `<key>\0...`: every id below `<key>\x01` that starts with the key.
+        let end = format!("{key}\u{1}");
+        let mut generations = Vec::new();
+        for row in table.range(key..end.as_str()).map_err(io)? {
+            let (id, _) = row.map_err(io)?;
+            generations.extend(generation_of(id.value(), key));
+        }
+        Ok(generations)
+    }
+
     fn load_run(&mut self, key: &str) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
         use redb::ReadableDatabase;
         let txn = self.db.begin_read().map_err(io)?;
@@ -163,6 +196,36 @@ fn io(error: impl std::fmt::Display) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generations_of_a_key_are_found_by_range() {
+        let dir = std::env::temp_dir().join(format!("aqueduct-state-gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = RedbStateStore::open(&dir.join("state.redb")).unwrap();
+        let runs: Vec<(String, Vec<Vec<u8>>)> =
+            ["k", "k\u{0}1", "k\u{0}12", "k1", "ka", "j", "k\u{0}x"]
+                .iter()
+                .map(|id| ((*id).to_owned(), vec![vec![1]]))
+                .collect();
+        store.save(1, &runs).unwrap();
+        let mut found = store.generations("k").unwrap();
+        found.sort_unstable();
+        assert_eq!(found, [0, 1, 12]);
+        assert_eq!(store.generations("k1").unwrap(), [0]);
+        assert!(store.generations("missing").unwrap().is_empty());
+        // The default implementation (through `load`) agrees.
+        let mut by_load: Vec<u32> = store
+            .load()
+            .unwrap()
+            .runs
+            .keys()
+            .filter_map(|id| generation_of(id, "k"))
+            .collect();
+        by_load.sort_unstable();
+        assert_eq!(by_load, found);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn checkpoints_round_trip_and_merge() {

@@ -192,3 +192,25 @@ fn a_decision_based_on_something_not_yet_durable_is_caught() {
         "the simulator should catch a dispatch built on lost state"
     );
 }
+
+#[test]
+fn a_successor_torn_off_by_a_crash_is_restarted() {
+    // Found by the simulator when continue-as-new was added: a run's `ContinuedAsNew` and its successor's
+    // `Started` are separate records of one batch, and a torn write can keep only the first.
+    let config = Config {
+        workload: WorkloadKind::RustPipeline,
+        bugs: Bugs {
+            skip_successor_repair: true,
+            ..Bugs::default()
+        },
+        ..Config::default()
+    };
+    let failure = (0..2_000)
+        .find_map(|seed| run_seed(seed, &config).err())
+        .expect("the simulator should catch a chain left without its next run");
+    assert!(
+        failure.message.contains("Continued") || failure.message.contains("liveness"),
+        "{}",
+        failure.message
+    );
+}
