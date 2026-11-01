@@ -35,7 +35,7 @@ This file and `.claude/` are the context for AI-assisted work on Aqueduct (see
 3. Determinism: the core is a pure state machine; procedures are deterministic by construction; Rust
    workflows read the outside world only through the context.
 4. `#![forbid(unsafe_code)]`, no `unwrap` or `expect` outside tests, permissive licences only.
-5. Every change passes fmt, clippy, tests, `cargo deny`, the CLA check, the simulator and the crash harness.
-   A failing check is fixed, never weakened, skipped or deleted.
+5. Every change passes `mise run ci` (fmt, clippy, tests, docs, `cargo deny`, the examples, the simulator and
+   the crash harness) and the CLA check. A failing check is fixed, never weakened, skipped or deleted.
 6. Nothing reaches `main` without a pull request and the owner's approval. Never force-push, never push to
    `main`, never publish crates.

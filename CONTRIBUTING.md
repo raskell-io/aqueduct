@@ -46,22 +46,31 @@ What we ask of AI-assisted contributions:
   them anywhere. Security issues are reported privately (below), not in issues, pull requests or prompts
   shared with others.
 
-## Gates
+## Setup
 
-Every change must pass all of these. CI runs them on every pull request, and branch protection on `main`
-requires `fmt, clippy, test`, `cargo-deny`, `CLA`, `simulation` and `crash harness`.
+Aqueduct uses [mise](https://mise.jdx.dev/) for its tools and tasks, like the other raskell projects. Rust
+itself comes from `rust-toolchain.toml` through rustup.
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo deny check
-cargo xtask sim --seeds 10000          # the deterministic simulator
-cargo xtask crash-engine --kills 50    # real kill -9 against the engine
+git clone https://github.com/raskell-io/aqueduct.git
+cd aqueduct
+mise trust && mise install    # installs cargo-deny
+mise tasks                    # lists every task
 ```
 
-The full list, including every simulator workload, crash mode and example, is in
-[`.claude/rules/workflow.md`](.claude/rules/workflow.md). Changes to the core, codec, storage or engine are
+## Gates
+
+Every change must pass all of these. CI runs the same mise tasks on every pull request, and branch
+protection on `main` requires `fmt, clippy, test`, `cargo-deny`, `CLA`, `simulation` and `crash harness`.
+
+```sh
+mise run ci          # everything CI checks, one after the other
+mise run ci:quick    # format, clippy and tests, before pushing
+```
+
+`mise run ci` is `fmt:check`, `lint`, `test`, `test:doc`, `doc`, `deny`, `examples`, `sim:ci` (every
+simulator workload) and `crash:ci` (real `kill -9` in every mode); `mise.toml` shows the exact commands,
+and [`.claude/rules/workflow.md`](.claude/rules/workflow.md) explains them. Changes to the core, codec, storage or engine are
 expected to run the simulator locally, and a new failure mode should come with an invariant or an injected
 bug that would catch it.
 

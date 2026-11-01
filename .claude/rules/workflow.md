@@ -2,14 +2,19 @@
 
 ## The gates
 
-Every change passes all of these before it is merged. CI runs them, and branch protection on `main` requires
-`fmt, clippy, test`, `cargo-deny`, `CLA`, `simulation` and `crash harness`.
+Every change passes all of these before it is merged. They are mise tasks (`mise.toml`), and CI runs the same
+tasks; branch protection on `main` requires `fmt, clippy, test`, `cargo-deny`, `CLA`, `simulation` and
+`crash harness`. `mise run ci` runs everything below, one after the other; `mise run ci:quick` runs format,
+clippy and tests. Set up once with `mise trust && mise install`.
+
+The commands behind the tasks:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test --workspace --doc
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 cargo deny check
 
 # The deterministic simulator (CI runs these seed counts)
@@ -31,7 +36,8 @@ cargo run --release -p aqueduct --example order_saga
 cargo run --release -p aqueduct --example ingest -- --auto
 ```
 
-A failing seed is reproduced with the command the simulator prints (`cargo xtask sim --seed N --workload W`).
+A failing seed is reproduced with the command the simulator prints (`cargo xtask sim --seed N --workload W`,
+or `mise run sim -- --seed N --workload W`).
 Fix the cause; never change the seed range or loosen an invariant to make it pass.
 
 ## How changes reach `main`
