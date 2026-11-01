@@ -4,3 +4,4 @@ quickstart-data/
 approval-data/
 order-saga-data/
 ingest-data/
+.claude/settings.local.json
