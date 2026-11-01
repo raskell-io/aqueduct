@@ -163,6 +163,9 @@ What holds today, for the embedded engine, and how it is checked:
 - **Per-version metrics:** runs, escalation and timeout rates, cost and replay divergence for every
   version (`aqueduct metrics`), and the version on every live run metric
   ([ADR 0031](docs/adr/0031-per-version-metrics.md)).
+- **For agents:** `aqueduct mcp <dir> --as <agent>` serves the Model Context Protocol, so agents
+  validate, replay and propose procedure versions, start and inspect runs, and resolve escalations.
+  Approval stays with people ([ADR 0032](docs/adr/0032-mcp-server.md)).
 - **Counterfactual replay:** a new procedure version is replayed against past runs, answered with their
   recorded results, and the runs it would decide differently are reported with where they diverge
   ([ADR 0028](docs/adr/0028-counterfactual-replay.md)).
@@ -212,6 +215,7 @@ cargo run -p aqueduct-cli -- counterfactual ./data claims-v3.star --workflow cla
                                                                       # how would a new version have decided past runs?
 cargo run -p aqueduct-cli -- metrics ./data claims                     # per version: runs, escalations, timeouts, cost, replay
 cargo run -p aqueduct-cli -- versions list ./data                      # procedure versions: state, approvals, replay, runs on them
+cargo run -p aqueduct-cli -- mcp ./data --as agent/claims-explorer      # MCP on stdio, for an agent (claude mcp add aqueduct -- aqueduct mcp ...)
 cargo run -p aqueduct-cli -- drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
                                                                       # ask past agent calls again: same answers?
 ```

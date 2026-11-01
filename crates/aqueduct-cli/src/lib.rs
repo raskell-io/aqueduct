@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod mcp;
+
 use std::path::Path;
 
 use aqueduct_ai::anthropic::Anthropic;
@@ -38,6 +40,13 @@ commands:
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
+  mcp <dir> [--as <identity>] [--read-only]
+                                      serve the Model Context Protocol on stdio, for agents: propose,
+                                      validate and replay versions, start and inspect runs, resolve
+                                      escalations (changes are made as <identity>; default agent/mcp)
+  start <dir> <workflow> <key> <json> [--version <v>] [--budget <tokens>]
+                                      start a run on the registry's active version (or <v>); it
+                                      runs when the engine next opens
   signal <dir> <key> <name> <json> [<id>]
                                       send a signal; with an id, sending it again records it once
   complete-awakeable <dir> <id> <json>
@@ -102,6 +111,24 @@ pub fn run(args: &[String]) -> Result<String, String> {
             &args[3..],
         ),
         Some("versions") => versions(&args[1..]),
+        Some("mcp") => {
+            let dir = Path::new(arg(1, "data directory")?);
+            let (mut identity, mut read_only) = ("agent/mcp".to_owned(), false);
+            let mut rest = args[2..].iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--as" => identity = rest.next().ok_or("--as needs an identity")?.clone(),
+                    "--read-only" => read_only = true,
+                    other => return Err(format!("unknown option `{other}`")),
+                }
+            }
+            let server = mcp::Server::new(dir, &identity, read_only);
+            server
+                .serve(std::io::stdin().lock(), std::io::stdout().lock())
+                .map_err(|e| e.to_string())?;
+            Ok(String::new())
+        }
+        Some("start") => start(Path::new(arg(1, "data directory")?), &args[2..]),
         Some("metrics") => metrics(
             Path::new(arg(1, "data directory")?),
             args.get(2).map(String::as_str),
@@ -212,6 +239,11 @@ fn signal(
 
 /// Loads every run in a data directory: the last checkpoint and the log after it.
 fn load(dir: &Path) -> Result<Partition<FileLog, RedbStateStore>, String> {
+    load_with(dir, Deciders::new())
+}
+
+/// Loads a data directory with deciders, so that commands that start runs can decide them.
+fn load_with(dir: &Path, deciders: Deciders) -> Result<Partition<FileLog, RedbStateStore>, String> {
     if !dir.join("log").is_dir() {
         return Err(format!(
             "{} is not an aqueduct data directory (no log)",
@@ -222,7 +254,7 @@ fn load(dir: &Path) -> Result<Partition<FileLog, RedbStateStore>, String> {
         FileLog::open(dir.join("log"), FileLogOptions::default()).map_err(|e| e.to_string())?;
     let state = RedbStateStore::open(&dir.join("state.redb"))
         .map_err(|e| format!("cannot open the state store (is the engine running?): {e}"))?;
-    Partition::load_with_state(log, state, Deciders::new()).map_err(|e| e.to_string())
+    Partition::load_with_state(log, state, deciders).map_err(|e| e.to_string())
 }
 
 fn run_state(dir: &Path, key: &str) -> Result<(RunState, Vec<Entry>), String> {
@@ -601,48 +633,11 @@ fn versions(args: &[String]) -> Result<String, String> {
         }
         "prove" => {
             let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
-            let by = by()?;
-            let version = registry.version(workflow, id).map_err(err)?.clone();
-            let source = registry.source(&version).map_err(err)?;
-            let procedure = Procedure::compile(&format!("{workflow}.star"), &source)
-                .map_err(|e| e.to_string())?;
-            let options = CounterfactualOptions {
-                stubs: match flags.get("stubs") {
-                    Some(path) => load_stubs(Path::new(path))?,
-                    None => Default::default(),
-                },
+            let stubs = match flags.get("stubs") {
+                Some(path) => load_stubs(Path::new(path))?,
+                None => Default::default(),
             };
-            let partition = match load(dir) {
-                Ok(partition) => Some(partition),
-                // No log yet: nothing has run.
-                Err(_) if !dir.join("log").is_dir() => None,
-                Err(e) => return Err(e),
-            };
-            let (report, [same, different, unresolved]) = match &partition {
-                Some(partition) => {
-                    counterfactual_report(partition, &procedure, &[], Some(workflow), &options)?
-                }
-                None => (
-                    "0 runs: 0 same, 0 different, 0 unresolved\n".to_owned(),
-                    [0; 3],
-                ),
-            };
-            // A workflow's first version has no past runs: its report says so (the policy's
-            // `min_runs` decides whether that is enough).
-            let runs = same + different + unresolved;
-            let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-            let evidence = ReplayEvidence {
-                runs: count(runs),
-                same: count(same),
-                different: count(different),
-                unresolved: count(unresolved),
-                report_sha256: aqueduct_procedure::version_of(&report),
-            };
-            registry.prove(workflow, id, by, evidence).map_err(err)?;
-            Ok(format!(
-                "{report}{workflow} version {} proven: the report is recorded\n",
-                short_version(&version.id)
-            ))
+            prove_version(dir, &mut registry, workflow, id, by()?, stubs)
         }
         "approve" => {
             let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
@@ -735,6 +730,148 @@ fn versions(args: &[String]) -> Result<String, String> {
         "" => Err(format!("versions needs a subcommand\n\n{USAGE}")),
         other => Err(format!("unknown versions subcommand `{other}`\n\n{USAGE}")),
     }
+}
+
+/// Replays every past run of `workflow` against a registered version and records the report as its
+/// evidence (ADR 0030). Returns the report.
+pub(crate) fn prove_version(
+    dir: &Path,
+    registry: &mut Registry,
+    workflow: &str,
+    id: &str,
+    by: &str,
+    stubs: std::collections::BTreeMap<String, Payload>,
+) -> Result<String, String> {
+    let err = |e: RegistryError| e.to_string();
+    let version = registry.version(workflow, id).map_err(err)?.clone();
+    let source = registry.source(&version).map_err(err)?;
+    let procedure =
+        Procedure::compile(&format!("{workflow}.star"), &source).map_err(|e| e.to_string())?;
+    let (report, [same, different, unresolved]) =
+        replay_workflow(dir, &procedure, workflow, &CounterfactualOptions { stubs })?;
+    // A workflow's first version has no past runs: its report says so (the policy's `min_runs`
+    // decides whether that is enough).
+    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    let evidence = ReplayEvidence {
+        runs: count(same + different + unresolved),
+        same: count(same),
+        different: count(different),
+        unresolved: count(unresolved),
+        report_sha256: aqueduct_procedure::version_of(&report),
+    };
+    registry
+        .prove(workflow, &version.id, by, evidence)
+        .map_err(err)?;
+    Ok(format!(
+        "{report}{workflow} version {} proven: the report is recorded\n",
+        short_version(&version.id)
+    ))
+}
+
+/// Replays every past run of `workflow` in a data directory against `procedure`: the report and the
+/// counts of same, different and unresolved runs. A directory where nothing has run has none.
+pub(crate) fn replay_workflow(
+    dir: &Path,
+    procedure: &Procedure,
+    workflow: &str,
+    options: &CounterfactualOptions,
+) -> Result<(String, [usize; 3]), String> {
+    if !dir.join("log").is_dir() {
+        return Ok((
+            "0 runs: 0 same, 0 different, 0 unresolved\n".to_owned(),
+            [0; 3],
+        ));
+    }
+    let partition = load(dir)?;
+    counterfactual_report(&partition, procedure, &[], Some(workflow), options)
+}
+
+/// Records a run's start in a stopped engine's data directory, on the workflow's active registered
+/// version (or `version`), and its first decision; the engine runs it when it next opens.
+fn start(dir: &Path, args: &[String]) -> Result<String, String> {
+    let mut positional: Vec<&str> = Vec::new();
+    let (mut version, mut budget) = (None, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--version" => version = Some(rest.next().ok_or("--version needs a version")?.clone()),
+            "--budget" => {
+                let text = rest.next().ok_or("--budget needs a number of tokens")?;
+                budget = Some(
+                    text.parse::<u64>()
+                        .map_err(|_| format!("--budget needs a number, not `{text}`"))?,
+                );
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
+            other => positional.push(other),
+        }
+    }
+    let [workflow, key, json] = positional[..] else {
+        return Err(format!("start needs <workflow> <key> <json>\n\n{USAGE}"));
+    };
+    start_run(dir, workflow, key, json, version, budget)
+}
+
+pub(crate) fn start_run(
+    dir: &Path,
+    workflow: &str,
+    key: &str,
+    json: &str,
+    version: Option<String>,
+    budget_tokens: Option<u64>,
+) -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|e| format!("the input is not JSON ({e})"))?;
+    let registry = Registry::open(dir).map_err(|e| e.to_string())?;
+    // Only deployable versions (approved, active, draining) can be started on, as in an engine.
+    let deciders = registry.deciders().map_err(|e| e.to_string())?;
+    let version = match version {
+        Some(prefix) => Some(
+            registry
+                .version(workflow, &prefix)
+                .map_err(|e| e.to_string())?
+                .id
+                .clone(),
+        ),
+        None => None,
+    };
+    std::fs::create_dir_all(dir.join("log")).map_err(|e| e.to_string())?;
+    let mut partition = load_with(dir, deciders)?;
+    partition.set_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+    );
+    let options = aqueduct_engine::StartOptions {
+        reuse: aqueduct_engine::ReusePolicy::ReturnExisting,
+        budget_tokens,
+        version,
+    };
+    partition
+        .start_with(
+            key,
+            workflow,
+            Payload::new(json.as_bytes().to_vec()),
+            options,
+        )
+        .map_err(|e| e.to_string())?;
+    partition.flush().map_err(|e| e.to_string())?;
+    let pinned = partition
+        .latest(key)
+        .map_err(|e| e.to_string())?
+        .and_then(|id| {
+            partition
+                .runs()
+                .get(&id)
+                .and_then(|r| r.state().version().map(str::to_owned))
+        });
+    Ok(format!(
+        "run {key} of {workflow} started{}; it runs when the engine next opens\n",
+        pinned.map_or(String::new(), |v| format!(
+            " on version {}",
+            short_version(&v)
+        ))
+    ))
 }
 
 /// Runs pinned to each version: `(unfinished, total)`, or `None` if the data directory cannot be read

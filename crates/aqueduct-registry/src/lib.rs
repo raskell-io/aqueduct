@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aqueduct_engine::Deciders;
 use aqueduct_engine::embedded::Builder;
 use aqueduct_procedure::{Procedure, version_of};
 use serde_json::{Value, json};
@@ -618,6 +619,24 @@ impl Registry {
             }
         }
         Ok(builder)
+    }
+
+    /// The deployable versions (approved, active, draining) as deciders, with the active ones
+    /// activated: for working on a data directory without an engine (the CLI's `start`).
+    pub fn deciders(&self) -> Result<Deciders, RegistryError> {
+        let mut deciders = Deciders::new();
+        for version in self.versions.values().filter(|v| v.state.is_deployed()) {
+            let source = self.source(version)?;
+            let procedure = Procedure::compile(&format!("{}.star", version.workflow), &source)
+                .map_err(|e| RegistryError::Invalid(e.to_string()))?;
+            deciders.insert_version(&version.workflow, &version.id, Arc::new(procedure));
+            if version.state == State::Active {
+                deciders
+                    .activate(&version.workflow, &version.id)
+                    .map_err(|e| RegistryError::Invalid(e.to_string()))?;
+            }
+        }
+        Ok(deciders)
     }
 
     fn append(
