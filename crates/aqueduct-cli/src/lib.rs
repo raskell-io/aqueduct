@@ -57,17 +57,20 @@ pub fn run(args: &[String]) -> Result<String, String> {
             arg(3, "signal name")?,
             arg(4, "JSON payload")?,
             args.get(5).map_or("", String::as_str),
+            false,
         ),
         Some("complete-awakeable") => {
             let id = arg(2, "awakeable id")?;
-            let (key, name) = aqueduct_core::parse_awakeable_id(id)
+            let (run, name) = aqueduct_core::parse_awakeable_id(id)
                 .ok_or_else(|| format!("`{id}` is not an awakeable id (<run key>#<command>)"))?;
+            let key = aqueduct_core::split_run_id(&run).0.to_owned();
             signal(
                 Path::new(arg(1, "data directory")?),
-                key,
+                &run,
                 &name,
                 arg(3, "JSON payload")?,
                 id,
+                true,
             )
             .map(|sent| {
                 sent.replacen(
@@ -98,7 +101,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 .map_err(|e| format!("the resolution is not JSON ({e})"))?;
             let mut partition = load(Path::new(arg(1, "data directory")?))?;
             partition
-                .resolve_escalation(key, cmd, Payload::new(json.as_bytes().to_vec()))
+                .resolve_escalation(&key, cmd, Payload::new(json.as_bytes().to_vec()))
                 .map_err(|e| e.to_string())?;
             partition.flush().map_err(|e| e.to_string())?;
             Ok(format!("escalation {id} resolved\n"))
@@ -118,19 +121,36 @@ pub fn run(args: &[String]) -> Result<String, String> {
 }
 
 /// Records a signal durably. The payload must be JSON (ADR 0010).
-fn signal(dir: &Path, key: &str, name: &str, json: &str, id: &str) -> Result<String, String> {
+/// Records a signal durably: to the key's latest run, or, if `exact`, to the run with run id `key`.
+fn signal(
+    dir: &Path,
+    key: &str,
+    name: &str,
+    json: &str,
+    id: &str,
+    exact: bool,
+) -> Result<String, String> {
     serde_json::from_str::<serde_json::Value>(json)
         .map_err(|e| format!("the payload is not JSON ({e}); quote strings, as in '\"yes\"'"))?;
     let mut partition = load(dir)?;
-    partition
-        .signal(key, name, id, Payload::new(json.as_bytes().to_vec()))
-        .map_err(|e| e.to_string())?;
+    let payload = Payload::new(json.as_bytes().to_vec());
+    if exact {
+        partition.signal_run(key, name, id, payload)
+    } else {
+        partition.signal(key, name, id, payload)
+    }
+    .map_err(|e| e.to_string())?;
     partition.flush().map_err(|e| e.to_string())?;
-    let state = partition
-        .runs()
-        .get(key)
+    let run = if exact {
+        Some(key.to_owned())
+    } else {
+        partition.latest(key).map_err(|e| e.to_string())?
+    };
+    let state = run
+        .and_then(|run| partition.runs().get(&run))
         .map(|run| format!("{:?}", run.state().status()).to_lowercase())
         .unwrap_or_else(|| "finished".to_owned());
+    let key = aqueduct_core::split_run_id(key).0;
     Ok(format!("signal {name} sent to {key} ({state})\n"))
 }
 
@@ -347,6 +367,7 @@ fn describe_entry(entry: &Entry) -> String {
             format!("signal {name} ({id}) received: {}", text(payload))
         }
         Entry::RunCompleted { output } => format!("run completed with {}", text(output)),
+        Entry::ContinuedAsNew { input } => format!("continued as new with {}", text(input)),
         Entry::RunFailed { error } => format!("run failed: {error}"),
         Entry::Parked { reason } => format!("run parked: {reason}"),
         Entry::CancelRequested { reason } => format!("cancel requested: {reason}"),
@@ -423,6 +444,9 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         }
         Entry::RunCompleted { output } => {
             json!({"kind": "RunCompleted", "output": payload(output)})
+        }
+        Entry::ContinuedAsNew { input } => {
+            json!({"kind": "ContinuedAsNew", "input": payload(input)})
         }
         Entry::RunFailed { error } => json!({"kind": "RunFailed", "error": error}),
         Entry::Parked { reason } => json!({"kind": "Parked", "reason": reason}),

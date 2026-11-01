@@ -58,6 +58,7 @@ pub(crate) struct Node {
     deciders: Deciders,
     ack_before_sync: bool,
     pub forget_dirty_runs: bool,
+    pub skip_successor_repair: bool,
 }
 
 impl Node {
@@ -82,6 +83,7 @@ impl Node {
             deciders,
             ack_before_sync,
             forget_dirty_runs: false,
+            skip_successor_repair: false,
         })
     }
 
@@ -225,6 +227,9 @@ impl Node {
             .map_err(|e| e.to_string())?;
         if self.forget_dirty_runs {
             partition.inject_forget_dirty_runs();
+        }
+        if self.skip_successor_repair {
+            partition.inject_skip_successor_repair();
         }
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);

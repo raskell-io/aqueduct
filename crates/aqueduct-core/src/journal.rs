@@ -151,6 +151,12 @@ pub enum Entry {
         /// The signal's payload.
         payload: Payload,
     },
+    /// The run ended and asked for a new run of the same workflow under the same key, with this input
+    /// (continue-as-new). The engine starts it as the key's next generation.
+    ContinuedAsNew {
+        /// The next run's input.
+        input: Payload,
+    },
     /// The run completed with an output.
     RunCompleted {
         /// The run's output.

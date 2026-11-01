@@ -301,6 +301,11 @@ impl Observer for OtelObserver {
                     .add(1, &[flow(), KeyValue::new("aqueduct.status", "completed")]);
                 point("run completed".into(), Vec::new(), None);
             }
+            Entry::ContinuedAsNew { .. } => {
+                self.runs_ended
+                    .add(1, &[flow(), KeyValue::new("aqueduct.status", "continued")]);
+                point("continued as new".into(), Vec::new(), None);
+            }
             Entry::RunFailed { error } => {
                 self.runs_ended
                     .add(1, &[flow(), KeyValue::new("aqueduct.status", "failed")]);

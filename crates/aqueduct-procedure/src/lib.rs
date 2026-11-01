@@ -13,6 +13,8 @@
 //!   step (in this spike, a step named `agent:<name>`).
 //! - `escalate(reason, payload = None)` hands a decision to a person or an agent, waits durably for
 //!   the resolution and returns it (ADR 0020).
+//! - `continue_as_new(input)` ends the run and starts a new run of the procedure under the same key with
+//!   `input` (ADR 0022).
 //! - `sleep(seconds)` sleeps durably; `wait(signal(name), timeout = seconds)` returns the next signal's
 //!   payload, or `None` when the timeout passes first. `minutes(n)`, `hours(n)` and `days(n)` give
 //!   seconds.
@@ -228,6 +230,7 @@ impl Decider for Procedure {
             (Err(_), Some(Stop::StepFailed(error) | Stop::Cancelled(error))) => {
                 Some(Command::FailRun { error })
             }
+            (Err(_), Some(Stop::Continue(input))) => Some(Command::ContinueAsNew { input }),
             (Err(ScriptError::Fail(error)), None) => Some(Command::FailRun { error }),
             (Err(ScriptError::Other(reason)), None) => Some(Command::Park {
                 reason: format!("procedure {}: {reason}", self.name),
@@ -247,6 +250,8 @@ enum Stop {
     StepFailed(String),
     /// The run was cancelled while the script waited for this call. Procedures cannot catch it.
     Cancelled(String),
+    /// The script called `continue_as_new(input)`.
+    Continue(Payload),
 }
 
 #[derive(Debug)]
@@ -315,6 +320,7 @@ impl Activation {
             Stop::Suspend => "suspended: waiting for a step".to_owned(),
             Stop::StepFailed(error) => format!("step failed: {error}"),
             Stop::Cancelled(error) => error.clone(),
+            Stop::Continue(_) => "continued as new".to_owned(),
         };
         self.stop = Some(stop);
         anyhow::anyhow!(message)
@@ -516,6 +522,12 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
     fn days(n: i32) -> anyhow::Result<i32> {
         n.checked_mul(86_400)
             .ok_or_else(|| anyhow::anyhow!("duration too long"))
+    }
+
+    /// Ends the run and starts a new run of this procedure under the same key with `input`.
+    fn continue_as_new<'v>(input: Value<'v>) -> anyhow::Result<NoneType> {
+        let input = to_payload(input)?;
+        suspend_or_fail(Stop::Continue(input))
     }
 
     /// Escalates a decision to a person or an agent and waits for the resolution, which it returns.
