@@ -1,0 +1,26 @@
+[package]
+name = "aqueduct-ai"
+description = "Model provider adapters for Aqueduct's agent steps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aqueduct-core.workspace = true
+aqueduct-engine.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1"
+thiserror.workspace = true
+rustls-native-certs = "0.8"
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
+
+[dev-dependencies]
+aqueduct-sdk.workspace = true

@@ -156,13 +156,17 @@ What holds today, for the embedded engine, and how it is checked:
   read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)).
 - **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
   once per signal id.** **Retries** follow a policy with journaled backoff.
+- **Agent steps:** a model call is a step whose answer, model identity and token cost are journaled, so
+  replay never calls the model again, under a hard token budget
+  ([ADR 0023](docs/adr/0023-agent-steps.md)). `aqueduct-ai` runs them on Claude or any OpenAI-compatible
+  endpoint, Ollama and vLLM included ([ADR 0026](docs/adr/0026-provider-adapters.md)).
 - **Observable:** `aqueduct-otel` turns runs into OpenTelemetry traces (one trace per run, across
   restarts) and metrics ([ADR 0021](docs/adr/0021-opentelemetry.md)); the CLI shows any run's journal
   without setup.
 - **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the
   code ([history format](docs/history-format.md)).
 
-Planned: the same semantics on a single server and in a replicated cluster, agent steps with budgets, and
+Planned: the same semantics on a single server and in a replicated cluster, run budgets, and
 the procedure lifecycle (proposal, replay against past cases, approval, retirement). The full design and
 phased plan are in [BRIEF.md](BRIEF.md).
 
