@@ -87,10 +87,22 @@ fn runs_complete_and_starts_are_idempotent() {
         );
     }
 
-    // Starting an existing key does not run it again.
-    engine
-        .start("greet:ada", "greet", json("\"someone else\""))
-        .unwrap();
+    // Starting an existing key again (a retried start) does not run it again; starting it with another
+    // input is a conflict, and the `Reject` policy refuses any existing key.
+    engine.start("greet:ada", "greet", json("\"ada\"")).unwrap();
+    assert_eq!(
+        engine.start("greet:ada", "greet", json("\"someone else\"")),
+        Err(EngineError::KeyConflict("greet:ada".into()))
+    );
+    assert_eq!(
+        engine.start_with(
+            "greet:ada",
+            "greet",
+            json("\"ada\""),
+            aqueduct_engine::ReusePolicy::Reject
+        ),
+        Err(EngineError::AlreadyStarted("greet:ada".into()))
+    );
     assert_eq!(
         engine
             .wait("greet:ada", Duration::from_secs(10))
@@ -186,7 +198,7 @@ fn finished_runs_leave_memory_and_stay_queryable() {
         );
     }
     // With a checkpoint after every record, finished runs have left memory; they are still answered,
-    // starting them again is still a no-op, and signals to them are still acknowledged.
+    // starting them again is still a no-op (and a conflicting start still refused), and signals to them are still acknowledged.
     std::thread::sleep(Duration::from_millis(50));
     let stats = engine.stats().unwrap();
     assert!(
@@ -197,9 +209,11 @@ fn finished_runs_leave_memory_and_stay_queryable() {
         engine.wait("u-3", Duration::from_secs(1)).unwrap().output,
         Some(json(r#"{"en":"hello U3","de":"hallo U3"}"#))
     );
-    engine
-        .start("u-3", "greet", json("\"someone else\""))
-        .unwrap();
+    engine.start("u-3", "greet", json("\"u3\"")).unwrap();
+    assert_eq!(
+        engine.start("u-3", "greet", json("\"someone else\"")),
+        Err(EngineError::KeyConflict("u-3".into()))
+    );
     engine.signal("u-3", "anything", "s-1", json("1")).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 20);
     engine.shutdown().unwrap();

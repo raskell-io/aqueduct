@@ -47,7 +47,7 @@ use std::time::Duration;
 use aqueduct_core::{CommandIndex, Decider, Payload, Status, StepOutcome};
 use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore};
 
-use crate::{Deciders, Outbound, Partition, PartitionError, RetryPolicy};
+use crate::{Deciders, Outbound, Partition, PartitionError, RetryPolicy, ReusePolicy};
 
 /// A step implementation.
 pub type StepFn = Arc<dyn Fn(&Payload) -> Attempt + Send + Sync>;
@@ -111,6 +111,12 @@ pub enum EngineError {
     /// The engine stopped, for example after a storage failure. Reopen it to recover.
     #[error("the engine has stopped: {0}")]
     Stopped(String),
+    /// A run with this key exists with another workflow or input.
+    #[error("run `{0}` exists with another workflow or input")]
+    KeyConflict(String),
+    /// A run with this key exists, and the start used [`ReusePolicy::Reject`].
+    #[error("run `{0}` already exists")]
+    AlreadyStarted(String),
     /// The id is not an awakeable id (`<run key>#<command index>`).
     #[error("`{0}` is not an awakeable id")]
     InvalidAwakeable(String),
@@ -280,11 +286,23 @@ impl Engine {
     /// Starts a run. Idempotent per key: starting an existing key returns once that run's start is
     /// durable, without starting it again. Returns after the start is durable.
     pub fn start(&self, key: &str, workflow: &str, input: Payload) -> Result<(), EngineError> {
+        self.start_with(key, workflow, input, ReusePolicy::ReturnExisting)
+    }
+
+    /// Starts a run with an explicit [`ReusePolicy`] for a key that already has one.
+    pub fn start_with(
+        &self,
+        key: &str,
+        workflow: &str,
+        input: Payload,
+        policy: ReusePolicy,
+    ) -> Result<(), EngineError> {
         let (reply, answer) = mpsc::channel();
         self.send(Request::Start {
             key: key.to_owned(),
             workflow: workflow.to_owned(),
             input,
+            policy,
             reply,
         })?;
         answer.recv().map_err(|_| self.stopped())?
@@ -390,6 +408,7 @@ enum Request {
         key: String,
         workflow: String,
         input: Payload,
+        policy: ReusePolicy,
         reply: Sender<Result<(), EngineError>>,
     },
     Wait {
@@ -501,11 +520,18 @@ impl Processor {
                 key,
                 workflow,
                 input,
+                policy,
                 reply,
-            } => match self.partition.start(&key, &workflow, input) {
+            } => match self.partition.start_with(&key, &workflow, input, policy) {
                 Ok(()) => self.starts.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownWorkflow(name)) => {
                     let _ = reply.send(Err(EngineError::UnknownWorkflow(name)));
+                }
+                Err(PartitionError::KeyConflict(key)) => {
+                    let _ = reply.send(Err(EngineError::KeyConflict(key)));
+                }
+                Err(PartitionError::AlreadyStarted(key)) => {
+                    let _ = reply.send(Err(EngineError::AlreadyStarted(key)));
                 }
                 Err(error) => return Err(error.to_string()),
             },
