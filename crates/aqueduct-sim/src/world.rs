@@ -171,10 +171,11 @@ struct World<'c> {
     /// Runs the client cancels, and those whose cancellation it saw acknowledged (never lost).
     to_cancel: BTreeSet<String>,
     acked_cancels: BTreeSet<String>,
-    /// The escalation the client last sent a resolution for, by run.
-    resolving: BTreeMap<String, CommandIndex>,
-    /// Escalations whose resolution the client saw acknowledged (never lost): (run id, command).
-    acked_resolutions: BTreeSet<(String, CommandIndex)>,
+    /// The escalation the client last sent a resolution for, by run: (command, reason).
+    resolving: BTreeMap<String, (CommandIndex, String)>,
+    /// Escalations whose resolution the client saw acknowledged (never lost): (run id, command,
+    /// reason). One agent call can escalate twice, for its budget and then for its answer.
+    acked_resolutions: BTreeSet<(String, CommandIndex, String)>,
     /// Timer firings (run, journal position) already checked against their wake time.
     checked_timers: BTreeSet<(String, usize)>,
     /// Results the worker holds and resends until acknowledged.
@@ -420,8 +421,8 @@ impl World<'_> {
                 self.acked_cancels.insert(key);
             }
             Ev::ClientResolveAck { run } => {
-                if let Some(cmd) = self.resolving.get(&run) {
-                    self.acked_resolutions.insert((run, *cmd));
+                if let Some((cmd, reason)) = self.resolving.get(&run).cloned() {
+                    self.acked_resolutions.insert((run, cmd, reason));
                 }
             }
             Ev::NodeResolve { run, cmd, outcome } => {
@@ -513,8 +514,18 @@ impl World<'_> {
                         let Some((_, input)) = self.wanted.iter().find(|(k, _)| k == key) else {
                             return Err(format!("an escalation of unknown run {run:?}"));
                         };
-                        let outcome = workflow::resolution(&reason, input);
-                        self.resolving.insert(run.clone(), cmd);
+                        let outcome = if reason == aqueduct_core::SCHEMA_ESCALATION {
+                            // The reviewer supplies the answer the model should have given.
+                            let Some(step) = self.node.runs().get(&run).and_then(|r| {
+                                r.state().steps().get(usize::try_from(cmd.0).ok()?).cloned()
+                            }) else {
+                                continue;
+                            };
+                            workflow::fake_model(&step.name, &step.input).response
+                        } else {
+                            workflow::resolution(&reason, input)
+                        };
+                        self.resolving.insert(run.clone(), (cmd, reason.clone()));
                         self.send(Ev::NodeResolve { run, cmd, outcome });
                     }
                 }
@@ -549,12 +560,17 @@ impl World<'_> {
                     }
                 }
                 *self.executions.entry((key.clone(), cmd)).or_default() += 1;
-                let report = if self.faults && self.rng.chance(self.config.transient_ppm) {
+                let report = if agent.is_some() {
+                    self.report.agent_calls += 1;
+                    let mut answer = workflow::fake_model(&name, &input);
+                    // A model that sometimes answers off schema: retried, then escalated.
+                    if self.faults && self.rng.chance(300_000) {
+                        answer.response = Payload::new(*b"\"off schema\"");
+                    }
+                    WorkerReport::Agent(Ok(answer))
+                } else if self.faults && self.rng.chance(self.config.transient_ppm) {
                     // A transient failure: the engine's retry policy schedules another attempt.
                     WorkerReport::Retry("transient failure".into())
-                } else if agent.is_some() {
-                    self.report.agent_calls += 1;
-                    WorkerReport::Agent(Ok(workflow::fake_model(&name, &input)))
                 } else {
                     WorkerReport::Outcome((self.workload.execute)(&name, &input))
                 };
@@ -572,8 +588,11 @@ impl World<'_> {
                 self.acked_results.insert((key, cmd));
             }
             Ev::WorkerAttemptAck { key, cmd } => {
-                // Acknowledges a retryable failure; the step stays pending until a retry completes it.
-                if let Some(WorkerReport::Retry(_)) = self.worker_pending.get(&(key.clone(), cmd)) {
+                // Acknowledges a retryable failure (or an answer refused by its schema); the command
+                // stays pending until a retry completes it.
+                if let Some(WorkerReport::Retry(_) | WorkerReport::Agent(_)) =
+                    self.worker_pending.get(&(key.clone(), cmd))
+                {
                     self.worker_pending.remove(&(key, cmd));
                 }
             }
@@ -726,7 +745,7 @@ impl World<'_> {
                 return Err(format!("lost acknowledged cancellation of {key}"));
             }
         }
-        for (id, cmd) in &self.acked_resolutions {
+        for (id, cmd, reason) in &self.acked_resolutions {
             let Some(run) = self.node.runs().get(id) else {
                 return Err(format!("lost run {id:?} with an acknowledged resolution"));
             };
@@ -736,7 +755,7 @@ impl World<'_> {
                 .state()
                 .open_escalations()
                 .iter()
-                .any(|(c, _, _)| c == cmd);
+                .any(|(c, r, _)| c == cmd && r == reason);
             if still_open {
                 return Err(format!(
                     "lost acknowledged resolution of {id:?} command {cmd}"
@@ -863,6 +882,7 @@ impl World<'_> {
         };
         self.report.budget_escalations = count(|e| matches!(e, Entry::AgentCallEscalated { .. }));
         self.report.budget_approvals = count(|e| matches!(e, Entry::BudgetApproved { .. }));
+        self.report.answer_escalations = count(|e| matches!(e, Entry::AgentAnswerEscalated { .. }));
         self.report.escalations_resolved = self
             .node
             .runs()

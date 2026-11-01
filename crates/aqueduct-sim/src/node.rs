@@ -8,6 +8,14 @@ use aqueduct_core::{CommandIndex, Decider, Payload, StepOutcome};
 use aqueduct_engine::{Deciders, Outbound, Partition, PartitionRun, RetryPolicy};
 
 /// Retries never run out in the simulation, so every run still ends as the fault-free reference.
+/// The agent call's retry policy: two answers that do not match the output schema escalate it.
+const SIM_AGENT_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 2,
+    initial_backoff_ms: 20,
+    multiplier: 2,
+    max_backoff_ms: 200,
+};
+
 const SIM_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: u32::MAX,
     initial_backoff_ms: 20,
@@ -74,6 +82,7 @@ impl Node {
             .map_err(|e| e.to_string())?;
         partition.inject_ack_before_sync(ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);
+        partition.set_retry_policy("classify", SIM_AGENT_RETRY);
         partition.set_seed(SIM_SEED);
         Ok(Node {
             up: true,
@@ -287,6 +296,7 @@ impl Node {
         }
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);
+        partition.set_retry_policy("classify", SIM_AGENT_RETRY);
         partition.set_seed(SIM_SEED ^ self.incarnation);
         self.partition = Some(partition);
         self.up = true;

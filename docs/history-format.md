@@ -58,6 +58,7 @@ record = version:u8  kind:u8  prev:hash  fields
 | 20 | `AgentCallEscalated` | `cmd:cmd`, `name:string`, `request:bytes`, `budget_tokens:varint`, `available:varint` |
 | 21 | `BudgetApproved` | `cmd:cmd`, `tokens:varint` |
 | 22 | `Started` (with a budget) | `workflow:string`, `input:bytes`, `budget_tokens:varint` |
+| 23 | `AgentAnswerEscalated` | `cmd:cmd`, `error:string`, `answer:bytes` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
@@ -109,7 +110,9 @@ A decoded history is a valid journal if:
    A run started with kind 22 has a token budget. `AgentCallEscalated` is an agent call that did not fit
    in what was left of it (the run's answered tokens plus the budgets of its calls in flight): it waits,
    without being made, until `BudgetApproved` (the run's new budget) releases it, or `StepFailed`
-   declines it, or a cancellation closes it.
+   declines it, or a cancellation closes it. `AgentAnswerEscalated` holds an agent call whose answers did
+   not match its output schema once its retries were spent; an `EscalationResolved` for it completes the
+   call with the supplied answer (as does a late `AgentCallCompleted`), or a cancellation closes it.
    `CancelRequested` occurs at most once. It completes every command that has no outcome yet (a step,
    including one waiting to retry, a sleep or a signal wait) as failed with the error
    `cancelled: <reason>`, in command order, and marks them cancelled. If no command is waiting, the next

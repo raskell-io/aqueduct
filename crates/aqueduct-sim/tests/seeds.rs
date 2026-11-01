@@ -284,13 +284,16 @@ fn agent_calls_hold_every_invariant() {
         workload: WorkloadKind::StarlarkPipeline,
         ..Config::default()
     };
-    let (mut calls, mut escalated, mut approved) = (0, 0, 0);
+    let (mut calls, mut escalated, mut approved, mut answers) = (0, 0, 0, 0);
     for seed in 0..300 {
         let report = run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
         calls += report.agent_calls;
         escalated += report.budget_escalations;
         approved += report.budget_approvals;
+        answers += report.answer_escalations;
     }
+    // Off-schema answers are retried, and some exhaust their retries and are answered by the reviewer.
+    assert!(answers > 50, "answers escalated {answers}");
     assert!(calls > 1_000, "agent calls {calls}");
     // Runs with too small a budget escalate; the reviewer approves some and declines others.
     assert!(

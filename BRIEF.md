@@ -754,9 +754,10 @@ Standards:
 - `#![forbid(unsafe_code)]` in every crate. An exception needs an ADR and a safety comment per block.
 - `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo deny check`, and (from
   phase 0) `cargo xtask sim` in CI.
-- License allowlist: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0. No copyleft, no
-  BSL. Known pressure points to settle by ADR before phase 3: `webpki-roots` (CDLA-Permissive-2.0) in TLS
-  stacks, MPL-2.0 crates, and the OpenSSL-style licenses in some crypto crates.
+- License allowlist: Apache-2.0, MIT, MIT-0 (ADR 0025), BSD-2-Clause, BSD-3-Clause, ISC, Zlib,
+  Unicode-3.0. No copyleft, no BSL. Known pressure points to settle by ADR before phase 3: `webpki-roots`
+  (CDLA-Permissive-2.0) in TLS stacks, MPL-2.0 crates, and the OpenSSL-style licenses in some crypto
+  crates.
 - Public APIs documented with examples that compile (doc tests). Every example in `examples/` runs in CI.
 - Errors: `thiserror` in libraries, typed and actionable; no `unwrap` outside tests.
 - All crates have `publish = false` until the owner approves publishing.

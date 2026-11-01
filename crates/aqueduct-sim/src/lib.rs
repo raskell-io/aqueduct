@@ -170,6 +170,9 @@ pub struct Report {
     pub budget_escalations: u64,
     /// Budget escalations the reviewer approved.
     pub budget_approvals: u64,
+    /// Agent calls whose answers did not match their schema until the retries were spent, answered by
+    /// the reviewer instead.
+    pub answer_escalations: u64,
     /// Agent calls executed by the simulated model, including repeats before a result was recorded.
     pub agent_calls: u64,
     /// A fingerprint of the event sequence and the final chain heads. Equal for equal seeds.

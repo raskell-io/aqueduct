@@ -392,6 +392,12 @@ fn describe_entry(entry: &Entry) -> String {
         } => format!(
             "[{cmd}] agent call {name} over budget: needs {budget_tokens} tokens, {available} available; escalated"
         ),
+        Entry::AgentAnswerEscalated { cmd, error, answer } => {
+            format!(
+                "[{cmd}] answer rejected ({error}), escalated: {}",
+                text(answer)
+            )
+        }
         Entry::BudgetApproved { cmd, tokens } => {
             format!("[{cmd}] budget raised to {tokens} tokens")
         }
@@ -505,6 +511,13 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
             "kind": "AgentCallEscalated", "cmd": cmd(c), "name": name, "request": payload(request),
             "budget_tokens": budget_tokens, "available": available
         }),
+        Entry::AgentAnswerEscalated {
+            cmd: c,
+            error,
+            answer,
+        } => {
+            json!({"kind": "AgentAnswerEscalated", "cmd": cmd(c), "error": error, "answer": payload(answer)})
+        }
         Entry::BudgetApproved { cmd: c, tokens } => {
             json!({"kind": "BudgetApproved", "cmd": cmd(c), "tokens": tokens})
         }

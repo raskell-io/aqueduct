@@ -259,3 +259,66 @@ mod budgets {
         assert_eq!(dispatched(&effects), [CommandIndex(0)]);
     }
 }
+
+mod answers {
+    use super::*;
+    use aqueduct_core::SCHEMA_ESCALATION;
+
+    #[test]
+    fn a_rejected_answer_holds_the_call_until_someone_supplies_one() {
+        let mut run = Run::new();
+        run.handle(Event::Decision(vec![call(1_000)]));
+        // The engine rejected the answers (schema) and spent the retries.
+        let effects = run.handle(Event::AgentAnswerRejected {
+            cmd: CommandIndex(0),
+            error:
+                "at '': \"poem\" is not one of [\"invoice\"]\nwith a \"quote\" and a \\ backslash"
+                    .into(),
+            answer: Payload::new(b"\"poem\"\t\x01".to_vec()),
+        });
+        assert!(effects.is_empty(), "nothing is dispatched or decided");
+        let open = run.state.open_escalations();
+        assert_eq!((open[0].0, open[0].1), (CommandIndex(0), SCHEMA_ESCALATION));
+        // The payload is valid JSON however odd the answer and the error are.
+        let payload: serde_json::Value = serde_json::from_slice(open[0].2.as_bytes()).unwrap();
+        assert_eq!(payload["answer"], "\"poem\"\t\u{1}");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("\"quote\" and a \\ backslash")
+        );
+        assert!(
+            run.state.pending_steps().is_empty(),
+            "held: not dispatched again"
+        );
+        let effects = run.handle(Event::ResolveEscalation {
+            cmd: CommandIndex(0),
+            outcome: Payload::new(*b"\"invoice\""),
+        });
+        assert_eq!(effects, vec![Effect::Activate]);
+        assert_eq!(
+            run.state.view().outcome(CommandIndex(0)),
+            Some(&StepOutcome::Completed(Payload::new(*b"\"invoice\"")))
+        );
+        assert!(run.state.open_escalations().is_empty());
+    }
+
+    #[test]
+    fn a_late_valid_answer_completes_a_held_call() {
+        // An answer of an earlier attempt, checked by the engine, may still arrive: it is the answer.
+        let mut run = Run::new();
+        run.handle(Event::Decision(vec![call(1_000)]));
+        run.handle(Event::AgentAnswerRejected {
+            cmd: CommandIndex(0),
+            error: "off schema".into(),
+            answer: Payload::new(*b"1"),
+        });
+        assert_eq!(
+            run.handle(result(Ok(answer((1, 1))))),
+            vec![Effect::Activate]
+        );
+        assert!(run.state.open_escalations().is_empty());
+        assert!(run.state.steps()[0].held.is_none());
+    }
+}

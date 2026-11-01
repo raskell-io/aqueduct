@@ -77,7 +77,7 @@ pub use awakeable::{
 pub use decider::{Command, Decider, Env, RunView};
 pub use journal::{AgentResponse, CommandIndex, Entry, IdempotencyKey, Payload, StepOutcome};
 pub use run::{
-    BUDGET_ESCALATION, CommandKind, Effect, Event, JournalError, RunState, ScheduledStep, Status,
-    TIMED_OUT, Transition, cancelled_error, start, start_with_budget,
+    BUDGET_ESCALATION, CommandKind, Effect, Event, Hold, JournalError, RunState, SCHEMA_ESCALATION,
+    ScheduledStep, Status, TIMED_OUT, Transition, cancelled_error, start, start_with_budget,
 };
 pub use run_id::{run_id, split_run_id, valid_key};

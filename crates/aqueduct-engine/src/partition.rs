@@ -212,6 +212,9 @@ pub enum PartitionError {
     /// Run keys must not be empty or contain NUL.
     #[error("invalid run key {0:?}")]
     InvalidKey(String),
+    /// A resolution was refused: an answer supplied for an agent call does not match its output schema.
+    #[error("{0}")]
+    InvalidResolution(String),
 }
 
 /// How a run is started.
@@ -611,6 +614,20 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             });
             return Ok(());
         };
+        // An answer supplied for an agent call held for its schema must match that schema.
+        if let Some(step) = usize::try_from(cmd.0)
+            .ok()
+            .and_then(|index| run.state.steps().get(index))
+            && matches!(step.held, Some(aqueduct_core::Hold::Answer(_)))
+            && let Some(schema) = crate::schema::output_schema(&step.input)
+            && let Err(crate::schema::SchemaError::Mismatch(error)) =
+                crate::schema::check(&schema, &outcome)
+        {
+            return Err(PartitionError::InvalidResolution(format!(
+                "the answer does not match the output schema of `{}`: {error}",
+                step.name
+            )));
+        }
         let transition = run
             .state
             .handle_at(Event::ResolveEscalation { cmd, outcome }, self.now_ms);
@@ -854,18 +871,88 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         cmd: CommandIndex,
         outcome: Result<aqueduct_core::AgentResponse, String>,
     ) -> Result<(), PartitionError> {
+        let mut rejected = false;
         if let Some(run) = self.runs.get(key) {
-            let transition = run
-                .state
-                .handle_at(Event::AgentResult { cmd, outcome }, self.now_ms);
+            let event = self.check_answer(&run.state, cmd, outcome);
+            // An answer refused by its schema is processed like a failed attempt, not recorded.
+            rejected = matches!(
+                event,
+                Event::StepAttemptFailed { .. } | Event::AgentAnswerRejected { .. }
+            );
+            let transition = run.state.handle_at(event, self.now_ms);
             let effects = self.append(key, transition)?;
             self.perform(key, effects)?;
         }
-        self.send(Outbound::ResultRecorded {
-            key: key.to_owned(),
-            cmd,
+        let key = key.to_owned();
+        self.send(if rejected {
+            Outbound::AttemptRecorded { key, cmd }
+        } else {
+            Outbound::ResultRecorded { key, cmd }
         });
         Ok(())
+    }
+
+    /// Checks an agent call's answer against its output schema: a match is recorded; a mismatch is a
+    /// retryable failure until the retry policy is spent, then an escalation; a schema that does not
+    /// compile fails the call (a mistake in the workflow).
+    fn check_answer(
+        &self,
+        state: &RunState,
+        cmd: CommandIndex,
+        outcome: Result<aqueduct_core::AgentResponse, String>,
+    ) -> Event {
+        let Ok(response) = outcome else {
+            return Event::AgentResult { cmd, outcome };
+        };
+        let Some(step) = usize::try_from(cmd.0)
+            .ok()
+            .and_then(|index| state.steps().get(index))
+        else {
+            return Event::AgentResult {
+                cmd,
+                outcome: Ok(response),
+            };
+        };
+        let Some(schema) = crate::schema::output_schema(&step.input) else {
+            return Event::AgentResult {
+                cmd,
+                outcome: Ok(response),
+            };
+        };
+        match crate::schema::check(&schema, &response.response) {
+            Ok(()) => Event::AgentResult {
+                cmd,
+                outcome: Ok(response),
+            },
+            Err(crate::schema::SchemaError::Schema(error)) => Event::AgentResult {
+                cmd,
+                outcome: Err(format!(
+                    "the output schema of `{}` is invalid: {error}",
+                    step.name
+                )),
+            },
+            Err(crate::schema::SchemaError::Mismatch(error)) => {
+                let policy = self
+                    .retry_policies
+                    .get(&step.name)
+                    .copied()
+                    .unwrap_or(self.default_retry);
+                let attempt = step.failed_attempts.saturating_add(1);
+                if attempt >= policy.max_attempts {
+                    Event::AgentAnswerRejected {
+                        cmd,
+                        error,
+                        answer: response.response,
+                    }
+                } else {
+                    Event::StepAttemptFailed {
+                        cmd,
+                        error: format!("the answer does not match the output schema: {error}"),
+                        retry_after_ms: policy.backoff_ms(attempt),
+                    }
+                }
+            }
+        }
     }
 
     /// Records a step result (at most once per command).

@@ -11,6 +11,7 @@ mod agent;
 pub mod embedded;
 mod observe;
 mod partition;
+mod schema;
 
 pub use agent::{AgentAttempt, AgentCall, AgentExecutor};
 pub use aqueduct_storage::Durability;

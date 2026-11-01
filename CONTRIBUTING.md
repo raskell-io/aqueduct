@@ -98,7 +98,7 @@ first. Changes to the [history format](docs/history-format.md) need an ADR and t
 
 ## Dependencies
 
-Only Apache-2.0, MIT, BSD-2/3-Clause, ISC, Zlib and Unicode-3.0 licensed dependencies are allowed
+Only Apache-2.0, MIT, MIT-0, BSD-2/3-Clause, ISC, Zlib and Unicode-3.0 licensed dependencies are allowed
 (enforced by `cargo deny`). Anything else needs an ADR and the owner's approval.
 
 ## Reporting security issues

@@ -26,6 +26,9 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # MIT No Attribution: MIT without the attribution requirement, so strictly more permissive.
+    # Accepted by the owner on 2026-11-01 (ADR 0025); reached through boon's URI parser.
+    "MIT-0",
 ]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"

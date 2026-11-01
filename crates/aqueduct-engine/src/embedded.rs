@@ -133,6 +133,9 @@ pub enum EngineError {
     /// Run keys must not be empty or contain NUL.
     #[error("invalid run key {0:?}")]
     InvalidKey(String),
+    /// A resolution was refused (for example, an answer that does not match the output schema).
+    #[error("{0}")]
+    InvalidResolution(String),
     /// A run with this key exists, and the start used [`ReusePolicy::Reject`].
     #[error("run `{0}` already exists")]
     AlreadyStarted(String),
@@ -693,6 +696,9 @@ impl Processor {
                 Ok(()) => self.signals.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownRun(key)) => {
                     let _ = reply.send(Err(EngineError::UnknownRun(key)));
+                }
+                Err(PartitionError::InvalidResolution(why)) => {
+                    let _ = reply.send(Err(EngineError::InvalidResolution(why)));
                 }
                 Err(error) => return Err(error.to_string()),
             },
