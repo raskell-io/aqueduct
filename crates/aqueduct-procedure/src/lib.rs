@@ -92,6 +92,15 @@ pub struct ProcedureError {
     pub message: String,
 }
 
+/// The version id of a procedure's source: the SHA-256 of its exact bytes, in lowercase hex.
+pub fn version_of(source: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(source.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// A compiled procedure: a decider backed by a hermetic Starlark interpreter.
 pub struct Procedure {
     name: String,
@@ -113,6 +122,17 @@ impl Procedure {
     /// Parses a procedure and checks that it defines `run`, with default limits.
     pub fn compile(name: &str, source: &str) -> Result<Procedure, ProcedureError> {
         Procedure::compile_with_limits(name, source, Limits::default())
+    }
+
+    /// The procedure's version id: the SHA-256 of its source's exact bytes, in lowercase hex (ADR 0029).
+    /// The same source is the same version wherever it is registered; any change is a new one.
+    pub fn version(&self) -> String {
+        version_of(&self.source)
+    }
+
+    /// The procedure's source.
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     /// Parses a procedure and checks that it defines `run`.

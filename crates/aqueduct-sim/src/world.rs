@@ -1002,6 +1002,9 @@ impl World<'_> {
             if verified.entries != run.journal() {
                 return Err(format!("run {key}: durable journal differs from memory"));
             }
+            if run.state().version() != Some(crate::node::VERSION) {
+                return Err(format!("run {key} is not pinned to its version"));
+            }
             for byte in verified.head {
                 self.report.trace = mix(self.report.trace, u64::from(byte));
             }

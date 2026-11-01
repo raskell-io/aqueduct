@@ -8,7 +8,7 @@
 //! use aqueduct_core::{Entry, Payload};
 //!
 //! let entries = [
-//!     Entry::Started { workflow: "orders".into(), input: Payload::new(*b"in"), budget_tokens: None },
+//!     Entry::Started { workflow: "orders".into(), input: Payload::new(*b"in"), budget_tokens: None, version: None },
 //!     Entry::RunCompleted { output: Payload::new(*b"out") },
 //! ];
 //! let mut chain = ChainWriter::new("orders:42");
@@ -62,6 +62,8 @@ mod kind {
     pub const BUDGET_APPROVED: u8 = 21;
     pub const STARTED_WITH_BUDGET: u8 = 22;
     pub const AGENT_ANSWER_ESCALATED: u8 = 23;
+    pub const STARTED_VERSION: u8 = 24;
+    pub const STARTED_VERSION_WITH_BUDGET: u8 = 25;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -141,12 +143,24 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
     let kind = match entry {
         Entry::Started {
             budget_tokens: None,
+            version: None,
             ..
         } => kind::STARTED,
         Entry::Started {
             budget_tokens: Some(_),
+            version: None,
             ..
         } => kind::STARTED_WITH_BUDGET,
+        Entry::Started {
+            budget_tokens: None,
+            version: Some(_),
+            ..
+        } => kind::STARTED_VERSION,
+        Entry::Started {
+            budget_tokens: Some(_),
+            version: Some(_),
+            ..
+        } => kind::STARTED_VERSION_WITH_BUDGET,
         Entry::StepScheduled { .. } => kind::STEP_SCHEDULED,
         Entry::StepCompleted { .. } => kind::STEP_COMPLETED,
         Entry::StepFailed { .. } => kind::STEP_FAILED,
@@ -176,9 +190,13 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             workflow,
             input,
             budget_tokens,
+            version,
         } => {
             put_bytes(&mut out, workflow.as_bytes());
             put_bytes(&mut out, input.as_bytes());
+            if let Some(version) = version {
+                put_bytes(&mut out, version.as_bytes());
+            }
             if let Some(tokens) = budget_tokens {
                 put_varint(&mut out, *tokens);
             }
@@ -316,12 +334,35 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
             workflow: reader.string()?,
             input: reader.payload()?,
             budget_tokens: None,
+            version: None,
         },
         kind::STARTED_WITH_BUDGET => Entry::Started {
             workflow: reader.string()?,
             input: reader.payload()?,
             budget_tokens: Some(reader.varint()?),
+            version: None,
         },
+        kind::STARTED_VERSION => {
+            let workflow = reader.string()?;
+            let input = reader.payload()?;
+            Entry::Started {
+                workflow,
+                input,
+                version: Some(reader.string()?),
+                budget_tokens: None,
+            }
+        }
+        kind::STARTED_VERSION_WITH_BUDGET => {
+            let workflow = reader.string()?;
+            let input = reader.payload()?;
+            let version = Some(reader.string()?);
+            Entry::Started {
+                workflow,
+                input,
+                version,
+                budget_tokens: Some(reader.varint()?),
+            }
+        }
         kind::STEP_SCHEDULED => Entry::StepScheduled {
             cmd: reader.cmd()?,
             name: reader.string()?,

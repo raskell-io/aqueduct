@@ -28,6 +28,9 @@ use crate::disk::SimDisk;
 
 /// The single workflow the simulated workload runs.
 pub(crate) const WORKFLOW: &str = "pipeline";
+/// The version every simulated run is pinned to, so starts are journaled pinned (ADR 0029) and crash
+/// recovery is checked with them.
+pub(crate) const VERSION: &str = "sim-v1";
 
 /// A simulated state store. Saves are atomic and survive crashes, like a committed redb transaction.
 #[derive(Clone, Debug, Default)]
@@ -77,7 +80,10 @@ impl Node {
         decider: Arc<dyn Decider + Send + Sync>,
     ) -> Result<Self, String> {
         let mut deciders = Deciders::new();
-        deciders.insert(WORKFLOW, decider);
+        deciders.insert_version(WORKFLOW, VERSION, decider);
+        deciders
+            .activate(WORKFLOW, VERSION)
+            .map_err(|e| e.to_string())?;
         let mut partition = Partition::load_with_state(disk, SimState::default(), deciders.clone())
             .map_err(|e| e.to_string())?;
         partition.inject_ack_before_sync(ack_before_sync);

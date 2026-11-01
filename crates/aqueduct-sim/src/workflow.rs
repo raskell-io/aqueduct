@@ -321,8 +321,12 @@ pub fn reference(
     workload: &Workload,
     input: &Payload,
 ) -> Result<(Status, Option<Payload>, Option<String>), String> {
-    let first =
-        aqueduct_core::start_with_budget(crate::node::WORKFLOW, input.clone(), run_budget(input));
+    let first = aqueduct_core::start_version(
+        crate::node::WORKFLOW,
+        input.clone(),
+        run_budget(input),
+        Some(crate::node::VERSION.to_owned()),
+    );
     let mut state = RunState::from_journal(&first.entries).map_err(|e| e.to_string())?;
     let mut work = first.effects;
     let mut signalled = false;
@@ -345,7 +349,12 @@ pub fn reference(
                 let left = state
                     .budget()
                     .map(|budget| budget.saturating_sub(state.tokens_used()));
-                let next = aqueduct_core::start_with_budget(crate::node::WORKFLOW, input, left);
+                let next = aqueduct_core::start_version(
+                    crate::node::WORKFLOW,
+                    input,
+                    left,
+                    Some(crate::node::VERSION.to_owned()),
+                );
                 state = RunState::from_journal(&next.entries).map_err(|e| e.to_string())?;
                 work = next.effects;
                 continue;
