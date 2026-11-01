@@ -309,3 +309,182 @@ def run(claim):
     drop(engine);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Answers agent calls from a list, as a recorded model did.
+struct Recorded(Vec<&'static str>);
+impl aqueduct_engine::AgentExecutor for Recorded {
+    fn call(&self, call: &aqueduct_engine::AgentCall<'_>) -> aqueduct_engine::AgentAttempt {
+        let input: serde_json::Value = serde_json::from_slice(call.request.as_bytes()).unwrap();
+        let i = input["input"].as_u64().unwrap() as usize;
+        aqueduct_engine::AgentAttempt::Completed(aqueduct_core::AgentResponse {
+            model: "test/old".into(),
+            params: Payload::new(*b"{}"),
+            response: Payload::new(self.0[i].as_bytes().to_vec()),
+            input_tokens: 5,
+            output_tokens: 5,
+        })
+    }
+}
+
+/// An OpenAI-compatible endpoint that answers each request from a list, in order.
+fn endpoint(
+    answers: Vec<&'static str>,
+) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for answer in answers {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            seen.push(serde_json::from_slice(&body).unwrap());
+            let reply = serde_json::json!({
+                "model": "llama-next",
+                "choices": [{"message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 2}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        seen
+    });
+    (url, handle)
+}
+
+#[test]
+fn agent_calls_are_replayed_against_a_new_model() {
+    let source = r#"
+def run(docs):
+    labels = []
+    for i in range(docs):
+        labels.append(agent("classify", i, prompt = "classify.md",
+                            output_schema = {"enum": ["invoice", "receipt"]}, budget_tokens = 400))
+    return labels
+"#;
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-drift-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_str().unwrap();
+    {
+        let engine = Engine::builder(&dir)
+            .workflow(
+                "label",
+                Arc::new(Procedure::compile("label.star", source).unwrap()),
+            )
+            .agent_executor(Arc::new(Recorded(vec![
+                "\"invoice\"",
+                "\"receipt\"",
+                "\"invoice\"",
+            ])))
+            .open()
+            .unwrap();
+        engine
+            .start("batch-1", "label", Payload::new(*b"3"))
+            .unwrap();
+        engine.wait("batch-1", Duration::from_secs(10)).unwrap();
+    }
+    let prompts = dir.join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(prompts.join("classify.md"), "Invoice or receipt?").unwrap();
+
+    assert!(
+        cli(&["drift", path, "--model", "ollama/llama-next"])
+            .unwrap_err()
+            .contains("--max-tokens")
+    );
+    assert!(
+        cli(&[
+            "drift",
+            path,
+            "nope",
+            "--model",
+            "x/y",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--max-tokens",
+            "1"
+        ])
+        .unwrap_err()
+        .contains("no run `nope`")
+    );
+
+    // The new model agrees on the first call, disagrees on the second, and breaks the schema on the third.
+    let (url, server) = endpoint(vec!["\"invoice\"", "\"invoice\"", "\"memo\""]);
+    let report = cli(&[
+        "drift",
+        path,
+        "batch-1",
+        "--model",
+        "ollama/llama-next",
+        "--base-url",
+        &url,
+        "--prompts",
+        prompts.to_str().unwrap(),
+        "--max-tokens",
+        "1200",
+    ])
+    .unwrap();
+    let lines: Vec<&str> = report.lines().collect();
+    assert!(
+        lines[0].starts_with("batch-1#0  classify  same  recorded by test/old"),
+        "{report}"
+    );
+    assert!(
+        lines[1].starts_with("batch-1#1  classify  changed")
+            && lines[1].contains("\"receipt\" -> \"invoice\" (ollama/llama-next)"),
+        "{report}"
+    );
+    assert!(
+        lines[2].starts_with("batch-1#2  classify  invalid  "),
+        "{report}"
+    );
+    assert_eq!(
+        lines[3],
+        "3 agent calls: 1 same, 1 changed, 0 new, 1 invalid, 0 failed, 0 skipped; 126 tokens used"
+    );
+    let sent = server.join().unwrap();
+    let prompt = sent[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(prompt.starts_with("Invoice or receipt?"), "{prompt}");
+
+    // The token cap is never exceeded: only two calls of 400 fit in 1000.
+    let (url, server) = endpoint(vec!["\"invoice\"", "\"receipt\""]);
+    let capped = cli(&[
+        "drift",
+        path,
+        "--model",
+        "ollama/llama-next",
+        "--base-url",
+        &url,
+        "--max-tokens",
+        "1000",
+    ])
+    .unwrap();
+    assert!(
+        capped.contains("2 same, 0 changed, 0 new, 0 invalid, 0 failed, 1 skipped"),
+        "{capped}"
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
+
+    // A replay writes nothing: the journal is as it was.
+    assert!(cli(&["verify", path]).unwrap().contains("batch-1"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -7,7 +7,13 @@
 
 use std::path::Path;
 
+use aqueduct_ai::anthropic::Anthropic;
+use aqueduct_ai::openai::OpenAiCompatible;
+use aqueduct_ai::{AiExecutor, Model};
 use aqueduct_core::{CommandKind, Decider, Entry, Event, Payload, RunState, StepOutcome};
+use aqueduct_engine::drift::{
+    DriftOptions, DriftReport, Recorded, Replayed, Verdict, agent_calls, replay_agent_calls,
+};
 use aqueduct_engine::{Deciders, Partition};
 use aqueduct_procedure::Procedure;
 use aqueduct_storage::{FileLog, FileLogOptions, RedbStateStore};
@@ -21,6 +27,9 @@ commands:
   verify <dir>                        verify every run's hash chain and print its head
   export <dir> <key>                  a run's journal as JSON Lines (one object per entry)
   replay <dir> <key> <procedure.star> replay a run against a procedure and report divergence
+  drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
+                                      ask past runs' agent calls again, live, with a model, and
+                                      compare the answers with the recorded ones (model-drift replay)
   signal <dir> <key> <name> <json> [<id>]
                                       send a signal; with an id, sending it again records it once
   complete-awakeable <dir> <id> <json>
@@ -28,6 +37,16 @@ commands:
   cancel <dir> <key> [<reason>]       ask a run to stop: what it waits for fails as cancelled
   escalations <dir>                   open escalations: id, reason, payload
   resolve <dir> <id> <json>           resolve an escalation; the run continues with the payload
+
+drift options:
+  --model anthropic/<model>           the Claude API (ANTHROPIC_API_KEY)
+  --model ollama/<model>              Ollama at http://localhost:11434/v1
+  --model <provider>/<model>          any OpenAI-compatible endpoint (--base-url; key from <PROVIDER>_API_KEY)
+  --base-url <url>                    the provider's base URL
+  --max-tokens <n>                    the most tokens the replay may spend (required: calls cost money)
+  --max-calls <n>                     the most calls to make
+  --prompts <dir>                     read each call's prompt from <dir>/<prompt name> when that file exists
+  --system <file>                     a system prompt for every call
 
 Signals, completions, cancellations and resolutions are durable when the command returns; the run continues when the engine
 next opens the directory.
@@ -51,6 +70,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
             arg(2, "run key")?,
             Path::new(arg(3, "procedure file")?),
         ),
+        Some("drift") => drift(Path::new(arg(1, "data directory")?), &args[2..]),
         Some("signal") => signal(
             Path::new(arg(1, "data directory")?),
             arg(2, "run key")?,
@@ -320,11 +340,185 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
     ))
 }
 
+/// Model-drift replay (ADR 0027): every recorded agent call of the chosen runs, asked again.
+fn drift(dir: &Path, args: &[String]) -> Result<String, String> {
+    let mut keys: Vec<&str> = Vec::new();
+    let (mut model, mut base_url, mut prompts, mut system) = (None, None, None, None);
+    let mut options = DriftOptions::default();
+    let mut max_tokens = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let mut value = |flag: &str| {
+            rest.next()
+                .map(String::as_str)
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        let number = |flag: &str, text: &str| {
+            text.parse::<u64>()
+                .map_err(|_| format!("{flag} needs a number, not `{text}`"))
+        };
+        match arg.as_str() {
+            "--model" => model = Some(value("--model")?),
+            "--base-url" => base_url = Some(value("--base-url")?),
+            "--prompts" => prompts = Some(Path::new(value("--prompts")?)),
+            "--system" => system = Some(Path::new(value("--system")?)),
+            "--max-tokens" => max_tokens = Some(number("--max-tokens", value("--max-tokens")?)?),
+            "--max-calls" => {
+                let calls = number("--max-calls", value("--max-calls")?)?;
+                options.max_calls = Some(usize::try_from(calls).unwrap_or(usize::MAX));
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
+            key => keys.push(key),
+        }
+    }
+    let model = model.ok_or("drift needs --model <provider>/<model>")?;
+    options.max_tokens = Some(max_tokens.ok_or(
+        "drift needs --max-tokens: the calls are made live and cost tokens; this caps what the replay may spend",
+    )?);
+
+    let partition = load(dir)?;
+    let mut calls = Vec::new();
+    for (run_id, run) in partition.runs() {
+        let key = aqueduct_core::split_run_id(run_id).0;
+        if keys.is_empty() || keys.contains(&key) {
+            calls.extend(agent_calls(run_id, run.journal()));
+        }
+    }
+    for key in &keys {
+        if !partition
+            .runs()
+            .keys()
+            .any(|id| aqueduct_core::split_run_id(id).0 == *key)
+        {
+            return Err(format!("no run `{key}`"));
+        }
+    }
+
+    let mut executor = AiExecutor::new(adapter(model, base_url)?);
+    if let Some(path) = system {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        executor = executor.system(&text);
+    }
+    if let Some(dir) = prompts {
+        for call in &calls {
+            let request: serde_json::Value =
+                serde_json::from_slice(call.request.as_bytes()).unwrap_or_default();
+            let Some(name) = request.get("prompt").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+                executor = executor.prompt(name, &text);
+            }
+        }
+    }
+    let report = replay_agent_calls(calls, &executor, &options);
+    Ok(drift_report(&report))
+}
+
+/// The model adapter for `<provider>/<model>`.
+fn adapter(spec: &str, base_url: Option<&str>) -> Result<std::sync::Arc<dyn Model>, String> {
+    let (provider, model) = spec
+        .split_once('/')
+        .filter(|(p, m)| !p.is_empty() && !m.is_empty())
+        .ok_or_else(|| format!("`{spec}` is not <provider>/<model>"))?;
+    if provider == "anthropic" {
+        let mut claude = Anthropic::from_env(model).map_err(|e| e.to_string())?;
+        if let Some(url) = base_url {
+            claude = claude.base_url(url);
+        }
+        return Ok(std::sync::Arc::new(claude));
+    }
+    let url = match (provider, base_url) {
+        (_, Some(url)) => url,
+        ("ollama", None) => "http://localhost:11434/v1",
+        (_, None) => return Err(format!("--model {spec} needs --base-url")),
+    };
+    let mut endpoint = OpenAiCompatible::new(url, model)
+        .map_err(|e| e.to_string())?
+        .provider(provider);
+    let variable = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
+    if let Ok(key) = std::env::var(&variable) {
+        endpoint = endpoint.api_key(&key);
+    }
+    Ok(std::sync::Arc::new(endpoint))
+}
+
+fn drift_report(report: &DriftReport) -> String {
+    let mut out = String::new();
+    for drift in &report.calls {
+        let call = &drift.call;
+        let recorded_model = match &call.recorded {
+            Recorded::Answer(response) => response.model.as_str(),
+            Recorded::Supplied(_) => "(supplied)",
+            Recorded::Failed(_) => "(failed)",
+            Recorded::Pending => "(none)",
+        };
+        let detail = match &drift.replayed {
+            Replayed::Answer {
+                schema_error: Some(why),
+                response,
+            } => format!("{}: {why}", short(&response.response)),
+            Replayed::Answer { response, .. } => match call.recorded.answer() {
+                Some(recorded) if drift.verdict() == Verdict::Changed => format!(
+                    "{} -> {} ({})",
+                    short(recorded),
+                    short(&response.response),
+                    response.model
+                ),
+                _ => format!("{} ({})", short(&response.response), response.model),
+            },
+            Replayed::Failed(why) | Replayed::Skipped(why) => why.clone(),
+        };
+        // One line per call: multi-line errors (schema errors list every violation) are folded.
+        let detail = detail
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!(
+            "{}  {}  {}  recorded by {recorded_model}  {detail}\n",
+            aqueduct_core::awakeable_id(&call.run, call.cmd),
+            call.name,
+            drift.verdict().as_str(),
+        ));
+    }
+    let counts: Vec<String> = [
+        Verdict::Same,
+        Verdict::Changed,
+        Verdict::New,
+        Verdict::Invalid,
+        Verdict::Failed,
+        Verdict::Skipped,
+    ]
+    .into_iter()
+    .map(|v| format!("{} {}", report.count(v), v.as_str()))
+    .collect();
+    out.push_str(&format!(
+        "{} agent calls: {}; {} tokens used\n",
+        report.calls.len(),
+        counts.join(", "),
+        report.tokens_used()
+    ));
+    out
+}
+
+/// A payload for a one-line report: its text, cut at 60 characters.
+fn short(payload: &Payload) -> String {
+    let text = text(payload);
+    match text.char_indices().nth(60) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text,
+    }
+}
+
 /// Entries the run's logic writes (commands and its end), as opposed to completions from outside.
 fn starts_commands(entry: &Entry) -> bool {
     matches!(
         entry,
         Entry::StepScheduled { .. }
+            | Entry::AgentCallScheduled { .. }
+            | Entry::AgentCallEscalated { .. }
             | Entry::TimerStarted { .. }
             | Entry::SignalAwaited { .. }
             | Entry::RunCompleted { .. }

@@ -133,6 +133,7 @@ dependencies = [
 name = "aqueduct-cli"
 version = "0.0.0"
 dependencies = [
+ "aqueduct-ai",
  "aqueduct-codec",
  "aqueduct-core",
  "aqueduct-engine",

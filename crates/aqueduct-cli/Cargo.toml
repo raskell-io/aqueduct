@@ -18,6 +18,7 @@ name = "aqueduct"
 path = "src/main.rs"
 
 [dependencies]
+aqueduct-ai.workspace = true
 aqueduct-codec.workspace = true
 aqueduct-core.workspace = true
 aqueduct-engine.workspace = true
