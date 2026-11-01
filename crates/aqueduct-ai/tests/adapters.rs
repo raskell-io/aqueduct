@@ -261,10 +261,11 @@ fn a_workflow_calls_claude_through_the_engine() {
         };
         ctx.agent("classify", &doc, &options).await
     }
-    let (url, seen) = server(vec![(
-        200,
-        message("claude-opus-5-5", "end_turn", "\"invoice\""),
-    )]);
+    // The first answer is off schema, and the engine retries the call; the second is right.
+    let (url, seen) = server(vec![
+        (200, message("claude-opus-5-5", "end_turn", "\"poem\"")),
+        (200, message("claude-opus-5-5", "end_turn", "\"invoice\"")),
+    ]);
     let agents = AiExecutor::new(Arc::new(
         Anthropic::new("k", "claude-opus-5-5")
             .unwrap()
@@ -298,6 +299,7 @@ fn a_workflow_calls_claude_through_the_engine() {
         prompt.starts_with("Is this an invoice or a receipt?"),
         "{prompt}"
     );
+    assert_eq!(seen.lock().unwrap().len(), 2);
     drop(engine);
     std::fs::remove_dir_all(&dir).unwrap();
 }
