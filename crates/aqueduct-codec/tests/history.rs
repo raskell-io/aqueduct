@@ -25,6 +25,7 @@ fn entry() -> impl Strategy<Value = Entry> {
         (cmd.clone(), payload()).prop_map(|(cmd, result)| Entry::StepCompleted { cmd, result }),
         (cmd, ".{0,12}").prop_map(|(cmd, error)| Entry::StepFailed { cmd, error }),
         payload().prop_map(|output| Entry::RunCompleted { output }),
+        payload().prop_map(|input| Entry::ContinuedAsNew { input }),
         ".{0,12}".prop_map(|error| Entry::RunFailed { error }),
         ".{0,12}".prop_map(|reason| Entry::Parked { reason }),
         ".{0,12}".prop_map(|reason| Entry::CancelRequested { reason }),

@@ -53,6 +53,9 @@ pub struct Bugs {
     /// After recovery, forget which runs have records after the checkpoint, so the next checkpoint
     /// skips them while moving past their log records.
     pub checkpoint_forgets_recovered_runs: bool,
+    /// On recovery, do not restart the successor of a run that continued as new when a crash tore its
+    /// start off the log.
+    pub skip_successor_repair: bool,
 }
 
 /// Parameters of a simulated world. Probabilities are in parts per million.

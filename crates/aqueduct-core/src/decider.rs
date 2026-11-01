@@ -47,6 +47,12 @@ pub enum Command {
         /// The run's output.
         output: Payload,
     },
+    /// End the run and start a new run of the same workflow under the same key with `input`
+    /// (continue-as-new): a long-lived process keeps its journal short. Must be the last command.
+    ContinueAsNew {
+        /// The next run's input.
+        input: Payload,
+    },
     /// Fail the run. Must be the last command.
     FailRun {
         /// A description of the failure.

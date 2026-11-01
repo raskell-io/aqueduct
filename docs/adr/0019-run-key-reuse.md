@@ -1,6 +1,6 @@
 # 0019: Run key reuse: return existing or reject now; new runs under a used key later
 
-- **Status:** accepted (the third policy is proposed)
+- **Status:** accepted; the third policy is implemented by ADR 0022
 - **Date:** 2026-10-31
 
 ## Context
@@ -20,7 +20,7 @@ mistake got someone else's result without an error.
   `ReturnExisting` is the right policy for that.
 - Both apply to finished runs that have left memory: the partition looks them up in the checkpoint.
 
-## Proposed: `AllowAfterCompletion`
+## Proposed: `AllowAfterCompletion` (implemented, with refinements, in ADR 0022)
 
 Starting a key whose run has ended would start a new run under the same key. Today a key names exactly
 one run: the hash chain's genesis, the log records, the checkpoint, every API (`wait`, `signal`, `cancel`,

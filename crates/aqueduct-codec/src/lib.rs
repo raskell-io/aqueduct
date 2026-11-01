@@ -55,6 +55,7 @@ mod kind {
     pub const CANCEL_REQUESTED: u8 = 14;
     pub const ESCALATED: u8 = 15;
     pub const ESCALATION_RESOLVED: u8 = 16;
+    pub const CONTINUED_AS_NEW: u8 = 17;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -148,6 +149,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::CancelRequested { .. } => kind::CANCEL_REQUESTED,
         Entry::Escalated { .. } => kind::ESCALATED,
         Entry::EscalationResolved { .. } => kind::ESCALATION_RESOLVED,
+        Entry::ContinuedAsNew { .. } => kind::CONTINUED_AS_NEW,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -170,6 +172,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_bytes(&mut out, error.as_bytes());
         }
         Entry::RunCompleted { output } => put_bytes(&mut out, output.as_bytes()),
+        Entry::ContinuedAsNew { input } => put_bytes(&mut out, input.as_bytes()),
         Entry::RunFailed { error } => put_bytes(&mut out, error.as_bytes()),
         Entry::Parked { reason } | Entry::CancelRequested { reason } => {
             put_bytes(&mut out, reason.as_bytes());
@@ -305,6 +308,9 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         kind::ESCALATION_RESOLVED => Entry::EscalationResolved {
             cmd: reader.cmd()?,
             outcome: reader.payload()?,
+        },
+        kind::CONTINUED_AS_NEW => Entry::ContinuedAsNew {
+            input: reader.payload()?,
         },
         kind::CANCEL_REQUESTED => Entry::CancelRequested {
             reason: reader.string()?,
