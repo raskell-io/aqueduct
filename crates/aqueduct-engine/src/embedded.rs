@@ -127,6 +127,9 @@ pub enum EngineError {
     /// A run with this key exists with another workflow or input.
     #[error("run `{0}` exists with another workflow or input")]
     KeyConflict(String),
+    /// Run keys must not be empty or contain NUL.
+    #[error("invalid run key {0:?}")]
+    InvalidKey(String),
     /// A run with this key exists, and the start used [`ReusePolicy::Reject`].
     #[error("run `{0}` already exists")]
     AlreadyStarted(String),
@@ -352,6 +355,7 @@ impl Engine {
             name: name.to_owned(),
             id: id.to_owned(),
             payload,
+            exact: false,
             reply,
         })?;
         answer.recv().map_err(|_| self.stopped())?
@@ -395,9 +399,20 @@ impl Engine {
     /// Completes an awakeable with a payload, given the id the workflow handed out. Returns once the
     /// completion is durable; completing it again records the first payload only.
     pub fn complete_awakeable(&self, id: &str, payload: Payload) -> Result<(), EngineError> {
-        let (key, name) = aqueduct_core::parse_awakeable_id(id)
+        let (run, name) = aqueduct_core::parse_awakeable_id(id)
             .ok_or_else(|| EngineError::InvalidAwakeable(id.to_owned()))?;
-        self.signal(key, &name, id, payload)
+        let (reply, answer) = mpsc::channel();
+        // The id names an exact run: a completion for an earlier generation of the key never reaches
+        // a later one.
+        self.send(Request::Signal {
+            key: run,
+            name,
+            id: id.to_owned(),
+            payload,
+            exact: true,
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
     }
 
     /// Waits until a run has finished and its end is durable.
@@ -471,6 +486,8 @@ enum Request {
         name: String,
         id: String,
         payload: Payload,
+        /// `key` is a run id naming an exact run, not a key (whose latest run is meant).
+        exact: bool,
         reply: Sender<Result<(), EngineError>>,
     },
     Cancel {
@@ -593,15 +610,23 @@ impl Processor {
                 Err(PartitionError::AlreadyStarted(key)) => {
                     let _ = reply.send(Err(EngineError::AlreadyStarted(key)));
                 }
+                Err(PartitionError::InvalidKey(key)) => {
+                    let _ = reply.send(Err(EngineError::InvalidKey(key)));
+                }
                 Err(error) => return Err(error.to_string()),
             },
             Request::Wait { key, reply } => {
-                if self.partition.run(&key).is_some() {
+                // The key's latest run; one that continues as new is followed to its successor.
+                let Some(id) = self.partition.latest(&key).map_err(|e| e.to_string())? else {
+                    let _ = reply.send(Err(EngineError::UnknownRun(key)));
+                    return Ok(true);
+                };
+                if self.partition.run(&id).is_some() {
                     // Answered after the next flush, once the run's end is durable.
-                    self.waiters.entry(key).or_default().push(reply);
+                    self.waiters.entry(id).or_default().push(reply);
                 } else {
-                    // Not in memory: an unloaded finished run (durable in a checkpoint), or no run.
-                    let answer = match self.partition.lookup(&key).map_err(|e| e.to_string())? {
+                    // Not in memory: an unloaded finished run (durable in a checkpoint).
+                    let answer = match self.partition.lookup_run(&id).map_err(|e| e.to_string())? {
                         Some(state) => Ok(RunResult {
                             status: state.status(),
                             output: state.output().cloned(),
@@ -617,8 +642,13 @@ impl Processor {
                 name,
                 id,
                 payload,
+                exact,
                 reply,
-            } => match self.partition.signal(&key, &name, &id, payload) {
+            } => match if exact {
+                self.partition.signal_run(&key, &name, &id, payload)
+            } else {
+                self.partition.signal(&key, &name, &id, payload)
+            } {
                 Ok(()) => self.signals.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownRun(key)) => {
                     let _ = reply.send(Err(EngineError::UnknownRun(key)));
@@ -734,6 +764,28 @@ impl Processor {
     /// Called right after a flush, when everything in memory is durable: answers waiters whose runs
     /// have ended.
     fn answer_waiters(&mut self) {
+        // Waiters of a run that continued as new wait for its successor (perhaps continued again).
+        loop {
+            let continued: Vec<String> = self
+                .waiters
+                .keys()
+                .filter(|id| {
+                    self.partition
+                        .run(id)
+                        .is_some_and(|run| run.state().status() == Status::Continued)
+                })
+                .cloned()
+                .collect();
+            if continued.is_empty() {
+                break;
+            }
+            for id in continued {
+                let (key, generation) = aqueduct_core::split_run_id(&id);
+                let next = aqueduct_core::run_id(key, generation + 1);
+                let replies = self.waiters.remove(&id).unwrap_or_default();
+                self.waiters.entry(next).or_default().extend(replies);
+            }
+        }
         let finished: Vec<String> = self
             .waiters
             .keys()

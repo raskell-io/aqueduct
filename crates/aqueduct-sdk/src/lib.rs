@@ -68,6 +68,10 @@ pub enum WorkflowError {
     /// issue calls afterwards, for example to undo its work with a [`Saga`].
     #[error("cancelled: {0}")]
     Cancelled(String),
+    /// Not an error: the workflow asked to continue as a new run with this input (JSON). Created by
+    /// [`WorkflowContext::continue_as_new`] and returned from the workflow.
+    #[error("continued as new")]
+    ContinueAsNew(Payload),
 }
 
 impl WorkflowError {
@@ -309,6 +313,17 @@ impl WorkflowContext {
                 .map_err(|e| WorkflowError::Payload(e.to_string())),
             StepOutcome::Failed(error) => Err(WorkflowError::Failed(error)),
         })
+    }
+
+    /// Ends this run and starts a new run of the same workflow under the same key with `input`: return
+    /// it from the workflow (`return Err(ctx.continue_as_new(&next))`). A long-lived process (a loop
+    /// over days, a subscription, a poller) keeps each run's journal short this way. `Engine::wait` on
+    /// the key waits for the last run of the chain.
+    pub fn continue_as_new<I: Serialize + ?Sized>(&self, input: &I) -> WorkflowError {
+        match serde_json::to_vec(input) {
+            Ok(input) => WorkflowError::ContinueAsNew(Payload::new(input)),
+            Err(e) => WorkflowError::Payload(e.to_string()),
+        }
     }
 
     /// Starts a [`Saga`]: steps with compensations.
@@ -748,6 +763,9 @@ where
                 commands.push(Command::Park {
                     reason: format!("a payload does not match its type: {e}"),
                 });
+            }
+            Poll::Ready(Err(WorkflowError::ContinueAsNew(input))) => {
+                commands.push(Command::ContinueAsNew { input });
             }
             Poll::Ready(Err(error)) => commands.push(Command::FailRun {
                 error: error.to_string(),

@@ -14,6 +14,8 @@ pub enum Status {
     Failed,
     /// The run's logic diverged from its journal; an operator must intervene.
     Parked,
+    /// The run ended and a new run of the same key continues it (continue-as-new).
+    Continued,
 }
 
 impl Status {
@@ -160,6 +162,11 @@ pub enum Effect {
     },
     /// The run reached a terminal status.
     Finished(Status),
+    /// Start the key's next run with the same workflow and this input (the run continued as new).
+    ContinueAsNew {
+        /// The next run's input.
+        input: Payload,
+    },
 }
 
 /// The result of handling an event: entries to append to the journal, then effects to perform after
@@ -255,6 +262,8 @@ pub struct RunState {
     entries: usize,
     /// The cancellation's reason, once one is recorded.
     cancel: Option<String>,
+    /// The next run's input, if the run continued as new.
+    continued_with: Option<Payload>,
     /// A cancellation found no pending command; the next waiting command takes it.
     pending_cancel: bool,
 }
@@ -278,6 +287,7 @@ impl RunState {
             error: None,
             entries: 1,
             cancel: None,
+            continued_with: None,
             pending_cancel: false,
         };
         for entry in rest {
@@ -420,6 +430,10 @@ impl RunState {
             Entry::RunCompleted { output } => {
                 self.status = Status::Completed;
                 self.output = Some(output.clone());
+            }
+            Entry::ContinuedAsNew { input } => {
+                self.status = Status::Continued;
+                self.continued_with = Some(input.clone());
             }
             Entry::RunFailed { error } => {
                 self.status = Status::Failed;
@@ -588,6 +602,11 @@ impl RunState {
             .filter(|(step, _)| step.kind == CommandKind::Escalation && step.outcome.is_none())
             .map(|(step, index)| (CommandIndex(index), step.name.as_str(), &step.input))
             .collect()
+    }
+
+    /// The next run's input, if the run continued as new.
+    pub fn continued_with(&self) -> Option<&Payload> {
+        self.continued_with.as_ref()
     }
 
     /// The cancellation's reason, if the run was cancelled.
@@ -976,7 +995,10 @@ impl RunState {
                 | Command::AwaitSignal { .. }
                 | Command::Record { .. }
                 | Command::Escalate { .. } => {}
-                Command::CompleteRun { .. } | Command::FailRun { .. } | Command::Park { .. }
+                Command::CompleteRun { .. }
+                | Command::FailRun { .. }
+                | Command::Park { .. }
+                | Command::ContinueAsNew { .. }
                     if position + 1 != total =>
                 {
                     return Transition::park(format!(
@@ -992,6 +1014,16 @@ impl RunState {
                 }
                 Command::Park { reason } => {
                     return Transition::park(reason);
+                }
+                Command::ContinueAsNew { input } => {
+                    if steps_seen < known {
+                        break;
+                    }
+                    transition.entries.push(Entry::ContinuedAsNew {
+                        input: input.clone(),
+                    });
+                    transition.effects.push(Effect::Finished(Status::Continued));
+                    transition.effects.push(Effect::ContinueAsNew { input });
                 }
                 Command::FailRun { error } => {
                     if steps_seen < known {

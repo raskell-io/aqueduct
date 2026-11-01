@@ -17,7 +17,7 @@ use std::sync::Arc;
 use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
 use aqueduct_core::{
     CommandIndex, Decider, Effect, Entry, Env, Event, Payload, RunState, Status, StepOutcome,
-    Transition, start,
+    Transition, run_id, split_run_id, start, valid_key,
 };
 use aqueduct_storage::{LogStore, NoStateStore, StateStore, StorageError};
 
@@ -196,6 +196,9 @@ pub enum PartitionError {
     /// A run with this key exists, and the start's policy is [`ReusePolicy::Reject`].
     #[error("run `{0}` already exists")]
     AlreadyStarted(String),
+    /// Run keys must not be empty or contain NUL.
+    #[error("invalid run key {0:?}")]
+    InvalidKey(String),
 }
 
 /// What starting a key that already has a run does (BRIEF.md section 5.3).
@@ -208,6 +211,10 @@ pub enum ReusePolicy {
     /// Fail with [`PartitionError::AlreadyStarted`] whenever the key has a run. A caller that retries
     /// its own start after a timeout then cannot tell whether its first attempt succeeded.
     Reject,
+    /// Start a new run (the key's next generation) if the key's latest run has ended; while it is
+    /// running, behave as [`ReusePolicy::ReturnExisting`]. A retried start after the run ended starts
+    /// yet another run, so retries should use `ReturnExisting`.
+    AllowAfterCompletion,
 }
 
 /// A partition processor over a log store.
@@ -235,6 +242,7 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     /// Each run's entries in `timers`, to update the index when a run changes.
     run_timers: BTreeMap<String, Vec<(CommandIndex, u64)>>,
     evict_finished: bool,
+    skip_successor_repair: bool,
 }
 
 impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
@@ -334,6 +342,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             timers: BTreeSet::new(),
             run_timers: BTreeMap::new(),
             evict_finished: false,
+            skip_successor_repair: false,
         })
         .map(|mut partition| {
             let keys: Vec<String> = partition.runs.keys().cloned().collect();
@@ -347,12 +356,32 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// Performs the recovery effects of every run: activation and re-dispatch.
     pub fn resume(&mut self) -> Result<(), PartitionError> {
         let keys: Vec<String> = self.runs.keys().cloned().collect();
-        for key in keys {
-            let effects = match self.runs.get(&key) {
+        for key in &keys {
+            let effects = match self.runs.get(key) {
                 Some(run) => run.state.recovery_effects(),
                 None => continue,
             };
-            self.perform(&key, effects)?;
+            self.perform(key, effects)?;
+        }
+        if self.skip_successor_repair {
+            return Ok(());
+        }
+        // A run that continued as new and its successor's start are separate records of one batch: a
+        // crash can keep the first and tear off the second. The successor is fully determined by the
+        // journaled `ContinuedAsNew`, so it is started again.
+        for key in &keys {
+            let Some(run) = self.runs.get(key) else {
+                continue;
+            };
+            let Some(input) = run.state.continued_with().cloned() else {
+                continue;
+            };
+            let workflow = run.state.workflow().to_owned();
+            let (base, generation) = split_run_id(key);
+            let next = run_id(base, generation + 1);
+            if !self.runs.contains_key(&next) && self.lookup_run(&next)?.is_none() {
+                self.create_run(&next, &workflow, input)?;
+            }
         }
         Ok(())
     }
@@ -375,46 +404,111 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         input: Payload,
         policy: ReusePolicy,
     ) -> Result<(), PartitionError> {
-        // A finished run may have been unloaded; it still exists.
-        let existing = match self.runs.get(key) {
-            Some(run) => Some(run.state.workflow() == workflow && *run.state.input() == input),
-            None => self
-                .lookup(key)?
-                .map(|state| state.workflow() == workflow && *state.input() == input),
-        };
-        match (existing, policy) {
-            (Some(_), ReusePolicy::Reject) => {
-                return Err(PartitionError::AlreadyStarted(key.to_owned()));
-            }
-            (Some(false), ReusePolicy::ReturnExisting) => {
-                return Err(PartitionError::KeyConflict(key.to_owned()));
-            }
-            _ => {}
+        if !valid_key(key) {
+            return Err(PartitionError::InvalidKey(key.to_owned()));
         }
-        if existing.is_none() {
+        // A finished run may have been unloaded; it still exists.
+        let next = match self.latest(key)? {
+            None => Some(0),
+            Some(latest) => {
+                let state = self
+                    .lookup_run(&latest)?
+                    .ok_or_else(|| PartitionError::Internal(format!("run {latest:?} vanished")))?;
+                match policy {
+                    ReusePolicy::Reject => {
+                        return Err(PartitionError::AlreadyStarted(key.to_owned()));
+                    }
+                    ReusePolicy::AllowAfterCompletion if state.status().is_terminal() => {
+                        Some(split_run_id(&latest).1 + 1)
+                    }
+                    _ => {
+                        // A retried start: the run its first attempt started heads the latest chain of
+                        // runs (one continued as new is still the same chain).
+                        let head = self.chain_head(&latest)?;
+                        if head.workflow() != workflow || *head.input() != input {
+                            return Err(PartitionError::KeyConflict(key.to_owned()));
+                        }
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(generation) = next {
             if self.deciders.get(workflow).is_none() {
                 return Err(PartitionError::UnknownWorkflow(workflow.to_owned()));
             }
-            let first = start(workflow, input);
-            let state = RunState::from_journal(&first.entries)
-                .map_err(|e| PartitionError::Internal(e.to_string()))?;
-            self.runs.insert(
-                key.to_owned(),
-                PartitionRun {
-                    state,
-                    journal: Vec::new(),
-                    chain: ChainWriter::new(key),
-                },
-            );
-            for entry in &first.entries {
-                self.log_entry(key, entry)?;
-            }
-            self.perform(key, first.effects)?;
+            self.create_run(&run_id(key, generation), workflow, input)?;
         }
         self.send(Outbound::Started {
             key: key.to_owned(),
         });
         Ok(())
+    }
+
+    /// Creates a run with this run id, logs its start and activates it.
+    fn create_run(
+        &mut self,
+        id: &str,
+        workflow: &str,
+        input: Payload,
+    ) -> Result<(), PartitionError> {
+        let first = start(workflow, input);
+        let state = RunState::from_journal(&first.entries)
+            .map_err(|e| PartitionError::Internal(e.to_string()))?;
+        self.runs.insert(
+            id.to_owned(),
+            PartitionRun {
+                state,
+                journal: Vec::new(),
+                chain: ChainWriter::new(id),
+            },
+        );
+        for entry in &first.entries {
+            self.log_entry(id, entry)?;
+        }
+        self.perform(id, first.effects)
+    }
+
+    /// The id of the latest run (highest generation) of `key`, if it has any run.
+    pub fn latest(&mut self, key: &str) -> Result<Option<String>, PartitionError> {
+        let prefix = format!("{key}\0");
+        let mut best: Option<(u32, bool)> = None;
+        for (id, run) in self
+            .runs
+            .range::<str, _>((std::ops::Bound::Included(key), std::ops::Bound::Unbounded))
+            .take_while(|(id, _)| id.as_str() == key || id.starts_with(&prefix))
+        {
+            let generation = split_run_id(id).1;
+            if best.is_none_or(|(b, _)| generation > b) {
+                best = Some((generation, run.state.status().is_terminal()));
+            }
+        }
+        // A running run is always the latest: a new generation starts only after it ends.
+        if let Some((generation, false)) = best {
+            return Ok(Some(run_id(key, generation)));
+        }
+        let saved = self.state.generations(key)?.into_iter().max();
+        let latest = best.map(|(g, _)| g).max(saved);
+        Ok(latest.map(|generation| run_id(key, generation)))
+    }
+
+    /// The first run of the chain of runs (continued as new) that ends with run `id`.
+    fn chain_head(&mut self, id: &str) -> Result<RunState, PartitionError> {
+        let (key, mut generation) = split_run_id(id);
+        let key = key.to_owned();
+        let mut head = self
+            .lookup_run(id)?
+            .ok_or_else(|| PartitionError::Internal(format!("run {id:?} vanished")))?;
+        while generation > 0 {
+            match self.lookup_run(&run_id(&key, generation - 1))? {
+                Some(previous) if previous.status() == Status::Continued => {
+                    head = previous;
+                    generation -= 1;
+                }
+                _ => break,
+            }
+        }
+        Ok(head)
     }
 
     /// Sets the partition's clock (milliseconds since the Unix epoch). New timers wake relative to it,
@@ -442,29 +536,26 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// and the run decides what to do (undo work, then fail). Only the first cancellation counts; later
     /// ones, and cancellations of ended runs, are acknowledged and dropped.
     pub fn cancel(&mut self, key: &str, reason: &str) -> Result<(), PartitionError> {
-        let Some(run) = self.runs.get(key) else {
-            if self.lookup(key)?.is_none() {
-                return Err(PartitionError::UnknownRun(key.to_owned()));
-            }
-            self.send(Outbound::Cancelled {
-                key: key.to_owned(),
-            });
-            return Ok(());
-        };
-        let event = Event::Cancel {
-            reason: reason.to_owned(),
-        };
-        let transition = run.state.handle_at(event, self.now_ms);
-        let effects = self.append(key, transition)?;
-        self.perform(key, effects)?;
+        let id = self
+            .latest(key)?
+            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        if let Some(run) = self.runs.get(&id) {
+            let event = Event::Cancel {
+                reason: reason.to_owned(),
+            };
+            let transition = run.state.handle_at(event, self.now_ms);
+            let effects = self.append(&id, transition)?;
+            self.perform(&id, effects)?;
+        }
         self.send(Outbound::Cancelled {
             key: key.to_owned(),
         });
         Ok(())
     }
 
-    /// Resolves an escalation of a run; the run continues with `outcome`. Only the first resolution
-    /// counts; later ones, and resolutions of ended runs, are acknowledged and dropped.
+    /// Resolves an escalation of the run with run id `key` (an exact run, not the key's latest); the run
+    /// continues with `outcome`. Only the first resolution counts; later ones, and resolutions of ended
+    /// runs, are acknowledged and dropped.
     pub fn resolve_escalation(
         &mut self,
         key: &str,
@@ -472,7 +563,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         outcome: Payload,
     ) -> Result<(), PartitionError> {
         let Some(run) = self.runs.get(key) else {
-            if self.lookup(key)?.is_none() {
+            if self.lookup_run(key)?.is_none() {
                 return Err(PartitionError::UnknownRun(key.to_owned()));
             }
             self.send(Outbound::Resolved {
@@ -516,14 +607,44 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         id: &str,
         payload: Payload,
     ) -> Result<(), PartitionError> {
-        let Some(run) = self.runs.get(key) else {
-            // An unloaded finished run drops the signal, as any finished run does.
-            if self.lookup(key)?.is_none() {
-                return Err(PartitionError::UnknownRun(key.to_owned()));
-            }
-            self.send(Outbound::Signaled {
-                key: key.to_owned(),
-            });
+        let run = self
+            .latest(key)?
+            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        self.deliver_signal(&run, name, id, payload)?;
+        self.send(Outbound::Signaled {
+            key: key.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Sends a signal to the run with this run id: an exact run, not the key's latest (for awakeables,
+    /// whose ids name their run). Acknowledged with the run id.
+    pub fn signal_run(
+        &mut self,
+        run: &str,
+        name: &str,
+        id: &str,
+        payload: Payload,
+    ) -> Result<(), PartitionError> {
+        if !self.runs.contains_key(run) && self.lookup_run(run)?.is_none() {
+            return Err(PartitionError::UnknownRun(run.to_owned()));
+        }
+        self.deliver_signal(run, name, id, payload)?;
+        self.send(Outbound::Signaled {
+            key: run.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Records a signal for a run in memory; a run that is not in memory has ended and drops it.
+    fn deliver_signal(
+        &mut self,
+        run: &str,
+        name: &str,
+        id: &str,
+        payload: Payload,
+    ) -> Result<(), PartitionError> {
+        let Some(state) = self.runs.get(run).map(|r| &r.state) else {
             return Ok(());
         };
         let event = Event::Signal {
@@ -531,13 +652,9 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             id: id.to_owned(),
             payload,
         };
-        let transition = run.state.handle_at(event, self.now_ms);
-        let effects = self.append(key, transition)?;
-        self.perform(key, effects)?;
-        self.send(Outbound::Signaled {
-            key: key.to_owned(),
-        });
-        Ok(())
+        let transition = state.handle_at(event, self.now_ms);
+        let effects = self.append(run, transition)?;
+        self.perform(run, effects)
     }
 
     /// Fires every timer whose wake time is at or before the partition's clock. Timers never fire early.
@@ -576,8 +693,17 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         self.evict();
     }
 
-    /// A run's state, from memory or, for an unloaded finished run, from the state store.
+    /// The state of a key's latest run, from memory or, for an unloaded finished run, from the state
+    /// store.
     pub fn lookup(&mut self, key: &str) -> Result<Option<RunState>, PartitionError> {
+        match self.latest(key)? {
+            Some(id) => self.lookup_run(&id),
+            None => Ok(None),
+        }
+    }
+
+    /// The state of the run with this run id, from memory or the state store.
+    pub fn lookup_run(&mut self, key: &str) -> Result<Option<RunState>, PartitionError> {
         if let Some(run) = self.runs.get(key) {
             return Ok(Some(run.state.clone()));
         }
@@ -841,6 +967,13 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         self.ack_before_sync = enabled;
     }
 
+    /// Testing only: on recovery, do not restart the successor of a run that continued as new when a
+    /// crash tore off its start. A deliberate bug that the simulator must catch.
+    #[doc(hidden)]
+    pub fn inject_skip_successor_repair(&mut self) {
+        self.skip_successor_repair = true;
+    }
+
     /// Testing only: forget which runs changed since the last checkpoint, as if runs recovered from the
     /// log tail were not marked. A deliberate bug that the simulator must catch.
     #[doc(hidden)]
@@ -934,6 +1067,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                         key: key.to_owned(),
                         status,
                     });
+                }
+                Effect::ContinueAsNew { input } => {
+                    let workflow = self
+                        .runs
+                        .get(key)
+                        .map(|run| run.state.workflow().to_owned())
+                        .ok_or_else(|| PartitionError::Internal(format!("run {key} vanished")))?;
+                    let (base, generation) = split_run_id(key);
+                    let next = run_id(base, generation + 1);
+                    self.create_run(&next, &workflow, input)?;
                 }
             }
         }

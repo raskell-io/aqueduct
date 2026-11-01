@@ -69,6 +69,7 @@ mod awakeable;
 mod decider;
 mod journal;
 mod run;
+mod run_id;
 
 pub use awakeable::{
     AWAKEABLE_PREFIX, awakeable_id, awakeable_signal, parse_awakeable_id, parse_command_id,
@@ -79,3 +80,4 @@ pub use run::{
     CommandKind, Effect, Event, JournalError, RunState, ScheduledStep, Status, TIMED_OUT,
     Transition, cancelled_error, start,
 };
+pub use run_id::{run_id, split_run_id, valid_key};
