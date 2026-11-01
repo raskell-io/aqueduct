@@ -147,3 +147,115 @@ fn a_changed_budget_parks_and_cancellation_closes_a_pending_call() {
     );
     assert!(run.handle(result(Ok(answer((1, 1))))).is_empty());
 }
+
+mod budgets {
+    use super::*;
+    use aqueduct_core::BUDGET_ESCALATION;
+
+    fn budgeted(tokens: u64) -> Run {
+        let journal =
+            aqueduct_core::start_with_budget("w", Payload::default(), Some(tokens)).entries;
+        Run {
+            state: RunState::from_journal(&journal).unwrap(),
+            journal,
+        }
+    }
+
+    fn named(name: &str, budget_tokens: u64) -> Command {
+        Command::CallAgent {
+            name: name.into(),
+            request: Payload::new(*b"{}"),
+            budget_tokens,
+        }
+    }
+
+    fn dispatched(effects: &[Effect]) -> Vec<CommandIndex> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::DispatchAgent { cmd, .. } => Some(*cmd),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn calls_that_fit_are_made_and_reserve_their_budget() {
+        let mut run = budgeted(1_000);
+        // Two concurrent calls of 400 fit; a third does not, because the first two are reserved.
+        let effects = run.handle(Event::Decision(vec![
+            named("a", 400),
+            named("b", 400),
+            named("c", 400),
+        ]));
+        assert_eq!(dispatched(&effects), [CommandIndex(0), CommandIndex(1)]);
+        assert!(matches!(
+            run.journal.last(),
+            Some(Entry::AgentCallEscalated {
+                cmd: CommandIndex(2),
+                budget_tokens: 400,
+                available: 200,
+                ..
+            })
+        ));
+        let open = run.state.open_escalations();
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].0, open[0].1), (CommandIndex(2), BUDGET_ESCALATION));
+        assert_eq!(open[0].2.as_bytes(), b"{\"needed\":400,\"available\":200}");
+        assert!(
+            run.state.pending_steps().len() == 2,
+            "the waiting call is not re-dispatched"
+        );
+    }
+
+    #[test]
+    fn approval_raises_the_budget_just_enough_and_makes_the_call() {
+        let mut run = budgeted(300);
+        run.handle(Event::Decision(vec![named("a", 400)]));
+        let effects = run.handle(Event::ResolveEscalation {
+            cmd: CommandIndex(0),
+            outcome: Payload::new(*b"true"),
+        });
+        assert_eq!(dispatched(&effects), [CommandIndex(0)]);
+        assert_eq!(run.state.budget(), Some(400));
+        assert!(run.state.open_escalations().is_empty());
+        // Answers spend from the budget; the next call that does not fit waits again.
+        run.handle(Event::AgentResult {
+            cmd: CommandIndex(0),
+            outcome: Ok(answer((150, 50))),
+        });
+        assert_eq!(run.state.tokens_used(), 200);
+        let effects = run.handle(Event::Decision(vec![named("a", 400), named("b", 300)]));
+        assert!(dispatched(&effects).is_empty());
+        assert!(matches!(
+            run.journal.last(),
+            Some(Entry::AgentCallEscalated {
+                budget_tokens: 300,
+                available: 200,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn declining_fails_the_call() {
+        let mut run = budgeted(100);
+        run.handle(Event::Decision(vec![named("a", 400)]));
+        run.handle(Event::ResolveEscalation {
+            cmd: CommandIndex(0),
+            outcome: Payload::new(*b"false"),
+        });
+        let Some(StepOutcome::Failed(error)) = run.state.view().outcome(CommandIndex(0)) else {
+            panic!("declined budget must fail the call");
+        };
+        assert!(error.contains("not approved"), "{error}");
+        assert_eq!(run.state.budget(), Some(100), "the budget is unchanged");
+    }
+
+    #[test]
+    fn without_a_budget_every_call_is_made() {
+        let mut run = Run::new();
+        let effects = run.handle(Event::Decision(vec![named("a", 1_000_000)]));
+        assert_eq!(dispatched(&effects), [CommandIndex(0)]);
+    }
+}

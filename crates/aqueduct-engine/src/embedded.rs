@@ -49,7 +49,7 @@ use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore};
 
 use crate::{
     AgentAttempt, AgentCall, AgentExecutor, Deciders, Observer, Outbound, Partition,
-    PartitionError, RetryPolicy, ReusePolicy,
+    PartitionError, RetryPolicy, ReusePolicy, StartOptions,
 };
 
 /// A step implementation.
@@ -342,20 +342,21 @@ impl Engine {
         self.start_with(key, workflow, input, ReusePolicy::ReturnExisting)
     }
 
-    /// Starts a run with an explicit [`ReusePolicy`] for a key that already has one.
+    /// Starts a run with explicit [`StartOptions`]: a [`ReusePolicy`] for a key that already has one,
+    /// and a token budget for its agent calls. A `ReusePolicy` alone converts into options.
     pub fn start_with(
         &self,
         key: &str,
         workflow: &str,
         input: Payload,
-        policy: ReusePolicy,
+        options: impl Into<StartOptions>,
     ) -> Result<(), EngineError> {
         let (reply, answer) = mpsc::channel();
         self.send(Request::Start {
             key: key.to_owned(),
             workflow: workflow.to_owned(),
             input,
-            policy,
+            options: options.into(),
             reply,
         })?;
         answer.recv().map_err(|_| self.stopped())?
@@ -495,7 +496,7 @@ enum Request {
         key: String,
         workflow: String,
         input: Payload,
-        policy: ReusePolicy,
+        options: StartOptions,
         reply: Sender<Result<(), EngineError>>,
     },
     Wait {
@@ -625,9 +626,9 @@ impl Processor {
                 key,
                 workflow,
                 input,
-                policy,
+                options,
                 reply,
-            } => match self.partition.start_with(&key, &workflow, input, policy) {
+            } => match self.partition.start_with(&key, &workflow, input, options) {
                 Ok(()) => self.starts.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownWorkflow(name)) => {
                     let _ = reply.send(Err(EngineError::UnknownWorkflow(name)));

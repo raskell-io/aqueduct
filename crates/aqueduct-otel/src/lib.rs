@@ -326,6 +326,35 @@ impl Observer for OtelObserver {
                 ],
                 None,
             ),
+            Entry::AgentCallEscalated {
+                cmd,
+                budget_tokens: needed,
+                ..
+            } => {
+                self.escalations.add(
+                    1,
+                    &[
+                        flow(),
+                        KeyValue::new("aqueduct.reason", aqueduct_core::BUDGET_ESCALATION),
+                    ],
+                );
+                point(
+                    "over budget, escalated".into(),
+                    vec![
+                        cmd_attribute(*cmd),
+                        KeyValue::new("aqueduct.tokens.needed", *needed as i64),
+                    ],
+                    None,
+                );
+            }
+            Entry::BudgetApproved { cmd, tokens } => point(
+                "budget raised".into(),
+                vec![
+                    cmd_attribute(*cmd),
+                    KeyValue::new("aqueduct.budget", *tokens as i64),
+                ],
+                None,
+            ),
             // Covered by the step execution spans.
             Entry::StepScheduled { .. }
             | Entry::StepCompleted { .. }

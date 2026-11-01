@@ -9,7 +9,6 @@ use crate::rng::Rng;
 
 use aqueduct_core::{
     Command, CommandIndex, Decider, Effect, Event, Payload, RunState, RunView, Status, StepOutcome,
-    start,
 };
 
 /// `extract`, then `map_a` and `map_b` concurrently, then `merge` of both (in command order), then
@@ -185,6 +184,33 @@ def run(input):
     return step("validate", extracted + "#" + go)
 "##;
 
+/// The token budget a run with this input starts with: for a third of runs too small for the Starlark
+/// pipeline's agent call (which then escalates), for a third ample, for a third none.
+pub fn run_budget(input: &Payload) -> Option<u64> {
+    let sum: u32 = input.as_bytes().iter().map(|&b| u32::from(b)).sum();
+    match sum % 3 {
+        0 => Some(500),
+        1 => Some(5_000),
+        _ => None,
+    }
+}
+
+/// How the simulated reviewer resolves an escalation with this reason, for a run with this input: a
+/// budget escalation with `true` or `false`, a review with `"approve"` or `"decline"`.
+pub fn resolution(reason: &str, input: &Payload) -> Payload {
+    let decision = review_decision(input);
+    if reason == aqueduct_core::BUDGET_ESCALATION {
+        let approve = decision.as_bytes() == b"\"approve\"";
+        Payload::new(if approve {
+            b"true".to_vec()
+        } else {
+            b"false".to_vec()
+        })
+    } else {
+        decision
+    }
+}
+
 /// The simulated reviewer's decision for a run with this input: deterministic, so the reference model
 /// resolves exactly as the client does. About one in four runs is declined.
 pub fn review_decision(input: &Payload) -> Payload {
@@ -259,7 +285,8 @@ impl Workload {
             WorkloadKind::StarlarkPipeline => Workload {
                 kind,
                 signals: false,
-                escalations: false,
+                // Runs whose budget is too small for the agent call escalate for more.
+                escalations: true,
                 decider: Arc::new(
                     Procedure::compile("pipeline.star", STARLARK_PIPELINE)
                         .map_err(|e| e.to_string())?,
@@ -293,11 +320,11 @@ pub fn reference(
     workload: &Workload,
     input: &Payload,
 ) -> Result<(Status, Option<Payload>, Option<String>), String> {
-    let first = start(crate::node::WORKFLOW, input.clone());
+    let first =
+        aqueduct_core::start_with_budget(crate::node::WORKFLOW, input.clone(), run_budget(input));
     let mut state = RunState::from_journal(&first.entries).map_err(|e| e.to_string())?;
     let mut work = first.effects;
     let mut signalled = false;
-    let decision = review_decision(input);
     loop {
         let event = match work.pop() {
             Some(Effect::Activate) => Event::Decision(workload.decider.decide(&state.view())),
@@ -314,7 +341,10 @@ pub fn reference(
             Some(Effect::Finished(_)) => continue,
             // The run continued as new: the key's next run takes over.
             Some(Effect::ContinueAsNew { input }) => {
-                let next = start(crate::node::WORKFLOW, input);
+                let left = state
+                    .budget()
+                    .map(|budget| budget.saturating_sub(state.tokens_used()));
+                let next = aqueduct_core::start_with_budget(crate::node::WORKFLOW, input, left);
                 state = RunState::from_journal(&next.entries).map_err(|e| e.to_string())?;
                 work = next.effects;
                 continue;
@@ -332,10 +362,13 @@ pub fn reference(
                     }
                 }
                 // The reviewer resolves the open escalation.
-                None if !state.open_escalations().is_empty() => Event::ResolveEscalation {
-                    cmd: state.open_escalations()[0].0,
-                    outcome: decision.clone(),
-                },
+                None if !state.open_escalations().is_empty() => {
+                    let (cmd, reason, _) = state.open_escalations()[0];
+                    Event::ResolveEscalation {
+                        cmd,
+                        outcome: resolution(reason, input),
+                    }
+                }
                 None => return Err("the reference run is stuck".into()),
             },
         };

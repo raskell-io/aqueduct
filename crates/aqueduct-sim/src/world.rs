@@ -171,8 +171,10 @@ struct World<'c> {
     /// Runs the client cancels, and those whose cancellation it saw acknowledged (never lost).
     to_cancel: BTreeSet<String>,
     acked_cancels: BTreeSet<String>,
-    /// Runs whose escalation's resolution the client saw acknowledged (never lost).
-    acked_resolutions: BTreeSet<String>,
+    /// The escalation the client last sent a resolution for, by run.
+    resolving: BTreeMap<String, CommandIndex>,
+    /// Escalations whose resolution the client saw acknowledged (never lost): (run id, command).
+    acked_resolutions: BTreeSet<(String, CommandIndex)>,
     /// Timer firings (run, journal position) already checked against their wake time.
     checked_timers: BTreeSet<(String, usize)>,
     /// Results the worker holds and resends until acknowledged.
@@ -238,6 +240,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         acked_signals: BTreeSet::new(),
         to_cancel: BTreeSet::new(),
         acked_cancels: BTreeSet::new(),
+        resolving: BTreeMap::new(),
         acked_resolutions: BTreeSet::new(),
         checked_timers: BTreeSet::new(),
         worker_pending: BTreeMap::new(),
@@ -417,7 +420,9 @@ impl World<'_> {
                 self.acked_cancels.insert(key);
             }
             Ev::ClientResolveAck { run } => {
-                self.acked_resolutions.insert(run);
+                if let Some(cmd) = self.resolving.get(&run) {
+                    self.acked_resolutions.insert((run, *cmd));
+                }
             }
             Ev::NodeResolve { run, cmd, outcome } => {
                 if self.node.up {
@@ -473,7 +478,7 @@ impl World<'_> {
                     .collect();
                 // The reviewer: looks at the open escalations, as a dashboard would, and resolves each,
                 // retrying until the resolution is acknowledged.
-                let open: Vec<(String, CommandIndex)> = if self.workload.escalations {
+                let open: Vec<(String, CommandIndex, String)> = if self.workload.escalations {
                     self.node.open_escalations()
                 } else {
                     Vec::new()
@@ -502,13 +507,14 @@ impl World<'_> {
                         self.send(Ev::NodeCancel { key });
                     }
                 }
-                for (run, cmd) in open {
+                for (run, cmd, reason) in open {
                     if self.rng.chance(400_000) {
                         let key = aqueduct_core::split_run_id(&run).0;
                         let Some((_, input)) = self.wanted.iter().find(|(k, _)| k == key) else {
                             return Err(format!("an escalation of unknown run {run:?}"));
                         };
-                        let outcome = workflow::review_decision(input);
+                        let outcome = workflow::resolution(&reason, input);
+                        self.resolving.insert(run.clone(), cmd);
                         self.send(Ev::NodeResolve { run, cmd, outcome });
                     }
                 }
@@ -720,17 +726,21 @@ impl World<'_> {
                 return Err(format!("lost acknowledged cancellation of {key}"));
             }
         }
-        for id in &self.acked_resolutions {
+        for (id, cmd) in &self.acked_resolutions {
             let Some(run) = self.node.runs().get(id) else {
                 return Err(format!("lost run {id:?} with an acknowledged resolution"));
             };
-            let resolved = run
-                .journal()
+            // Once a resolution is acknowledged, its escalation is no longer open (resolved, approved
+            // or declined; or closed first by a cancellation, which drops the resolution as specified).
+            let still_open = run
+                .state()
+                .open_escalations()
                 .iter()
-                .any(|e| matches!(e, Entry::EscalationResolved { .. }));
-            // A resolution for an escalation that a cancellation closed first is dropped, as specified.
-            if !resolved && !run.state().status().is_terminal() {
-                return Err(format!("lost acknowledged resolution of {id:?}"));
+                .any(|(c, _, _)| c == cmd);
+            if still_open {
+                return Err(format!(
+                    "lost acknowledged resolution of {id:?} command {cmd}"
+                ));
             }
         }
         for key in &self.acked_signals {
@@ -843,6 +853,16 @@ impl World<'_> {
             }
         }
 
+        let count = |f: fn(&Entry) -> bool| {
+            self.node
+                .runs()
+                .values()
+                .flat_map(|run| run.journal())
+                .filter(|e| f(e))
+                .count() as u64
+        };
+        self.report.budget_escalations = count(|e| matches!(e, Entry::AgentCallEscalated { .. }));
+        self.report.budget_approvals = count(|e| matches!(e, Entry::BudgetApproved { .. }));
         self.report.escalations_resolved = self
             .node
             .runs()
@@ -861,6 +881,12 @@ impl World<'_> {
                         input,
                     }
                     | aqueduct_core::Entry::AgentCallScheduled {
+                        cmd: c,
+                        name,
+                        request: input,
+                        ..
+                    }
+                    | aqueduct_core::Entry::AgentCallEscalated {
                         cmd: c,
                         name,
                         request: input,

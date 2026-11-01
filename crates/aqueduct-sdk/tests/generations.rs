@@ -169,3 +169,65 @@ fn an_awakeable_of_an_earlier_run_never_reaches_a_later_one() {
     drop(engine);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_run_budget_escalates_and_carries_over_continue_as_new() {
+    use aqueduct_engine::{AgentAttempt, AgentCall, AgentExecutor, StartOptions};
+    use aqueduct_sdk::AgentOptions;
+
+    struct Model;
+    impl AgentExecutor for Model {
+        fn call(&self, _: &AgentCall<'_>) -> AgentAttempt {
+            AgentAttempt::Completed(aqueduct_core::AgentResponse {
+                model: "test/model".into(),
+                params: json("{}"),
+                response: json("\"ok\""),
+                input_tokens: 250,
+                output_tokens: 50,
+            })
+        }
+    }
+    /// Three rounds, one agent call (budget 400, costing 300) each, continuing as new between rounds.
+    async fn rounds(ctx: WorkflowContext, round: u32) -> Result<u32, WorkflowError> {
+        let options = AgentOptions {
+            prompt: "think".into(),
+            output_schema: None,
+            budget_tokens: 400,
+        };
+        let _: String = ctx.agent("think", &round, &options).await?;
+        if round < 2 {
+            return Err(ctx.continue_as_new(&(round + 1)));
+        }
+        Ok(round)
+    }
+    let dir = temp("budget");
+    let engine = Engine::builder(&dir)
+        .workflow("rounds", Arc::new(workflow(rounds)))
+        .agent_executor(Arc::new(Model))
+        .open()
+        .unwrap();
+    let options = StartOptions {
+        budget_tokens: Some(800),
+        ..StartOptions::default()
+    };
+    engine
+        .start_with("r", "rounds", json("0"), options)
+        .unwrap();
+    // Round 0 spends 300 (500 left, carried over); round 1 spends 300 (200 left); round 2 needs 400.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let open = loop {
+        if let Some(open) = engine.escalations().unwrap().into_iter().next() {
+            break open;
+        }
+        assert!(Instant::now() < deadline, "the run never asked for budget");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(open.reason, "budget");
+    assert_eq!(open.payload, json("{\"needed\":400,\"available\":200}"));
+    assert_eq!(open.id, "r#2.0", "the third generation's call");
+    engine.resolve_escalation(&open.id, json("true")).unwrap();
+    let done = engine.wait("r", Duration::from_secs(10)).unwrap();
+    assert_eq!(done.output, Some(json("2")));
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

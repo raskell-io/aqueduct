@@ -16,7 +16,15 @@ fn payload() -> impl Strategy<Value = Payload> {
 fn entry() -> impl Strategy<Value = Entry> {
     let cmd = any::<u32>().prop_map(CommandIndex);
     prop_oneof![
-        (".{0,12}", payload()).prop_map(|(workflow, input)| Entry::Started { workflow, input }),
+        (".{0,12}", payload(), any::<Option<u64>>()).prop_map(
+            |(workflow, input, budget_tokens)| {
+                Entry::Started {
+                    workflow,
+                    input,
+                    budget_tokens,
+                }
+            }
+        ),
         (cmd.clone(), ".{0,12}", payload()).prop_map(|(cmd, name, input)| Entry::StepScheduled {
             cmd,
             name,
@@ -26,6 +34,26 @@ fn entry() -> impl Strategy<Value = Entry> {
         (cmd, ".{0,12}").prop_map(|(cmd, error)| Entry::StepFailed { cmd, error }),
         payload().prop_map(|output| Entry::RunCompleted { output }),
         payload().prop_map(|input| Entry::ContinuedAsNew { input }),
+        (
+            any::<u32>(),
+            ".{0,12}",
+            payload(),
+            any::<u64>(),
+            any::<u64>()
+        )
+            .prop_map(|(cmd, name, request, budget_tokens, available)| {
+                Entry::AgentCallEscalated {
+                    cmd: CommandIndex(cmd),
+                    name,
+                    request,
+                    budget_tokens,
+                    available,
+                }
+            }),
+        (any::<u32>(), any::<u64>()).prop_map(|(cmd, tokens)| Entry::BudgetApproved {
+            cmd: CommandIndex(cmd),
+            tokens
+        }),
         (any::<u32>(), ".{0,12}", payload(), any::<u64>()).prop_map(
             |(cmd, name, request, budget_tokens)| Entry::AgentCallScheduled {
                 cmd: CommandIndex(cmd),

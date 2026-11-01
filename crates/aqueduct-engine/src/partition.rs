@@ -17,7 +17,7 @@ use std::sync::Arc;
 use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
 use aqueduct_core::{
     CommandIndex, Decider, Effect, Entry, Env, Event, Payload, RunState, Status, StepOutcome,
-    Transition, run_id, split_run_id, start, valid_key,
+    Transition, run_id, split_run_id, start_with_budget, valid_key,
 };
 use aqueduct_storage::{LogStore, NoStateStore, StateStore, StorageError};
 
@@ -214,6 +214,25 @@ pub enum PartitionError {
     InvalidKey(String),
 }
 
+/// How a run is started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StartOptions {
+    /// What to do if the key already has a run.
+    pub reuse: ReusePolicy,
+    /// The run's token budget for agent calls, if it has one. An agent call that would exceed it is not
+    /// made; it escalates for approval (reason [`aqueduct_core::BUDGET_ESCALATION`]).
+    pub budget_tokens: Option<u64>,
+}
+
+impl From<ReusePolicy> for StartOptions {
+    fn from(reuse: ReusePolicy) -> Self {
+        StartOptions {
+            reuse,
+            budget_tokens: None,
+        }
+    }
+}
+
 /// What starting a key that already has a run does (BRIEF.md section 5.3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReusePolicy {
@@ -392,10 +411,11 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 continue;
             };
             let workflow = run.state.workflow().to_owned();
+            let budget = successor_budget(&run.state);
             let (base, generation) = split_run_id(key);
             let next = run_id(base, generation + 1);
             if !self.runs.contains_key(&next) && self.lookup_run(&next)?.is_none() {
-                self.create_run(&next, &workflow, input)?;
+                self.create_run(&next, &workflow, input, budget)?;
             }
         }
         Ok(())
@@ -417,8 +437,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         key: &str,
         workflow: &str,
         input: Payload,
-        policy: ReusePolicy,
+        options: impl Into<StartOptions>,
     ) -> Result<(), PartitionError> {
+        let StartOptions {
+            reuse: policy,
+            budget_tokens,
+        } = options.into();
         if !valid_key(key) {
             return Err(PartitionError::InvalidKey(key.to_owned()));
         }
@@ -452,7 +476,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             if self.deciders.get(workflow).is_none() {
                 return Err(PartitionError::UnknownWorkflow(workflow.to_owned()));
             }
-            self.create_run(&run_id(key, generation), workflow, input)?;
+            self.create_run(&run_id(key, generation), workflow, input, budget_tokens)?;
         }
         self.send(Outbound::Started {
             key: key.to_owned(),
@@ -466,8 +490,9 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         id: &str,
         workflow: &str,
         input: Payload,
+        budget: Option<u64>,
     ) -> Result<(), PartitionError> {
-        let first = start(workflow, input);
+        let first = start_with_budget(workflow, input, budget);
         let state = RunState::from_journal(&first.entries)
             .map_err(|e| PartitionError::Internal(e.to_string()))?;
         self.runs.insert(
@@ -1123,14 +1148,19 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     });
                 }
                 Effect::ContinueAsNew { input } => {
-                    let workflow = self
+                    let (workflow, budget) = self
                         .runs
                         .get(key)
-                        .map(|run| run.state.workflow().to_owned())
+                        .map(|run| {
+                            (
+                                run.state.workflow().to_owned(),
+                                successor_budget(&run.state),
+                            )
+                        })
                         .ok_or_else(|| PartitionError::Internal(format!("run {key} vanished")))?;
                     let (base, generation) = split_run_id(key);
                     let next = run_id(base, generation + 1);
-                    self.create_run(&next, &workflow, input)?;
+                    self.create_run(&next, &workflow, input, budget)?;
                 }
             }
         }
@@ -1145,6 +1175,13 @@ fn os_seed() -> u64 {
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     hasher.write_u64(0x6171_7565_6475_6374);
     hasher.finish()
+}
+
+/// The budget a run's successor (after continue-as-new) starts with: what is left of the run's.
+fn successor_budget(state: &RunState) -> Option<u64> {
+    state
+        .budget()
+        .map(|budget| budget.saturating_sub(state.tokens_used()))
 }
 
 /// The message that executes a dispatch effect, if it is one.
