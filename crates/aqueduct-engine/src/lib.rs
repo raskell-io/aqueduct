@@ -8,9 +8,11 @@
 #![forbid(unsafe_code)]
 
 pub mod embedded;
+mod observe;
 mod partition;
 
 pub use aqueduct_storage::Durability;
+pub use observe::{Observer, StepEnd};
 pub use partition::{
     Deciders, Outbound, Partition, PartitionError, PartitionRun, RetryPolicy, ReusePolicy,
 };

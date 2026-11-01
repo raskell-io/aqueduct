@@ -38,7 +38,7 @@ pub use aqueduct_sdk::{
 
 /// The embedded engine: a durable engine inside your process.
 pub mod embedded {
-    pub use aqueduct_engine::Durability;
+    pub use aqueduct_engine::{Durability, Observer, StepEnd};
     pub use aqueduct_engine::embedded::{
         Attempt, Builder, Engine, EngineError, EngineStats, Escalation, RunResult,
     };

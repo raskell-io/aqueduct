@@ -219,6 +219,9 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     deciders: Deciders,
     runs: BTreeMap<String, PartitionRun>,
     batch: Vec<Vec<u8>>,
+    /// Entries of the batch for the observer: (run key, workflow, entry).
+    observed: Vec<(String, String, Entry)>,
+    observer: Option<std::sync::Arc<dyn crate::Observer>>,
     deferred: Vec<Outbound>,
     immediate: Vec<Outbound>,
     ack_before_sync: bool,
@@ -319,6 +322,8 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             deciders,
             runs,
             batch: Vec::new(),
+            observed: Vec::new(),
+            observer: None,
             deferred: Vec::new(),
             immediate: Vec::new(),
             ack_before_sync: false,
@@ -731,11 +736,25 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// partition must be dropped and recovered.
     pub fn flush(&mut self) -> Result<Vec<Outbound>, StorageError> {
         if !self.batch.is_empty() {
-            self.log.append(&self.batch)?;
+            let started = std::time::Instant::now();
+            let records = self.batch.len();
+            let written = self.log.append(&self.batch).and_then(|()| self.log.sync());
             self.batch.clear();
-            self.log.sync()?;
+            let observed = std::mem::take(&mut self.observed);
+            written?;
+            if let Some(observer) = &self.observer {
+                observer.flush(records, started.elapsed());
+                for (key, workflow, entry) in &observed {
+                    observer.entry(key, workflow, entry, self.now_ms);
+                }
+            }
         }
         Ok(std::mem::take(&mut self.deferred))
+    }
+
+    /// Sets the observer told about durable entries and flushes (see [`crate::Observer`]).
+    pub fn set_observer(&mut self, observer: std::sync::Arc<dyn crate::Observer>) {
+        self.observer = Some(observer);
     }
 
     /// The runs, by key.
@@ -851,6 +870,13 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         let record = run.chain.append(entry);
         run.journal.push(entry.clone());
         self.batch.push(encode_log_record(key, &record));
+        if self.observer.is_some() {
+            self.observed.push((
+                key.to_owned(),
+                run.state.workflow().to_owned(),
+                entry.clone(),
+            ));
+        }
         if !self.dirty.contains(key) {
             self.dirty.insert(key.to_owned());
         }
