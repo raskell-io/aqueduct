@@ -18,6 +18,7 @@ aqueduct-sdk.workspace = true
 aqueduct-core.workspace = true
 aqueduct-engine.workspace = true
 aqueduct-procedure.workspace = true
+aqueduct-registry.workspace = true
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -634,3 +634,244 @@ fn a_pinned_run_shows_its_version() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_version_is_proposed_proven_approved_activated_drained_and_retired() {
+    let v1 = r#"
+def run(claim):
+    score = step("score", claim)
+    if score > 50:
+        return wait(signal("review"))
+    return "approve"
+"#;
+    let v2 = v1.replace("score > 50", "score > 80");
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-versions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_str().unwrap();
+    let file = |name: &str, text: &str| {
+        let file = dir.join(name);
+        std::fs::write(&file, text).unwrap();
+        file.to_str().unwrap().to_owned()
+    };
+    let (f1, f2) = (file("v1.star", v1), file("v2.star", &v2));
+    let open = || {
+        let builder = Engine::builder(&dir).step("score", |claim: &Payload| {
+            let claim: serde_json::Value = serde_json::from_slice(claim.as_bytes()).unwrap();
+            Attempt::Completed(Payload::new(
+                (claim["amount"].as_u64().unwrap() / 100)
+                    .to_string()
+                    .into_bytes(),
+            ))
+        });
+        aqueduct_registry::Registry::open(&dir)
+            .unwrap()
+            .deploy(builder)
+            .unwrap()
+            .open()
+            .unwrap()
+    };
+    let claim = |amount: u32| Payload::new(format!("{{\"amount\": {amount}}}").into_bytes());
+
+    // The first version: nothing to replay it against yet, and it needs a second pair of eyes.
+    let registered = cli(&[
+        "versions", "register", path, "claims", &f1, "--by", "ada", "--cases", "37",
+    ])
+    .unwrap();
+    let id1 = registered.split_whitespace().nth(3).unwrap().to_owned();
+    assert!(
+        cli(&["versions", "propose", path, "claims", &id1])
+            .unwrap_err()
+            .contains("--by")
+    );
+    cli(&[
+        "versions",
+        "propose",
+        path,
+        "claims",
+        &id1[..10],
+        "--by",
+        "ada",
+    ])
+    .unwrap();
+    let proven = cli(&[
+        "versions",
+        "prove",
+        path,
+        "claims",
+        &id1[..10],
+        "--by",
+        "ada",
+    ])
+    .unwrap();
+    assert!(proven.starts_with("0 runs: 0 same"), "{proven}");
+    assert!(
+        cli(&[
+            "versions",
+            "approve",
+            path,
+            "claims",
+            &id1[..10],
+            "--by",
+            "ada"
+        ])
+        .unwrap_err()
+        .contains("ada wrote this version")
+    );
+    cli(&[
+        "versions",
+        "approve",
+        path,
+        "claims",
+        &id1[..10],
+        "--by",
+        "grace",
+        "--note",
+        "first cut",
+    ])
+    .unwrap();
+    cli(&[
+        "versions",
+        "activate",
+        path,
+        "claims",
+        &id1[..10],
+        "--by",
+        "grace",
+    ])
+    .unwrap();
+    {
+        let engine = open();
+        for (key, amount) in [("c-1", 3000), ("c-2", 6000), ("c-3", 9000)] {
+            engine.start(key, "claims", claim(amount)).unwrap();
+        }
+        engine
+            .signal("c-2", "review", "", Payload::new(*b"\"settle\""))
+            .unwrap();
+        engine.wait("c-2", Duration::from_secs(10)).unwrap();
+        engine.wait("c-1", Duration::from_secs(10)).unwrap();
+    }
+
+    // The second version, proven against the first's runs: c-2 would be decided differently; c-3 (90)
+    // still waits for its review.
+    let registered = cli(&["versions", "register", path, "claims", &f2, "--by", "ada"]).unwrap();
+    let id2 = registered.split_whitespace().nth(3).unwrap().to_owned();
+    cli(&[
+        "versions",
+        "propose",
+        path,
+        "claims",
+        &id2[..10],
+        "--by",
+        "ada",
+    ])
+    .unwrap();
+    let proven = cli(&[
+        "versions",
+        "prove",
+        path,
+        "claims",
+        &id2[..10],
+        "--by",
+        "ada",
+    ])
+    .unwrap();
+    assert!(proven.contains("c-2  different"), "{proven}");
+    assert!(
+        proven.contains("3 runs: 2 same, 1 different, 0 unresolved"),
+        "{proven}"
+    );
+    cli(&[
+        "versions",
+        "approve",
+        path,
+        "claims",
+        &id2[..10],
+        "--by",
+        "grace",
+    ])
+    .unwrap();
+    let activated = cli(&[
+        "versions",
+        "activate",
+        path,
+        "claims",
+        &id2[..10],
+        "--by",
+        "grace",
+    ])
+    .unwrap();
+    assert!(
+        activated.contains(&format!("version {} is draining", &id1[..12])),
+        "{activated}"
+    );
+    let listed = cli(&["versions", "list", path]).unwrap();
+    assert!(listed.contains(&format!("claims               {} draining  ada              1         0/0/0              1 running of 3", &id1[..12])), "{listed}");
+    assert!(
+        listed.contains(&format!(
+            "{} active    ada              1         2/1/0              0 running of 0",
+            &id2[..12]
+        )),
+        "{listed}"
+    );
+
+    // c-3 still runs on the first version: it cannot be retired yet.
+    assert!(
+        cli(&[
+            "versions",
+            "retire",
+            path,
+            "claims",
+            &id1[..10],
+            "--by",
+            "grace"
+        ])
+        .unwrap_err()
+        .contains("1 runs on it have not finished")
+    );
+    {
+        let engine = open();
+        engine
+            .signal("c-3", "review", "", Payload::new(*b"\"settle\""))
+            .unwrap();
+        let done = engine.wait("c-3", Duration::from_secs(10)).unwrap();
+        assert_eq!(done.version.as_deref(), Some(id1.as_str()));
+        engine.start("c-4", "claims", claim(6000)).unwrap();
+        let done = engine.wait("c-4", Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            (done.version.as_deref(), done.output),
+            (Some(id2.as_str()), Some(Payload::new(*b"\"approve\"")))
+        );
+    }
+    cli(&[
+        "versions",
+        "retire",
+        path,
+        "claims",
+        &id1[..10],
+        "--by",
+        "grace",
+    ])
+    .unwrap();
+
+    let diff = cli(&["versions", "diff", path, "claims", &id1[..10], &id2[..10]]).unwrap();
+    assert!(
+        diff.contains("-     if score > 50:\n+     if score > 80:\n"),
+        "{diff}"
+    );
+    let shown = cli(&["versions", "show", path, "claims", &id1[..10]]).unwrap();
+    assert!(shown.contains("state     retired\n"), "{shown}");
+    assert!(shown.contains("cases     37 studied\n"), "{shown}");
+    assert!(shown.contains("approved  by grace: first cut\n"), "{shown}");
+    let log = cli(&["versions", "log", path]).unwrap();
+    assert!(log.ends_with("14 events, chain verified\n"), "{log}");
+    assert!(
+        log.contains("grace            approval: first cut\n"),
+        "{log}"
+    );
+    assert!(
+        log.contains("ada              proven 3 runs: 2 same, 1 different, 0 unresolved\n"),
+        "{log}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

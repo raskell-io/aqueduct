@@ -17,6 +17,7 @@ use aqueduct_engine::drift::{
 };
 use aqueduct_engine::{Deciders, Partition};
 use aqueduct_procedure::Procedure;
+use aqueduct_registry::{Action, Provenance, Registry, RegistryError, ReplayEvidence, State};
 use aqueduct_storage::{FileLog, FileLogOptions, RedbStateStore};
 
 const USAGE: &str = "usage: aqueduct <command> <data-dir> [arguments]
@@ -31,6 +32,7 @@ commands:
   counterfactual <dir> <procedure.star> (<key>... | --workflow <name>) [--stubs <file.json>]
                                       replay past runs against a new procedure version, answering it
                                       with their recorded results, and report where outcomes differ
+  versions <subcommand> <dir> ...     procedure versions and their lifecycle (see below)
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
@@ -41,6 +43,24 @@ commands:
   cancel <dir> <key> [<reason>]       ask a run to stop: what it waits for fails as cancelled
   escalations <dir>                   open escalations: id, reason, payload
   resolve <dir> <id> <json>           resolve an escalation; the run continues with the payload
+
+versions (ADR 0030; every change names who makes it with --by):
+  versions list <dir> [<workflow>]    versions: state, author, approvals, replay, runs pinned to them
+  versions show <dir> <workflow> <version>
+                                      a version's provenance, evidence, approvals and source
+  versions register <dir> <workflow> <file.star> --by <name>
+                    [--explored-by <agent>] [--cases <n>] [--note <text>]
+  versions propose <dir> <workflow> <version> --by <name>
+  versions prove <dir> <workflow> <version> --by <name> [--stubs <file.json>]
+                                      replay the workflow's past runs against it and record the report
+  versions approve <dir> <workflow> <version> --by <name> [--note <text>]
+  versions activate <dir> <workflow> <version> --by <name>
+                                      new runs start on it; the active version starts draining
+  versions retire <dir> <workflow> <version> --by <name>
+                                      only once no unfinished run is pinned to it
+  versions diff <dir> <workflow> <version> <version>
+  versions log <dir>                  every lifecycle event, verified
+  A version can be given by a prefix of its id. Engines deploy the registry with Registry::deploy.
 
 drift options:
   --model anthropic/<model>           the Claude API (ANTHROPIC_API_KEY)
@@ -79,6 +99,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
             Path::new(arg(2, "procedure file")?),
             &args[3..],
         ),
+        Some("versions") => versions(&args[1..]),
         Some("drift") => drift(Path::new(arg(1, "data directory")?), &args[2..]),
         Some("signal") => signal(
             Path::new(arg(1, "data directory")?),
@@ -365,6 +386,291 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
     ))
 }
 
+/// The version registry's commands (ADR 0030).
+fn versions(args: &[String]) -> Result<String, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let mut positional: Vec<&str> = Vec::new();
+    let mut flags: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if let Some(flag) = arg.strip_prefix("--") {
+            let value = rest
+                .next()
+                .ok_or_else(|| format!("--{flag} needs a value"))?;
+            if !["by", "explored-by", "cases", "note", "stubs"].contains(&flag) {
+                return Err(format!("unknown option `--{flag}`"));
+            }
+            flags.insert(flag, value);
+        } else {
+            positional.push(arg);
+        }
+    }
+    let at = |i: usize, what: &str| {
+        positional
+            .get(i)
+            .copied()
+            .ok_or_else(|| format!("versions {sub}: missing {what}\n\n{USAGE}"))
+    };
+    let by = || {
+        flags.get("by").copied().ok_or_else(|| {
+            format!("versions {sub} needs --by <name>: every change says who made it")
+        })
+    };
+    let dir = Path::new(at(0, "data directory")?);
+    let mut registry = Registry::open(dir).map_err(|e| e.to_string())?;
+    let err = |e: RegistryError| e.to_string();
+    match sub {
+        "list" => {
+            let pinned = pinned_runs(dir);
+            let mut out = format!(
+                "{:<20} {:<12} {:<9} {:<16} {:<9} {:<18} {}\n",
+                "WORKFLOW", "VERSION", "STATE", "AUTHOR", "APPROVED", "REPLAY", "RUNS"
+            );
+            for v in registry
+                .versions()
+                .filter(|v| positional.get(1).is_none_or(|w| v.workflow == *w))
+            {
+                let replay = v.replay.as_ref().map_or("-".to_owned(), |r| {
+                    format!("{}/{}/{}", r.same, r.different, r.unresolved)
+                });
+                let runs = pinned.as_ref().map_or("?".to_owned(), |pinned| {
+                    let (unfinished, total) = pinned.get(&v.id).copied().unwrap_or((0, 0));
+                    format!("{unfinished} running of {total}")
+                });
+                out.push_str(&format!(
+                    "{:<20} {:<12} {:<9} {:<16} {:<9} {:<18} {runs}\n",
+                    v.workflow,
+                    short_version(&v.id),
+                    v.state.as_str(),
+                    v.provenance.author,
+                    v.approvals.len(),
+                    replay,
+                ));
+            }
+            Ok(out)
+        }
+        "show" => {
+            let v = registry
+                .version(at(1, "workflow")?, at(2, "version")?)
+                .map_err(err)?;
+            let mut out = format!(
+                "workflow  {}\nversion   {}\nstate     {}\nauthor    {}\n",
+                v.workflow,
+                v.id,
+                v.state.as_str(),
+                v.provenance.author
+            );
+            if let Some(agent) = &v.provenance.explored_by {
+                out.push_str(&format!("explored  by {agent}\n"));
+            }
+            if let Some(cases) = v.provenance.cases_studied {
+                out.push_str(&format!("cases     {cases} studied\n"));
+            }
+            if let Some(note) = &v.provenance.note {
+                out.push_str(&format!("note      {note}\n"));
+            }
+            if let Some(r) = &v.replay {
+                out.push_str(&format!(
+                    "replay    {} runs: {} same, {} different, {} unresolved (report sha256 {})\n",
+                    r.runs, r.same, r.different, r.unresolved, r.report_sha256
+                ));
+            }
+            for a in &v.approvals {
+                out.push_str(&format!(
+                    "approved  by {}{}\n",
+                    a.by,
+                    a.note.as_ref().map_or(String::new(), |n| format!(": {n}"))
+                ));
+            }
+            out.push_str("source\n");
+            for line in registry.source(v).map_err(err)?.lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
+            Ok(out)
+        }
+        "register" => {
+            let workflow = at(1, "workflow")?;
+            let file = Path::new(at(2, "procedure file")?);
+            let source =
+                std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+            let cases = flags
+                .get("cases")
+                .map(|c| {
+                    c.parse::<u64>()
+                        .map_err(|_| format!("--cases needs a number, not `{c}`"))
+                })
+                .transpose()?;
+            let provenance = Provenance {
+                author: by()?.to_owned(),
+                explored_by: flags.get("explored-by").map(|s| (*s).to_owned()),
+                cases_studied: cases,
+                note: flags.get("note").map(|s| (*s).to_owned()),
+            };
+            let id = registry
+                .register(workflow, &source, provenance)
+                .map_err(err)?;
+            Ok(format!("registered {workflow} version {id} (draft)\n"))
+        }
+        "propose" => {
+            let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
+            registry.propose(workflow, id, by()?).map_err(err)?;
+            Ok(format!("{workflow} version {id} proposed\n"))
+        }
+        "prove" => {
+            let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
+            let by = by()?;
+            let version = registry.version(workflow, id).map_err(err)?.clone();
+            let source = registry.source(&version).map_err(err)?;
+            let procedure = Procedure::compile(&format!("{workflow}.star"), &source)
+                .map_err(|e| e.to_string())?;
+            let options = CounterfactualOptions {
+                stubs: match flags.get("stubs") {
+                    Some(path) => load_stubs(Path::new(path))?,
+                    None => Default::default(),
+                },
+            };
+            let partition = match load(dir) {
+                Ok(partition) => Some(partition),
+                // No log yet: nothing has run.
+                Err(_) if !dir.join("log").is_dir() => None,
+                Err(e) => return Err(e),
+            };
+            let (report, [same, different, unresolved]) = match &partition {
+                Some(partition) => {
+                    counterfactual_report(partition, &procedure, &[], Some(workflow), &options)?
+                }
+                None => (
+                    "0 runs: 0 same, 0 different, 0 unresolved\n".to_owned(),
+                    [0; 3],
+                ),
+            };
+            // A workflow's first version has no past runs: its report says so (the policy's
+            // `min_runs` decides whether that is enough).
+            let runs = same + different + unresolved;
+            let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+            let evidence = ReplayEvidence {
+                runs: count(runs),
+                same: count(same),
+                different: count(different),
+                unresolved: count(unresolved),
+                report_sha256: aqueduct_procedure::version_of(&report),
+            };
+            registry.prove(workflow, id, by, evidence).map_err(err)?;
+            Ok(format!(
+                "{report}{workflow} version {} proven: the report is recorded\n",
+                short_version(&version.id)
+            ))
+        }
+        "approve" => {
+            let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
+            let note = flags.get("note").map(|s| (*s).to_owned());
+            let state = registry.approve(workflow, id, by()?, note).map_err(err)?;
+            Ok(match state {
+                State::Approved => format!("{workflow} version {id} approved\n"),
+                _ => format!(
+                    "approval recorded; {workflow} version {id} needs more approvals ({} so far)\n",
+                    registry.version(workflow, id).map_err(err)?.approvals.len()
+                ),
+            })
+        }
+        "activate" => {
+            let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
+            let previous = registry
+                .active(workflow)
+                .map(|v| short_version(&v.id).to_owned());
+            registry.activate(workflow, id, by()?).map_err(err)?;
+            let mut out = format!(
+                "{workflow} version {id} is active: new runs start on it when the engine next opens\n"
+            );
+            if let Some(previous) = previous {
+                out.push_str(&format!("{workflow} version {previous} is draining\n"));
+            }
+            Ok(out)
+        }
+        "retire" => {
+            let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
+            let version = registry.version(workflow, id).map_err(err)?.clone();
+            let pinned = pinned_runs(dir)
+                .ok_or("cannot read the data directory to check that no runs are left (is the engine running?)")?;
+            let unfinished = pinned.get(&version.id).map_or(0, |(u, _)| *u);
+            registry
+                .retire(workflow, id, by()?, unfinished)
+                .map_err(err)?;
+            Ok(format!("{workflow} version {id} retired\n"))
+        }
+        "diff" => {
+            let workflow = at(1, "workflow")?;
+            let a = registry.version(workflow, at(2, "version")?).map_err(err)?;
+            let b = registry.version(workflow, at(3, "version")?).map_err(err)?;
+            Ok(format!(
+                "--- {workflow} {}\n+++ {workflow} {}\n{}",
+                short_version(&a.id),
+                short_version(&b.id),
+                aqueduct_registry::diff(
+                    &registry.source(a).map_err(err)?,
+                    &registry.source(b).map_err(err)?
+                )
+            ))
+        }
+        "log" => {
+            let mut out = String::new();
+            for e in registry.events() {
+                let detail = match &e.action {
+                    Action::Registered(p) => {
+                        let mut detail = String::new();
+                        if let Some(agent) = &p.explored_by {
+                            detail.push_str(&format!(" explored by {agent}"));
+                        }
+                        if let Some(cases) = p.cases_studied {
+                            detail.push_str(&format!(" from {cases} cases"));
+                        }
+                        detail
+                    }
+                    Action::Proven(r) => format!(
+                        " {} runs: {} same, {} different, {} unresolved",
+                        r.runs, r.same, r.different, r.unresolved
+                    ),
+                    Action::Approval { note: Some(note) } => format!(": {note}"),
+                    _ => String::new(),
+                };
+                out.push_str(&format!(
+                    "{:>4}  {}  {:<20} {:<12} {:<16} {}{detail}\n",
+                    e.seq,
+                    e.at_ms,
+                    e.workflow,
+                    short_version(&e.version),
+                    e.by,
+                    e.action.kind(),
+                ));
+            }
+            out.push_str(&format!(
+                "{} events, chain verified\n",
+                registry.events().len()
+            ));
+            Ok(out)
+        }
+        "" => Err(format!("versions needs a subcommand\n\n{USAGE}")),
+        other => Err(format!("unknown versions subcommand `{other}`\n\n{USAGE}")),
+    }
+}
+
+/// Runs pinned to each version: `(unfinished, total)`, or `None` if the data directory cannot be read
+/// (no log yet, or the engine is running).
+fn pinned_runs(dir: &Path) -> Option<std::collections::BTreeMap<String, (usize, usize)>> {
+    let partition = load(dir).ok()?;
+    let mut pinned = std::collections::BTreeMap::new();
+    for run in partition.runs().values() {
+        if let Some(version) = run.state().version() {
+            let entry: &mut (usize, usize) = pinned.entry(version.to_owned()).or_default();
+            entry.1 += 1;
+            if !run.state().status().is_terminal() {
+                entry.0 += 1;
+            }
+        }
+    }
+    Some(pinned)
+}
+
 /// Counterfactual replay (ADR 0028): the chosen runs against a new procedure version.
 fn counterfactual(dir: &Path, procedure: &Path, args: &[String]) -> Result<String, String> {
     let mut keys: Vec<&str> = Vec::new();
@@ -381,21 +687,12 @@ fn counterfactual(dir: &Path, procedure: &Path, args: &[String]) -> Result<Strin
     if keys.is_empty() && workflow.is_none() {
         return Err("counterfactual needs run keys or --workflow <name>".into());
     }
-    let mut options = CounterfactualOptions::default();
-    if let Some(path) = stubs_file {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let stubs: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
-            .map_err(|e| {
-                format!(
-                    "{}: stubs are a JSON object of results by step or agent call name ({e})",
-                    path.display()
-                )
-            })?;
-        options.stubs = stubs
-            .into_iter()
-            .map(|(name, value)| (name, Payload::new(value.to_string().into_bytes())))
-            .collect();
-    }
+    let options = CounterfactualOptions {
+        stubs: match stubs_file {
+            Some(path) => load_stubs(path)?,
+            None => Default::default(),
+        },
+    };
     let source =
         std::fs::read_to_string(procedure).map_err(|e| format!("{}: {e}", procedure.display()))?;
     let name = procedure
@@ -414,6 +711,34 @@ fn counterfactual(dir: &Path, procedure: &Path, args: &[String]) -> Result<Strin
             return Err(format!("no run `{key}`"));
         }
     }
+    Ok(counterfactual_report(&partition, &procedure, &keys, workflow, &options)?.0)
+}
+
+/// Stubs for counterfactual replay: a JSON object of results by step or agent call name.
+fn load_stubs(path: &Path) -> Result<std::collections::BTreeMap<String, Payload>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let stubs: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "{}: stubs are a JSON object of results by step or agent call name ({e})",
+                path.display()
+            )
+        })?;
+    Ok(stubs
+        .into_iter()
+        .map(|(name, value)| (name, Payload::new(value.to_string().into_bytes())))
+        .collect())
+}
+
+/// Replays the chosen runs (by key, or every run of `workflow`) against `procedure`; the report and the
+/// counts of same, different and unresolved runs.
+fn counterfactual_report(
+    partition: &Partition<FileLog, RedbStateStore>,
+    procedure: &Procedure,
+    keys: &[&str],
+    workflow: Option<&str>,
+    options: &CounterfactualOptions,
+) -> Result<(String, [usize; 3]), String> {
     let mut out = String::new();
     let mut counts = [0usize; 3];
     for (run_id, run) in partition.runs() {
@@ -422,7 +747,7 @@ fn counterfactual(dir: &Path, procedure: &Path, args: &[String]) -> Result<Strin
         if !chosen {
             continue;
         }
-        let replayed = replay_counterfactual(run_id, run.journal(), &procedure, &options)?;
+        let replayed = replay_counterfactual(run_id, run.journal(), procedure, options)?;
         let verdict = replayed.verdict();
         counts[verdict as usize] += 1;
         out.push_str(&format!(
@@ -455,7 +780,7 @@ fn counterfactual(dir: &Path, procedure: &Path, args: &[String]) -> Result<Strin
         "{} runs: {same} same, {different} different, {unresolved} unresolved\n",
         same + different + unresolved
     ));
-    Ok(out)
+    Ok((out, counts))
 }
 
 fn outcome(outcome: &Outcome) -> String {
