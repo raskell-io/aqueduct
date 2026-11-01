@@ -49,6 +49,10 @@ Fix the cause; never change the seed range or loosen an invariant to make it pas
    merge, and never push to `main`, force-push, rewrite published history, change branch protection or
    repository settings, or publish crates.
 
+For Claude Code, `.claude/settings.json` enforces part of this: it denies force-pushes, pushes to `main` and
+publishing crates in every session in this repository. Personal settings go in `.claude/settings.local.json`,
+which is not committed.
+
 ## When to write an ADR
 
 Before a change that disagrees with the brief or an ADR, adds a journal entry or command, changes the
