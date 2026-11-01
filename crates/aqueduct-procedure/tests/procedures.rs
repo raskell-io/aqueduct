@@ -65,6 +65,22 @@ fn run(
                 };
                 Event::StepResult { cmd, outcome }
             }
+            // Agent calls are answered by the same world, as `agent:<name>`.
+            Effect::DispatchAgent {
+                cmd, name, request, ..
+            } => {
+                let request: Value = serde_json::from_slice(request.as_bytes()).unwrap();
+                let outcome = execute(&format!("agent:{name}"), &request).map(|response| {
+                    aqueduct_core::AgentResponse {
+                        model: "test/model".into(),
+                        params: Payload::new(*b"{}"),
+                        response: Payload::new(response.to_string().into_bytes()),
+                        input_tokens: 100,
+                        output_tokens: 20,
+                    }
+                });
+                Event::AgentResult { cmd, outcome }
+            }
             Effect::Finished(_) | Effect::ContinueAsNew { .. } => continue,
         };
         let transition = state.handle(event);
@@ -114,6 +130,7 @@ fn step_names(journal: &[Entry]) -> Vec<String> {
         .iter()
         .filter_map(|e| match e {
             Entry::StepScheduled { name, .. } => Some(name.clone()),
+            Entry::AgentCallScheduled { name, .. } => Some(format!("agent:{name}")),
             _ => None,
         })
         .collect()

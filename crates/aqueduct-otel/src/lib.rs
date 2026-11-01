@@ -316,10 +316,21 @@ impl Observer for OtelObserver {
                     .add(1, &[flow(), KeyValue::new("aqueduct.status", "parked")]);
                 point("run parked".into(), Vec::new(), Some(reason.clone()));
             }
+            Entry::AgentCallCompleted { cmd, response } => point(
+                format!("agent answered ({})", response.model),
+                vec![
+                    cmd_attribute(*cmd),
+                    KeyValue::new("gen_ai.request.model", response.model.clone()),
+                    KeyValue::new("gen_ai.usage.input_tokens", response.input_tokens as i64),
+                    KeyValue::new("gen_ai.usage.output_tokens", response.output_tokens as i64),
+                ],
+                None,
+            ),
             // Covered by the step execution spans.
             Entry::StepScheduled { .. }
             | Entry::StepCompleted { .. }
-            | Entry::StepFailed { .. } => {}
+            | Entry::StepFailed { .. }
+            | Entry::AgentCallScheduled { .. } => {}
         }
     }
 

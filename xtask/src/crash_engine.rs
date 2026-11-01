@@ -73,8 +73,10 @@ fn reference(decider: &dyn Decider, n: u64) -> Result<String, String> {
                 cmd,
                 outcome: execute(&name, &input),
             },
-            // The crash workload's procedure never continues as new.
-            Effect::Finished(_) | Effect::ContinueAsNew { .. } => continue,
+            // The crash workload's procedure never continues as new or calls agents.
+            Effect::Finished(_) | Effect::ContinueAsNew { .. } | Effect::DispatchAgent { .. } => {
+                continue;
+            }
         };
         let transition = state.handle(event);
         for entry in &transition.entries {

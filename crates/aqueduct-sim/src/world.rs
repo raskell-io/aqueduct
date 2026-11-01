@@ -33,6 +33,13 @@ enum Ev {
         cmd: CommandIndex,
         name: String,
         input: Payload,
+        /// For an agent call, its token budget.
+        agent: Option<u64>,
+    },
+    NodeAgentResult {
+        key: String,
+        cmd: CommandIndex,
+        outcome: Result<aqueduct_core::AgentResponse, String>,
     },
     WorkerResultAck {
         key: String,
@@ -89,6 +96,7 @@ enum Ev {
 #[derive(Clone, Debug)]
 enum WorkerReport {
     Outcome(StepOutcome),
+    Agent(Result<aqueduct_core::AgentResponse, String>),
     Retry(String),
 }
 
@@ -116,6 +124,7 @@ impl Ev {
             Ev::ClientCancelAck { .. } => 19,
             Ev::NodeResolve { .. } => 20,
             Ev::ClientResolveAck { .. } => 21,
+            Ev::NodeAgentResult { .. } => 22,
         }
     }
 
@@ -133,6 +142,7 @@ impl Ev {
                 | Ev::ClientCancelAck { .. }
                 | Ev::NodeResolve { .. }
                 | Ev::ClientResolveAck { .. }
+                | Ev::NodeAgentResult { .. }
                 | Ev::NodeAttemptFailed { .. }
                 | Ev::WorkerAttemptAck { .. }
         )
@@ -168,6 +178,8 @@ struct World<'c> {
     /// Results the worker holds and resends until acknowledged.
     worker_pending: BTreeMap<(String, CommandIndex), WorkerReport>,
     executions: BTreeMap<(String, CommandIndex), u64>,
+    /// Set when the node dispatches an agent call whose response is already recorded.
+    agent_reissued: Option<String>,
     /// The name and input each command was dispatched with.
     dispatched: BTreeMap<(String, CommandIndex), (String, Payload)>,
     report: Report,
@@ -177,6 +189,7 @@ struct World<'c> {
 fn report_event(key: String, cmd: CommandIndex, report: WorkerReport) -> Ev {
     match report {
         WorkerReport::Outcome(outcome) => Ev::NodeStepResult { key, cmd, outcome },
+        WorkerReport::Agent(outcome) => Ev::NodeAgentResult { key, cmd, outcome },
         WorkerReport::Retry(error) => Ev::NodeAttemptFailed { key, cmd, error },
     }
 }
@@ -230,6 +243,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         worker_pending: BTreeMap::new(),
         executions: BTreeMap::new(),
         dispatched: BTreeMap::new(),
+        agent_reissued: None,
         report: Report {
             seed,
             ..Report::default()
@@ -237,6 +251,10 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     };
     world.node.forget_dirty_runs = config.bugs.checkpoint_forgets_recovered_runs;
     world.node.skip_successor_repair = config.bugs.skip_successor_repair;
+    world.node.release_stale_dispatches = config.bugs.release_stale_dispatches;
+    if config.bugs.release_stale_dispatches {
+        world.node.inject_release_stale_dispatches();
+    }
     if config.cancel_every > 0 {
         world.to_cancel = (0..config.runs)
             .filter(|i| i % config.cancel_every == config.cancel_every - 1)
@@ -298,6 +316,9 @@ impl World<'_> {
             }
             self.node.check_fold()?;
             self.check_timers()?;
+            if let Some(reissued) = self.agent_reissued.take() {
+                return Err(reissued);
+            }
 
             if !self.faults && self.quiescent() {
                 self.final_checks()?;
@@ -324,6 +345,12 @@ impl World<'_> {
             Ev::NodeStart { key, input } => {
                 if self.node.up {
                     self.node.on_start(&key, input)?;
+                    self.after_node_event();
+                }
+            }
+            Ev::NodeAgentResult { key, cmd, outcome } => {
+                if self.node.up {
+                    self.node.on_agent_result(&key, cmd, outcome)?;
                     self.after_node_event();
                 }
             }
@@ -494,6 +521,7 @@ impl World<'_> {
                 cmd,
                 name,
                 input,
+                agent,
             } => {
                 if self.faults && self.rng.chance(self.config.worker_amnesia_ppm) {
                     // The worker restarts and forgets the results it was still trying to report.
@@ -518,6 +546,9 @@ impl World<'_> {
                 let report = if self.faults && self.rng.chance(self.config.transient_ppm) {
                     // A transient failure: the engine's retry policy schedules another attempt.
                     WorkerReport::Retry("transient failure".into())
+                } else if agent.is_some() {
+                    self.report.agent_calls += 1;
+                    WorkerReport::Agent(Ok(workflow::fake_model(&name, &input)))
                 } else {
                     WorkerReport::Outcome((self.workload.execute)(&name, &input))
                 };
@@ -527,7 +558,8 @@ impl World<'_> {
             }
             Ev::WorkerResultAck { key, cmd } => {
                 // Acknowledges an outcome: it must never be lost.
-                if let Some(WorkerReport::Outcome(_)) = self.worker_pending.get(&(key.clone(), cmd))
+                if let Some(WorkerReport::Outcome(_) | WorkerReport::Agent(_)) =
+                    self.worker_pending.get(&(key.clone(), cmd))
                 {
                     self.worker_pending.remove(&(key.clone(), cmd));
                 }
@@ -582,7 +614,35 @@ impl World<'_> {
                     cmd,
                     name,
                     input,
+                    agent: None,
                 },
+                Outbound::DispatchAgent {
+                    key,
+                    cmd,
+                    name,
+                    request,
+                    budget_tokens,
+                } => {
+                    // Invariant: a recorded agent call is never issued again (phase 2 acceptance). Checked
+                    // when the node sends the dispatch, not when a delayed copy arrives.
+                    let recorded = self.node.runs().get(&key).is_some_and(|run| {
+                        run.journal().iter().any(
+                            |e| matches!(e, Entry::AgentCallCompleted { cmd: c, .. } if *c == cmd),
+                        )
+                    });
+                    if recorded && self.agent_reissued.is_none() {
+                        self.agent_reissued = Some(format!(
+                            "run {key} agent call {cmd} was dispatched again after its response was recorded"
+                        ));
+                    }
+                    Ev::WorkerDispatch {
+                        key,
+                        cmd,
+                        name,
+                        input: request,
+                        agent: Some(budget_tokens),
+                    }
+                }
                 Outbound::ResultRecorded { key, cmd } => Ev::WorkerResultAck { key, cmd },
                 Outbound::AttemptRecorded { key, cmd } => Ev::WorkerAttemptAck { key, cmd },
                 Outbound::Finished { .. } => continue,
@@ -791,7 +851,7 @@ impl World<'_> {
             .filter(|e| matches!(e, Entry::EscalationResolved { .. }))
             .count() as u64;
 
-        // Every dispatched step is in the final journal as it was dispatched.
+        // Every dispatched step and agent call is in the final journal as it was dispatched.
         for ((key, cmd), (name, input)) in &self.dispatched {
             let scheduled = self.node.runs().get(key).and_then(|run| {
                 run.journal().iter().find_map(|e| match e {
@@ -799,6 +859,12 @@ impl World<'_> {
                         cmd: c,
                         name,
                         input,
+                    }
+                    | aqueduct_core::Entry::AgentCallScheduled {
+                        cmd: c,
+                        name,
+                        request: input,
+                        ..
                     } if c == cmd => Some((name, input)),
                     _ => None,
                 })

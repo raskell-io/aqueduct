@@ -9,8 +9,9 @@
 //!   instead of failing the run when the step fails.
 //! - `parallel([[name, input], ...])` runs several steps concurrently and returns their results in
 //!   the order given.
-//! - `agent(name, input, prompt = ..., output_schema = ..., budget_tokens = ...)` runs a bounded agent
-//!   step (in this spike, a step named `agent:<name>`).
+//! - `agent(name, input, prompt = ..., output_schema = ..., budget_tokens = ...)` calls a model through
+//!   the engine's agent executor and returns its response; the model, its parameters and the tokens used
+//!   are journaled, and replay never calls it again (ADR 0023).
 //! - `escalate(reason, payload = None)` hands a decision to a person or an agent, waits durably for
 //!   the resolution and returns it (ADR 0020).
 //! - `continue_as_new(input)` ends the run and starts a new run of the procedure under the same key with
@@ -441,7 +442,8 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
         Ok(eval.heap().alloc(serde_json::Value::Array(results)))
     }
 
-    /// Runs a bounded agent step. In this spike: a step named `agent:<name>` carrying its bounds.
+    /// Calls a model, bounded by a token budget: the engine's agent executor runs it, and its response,
+    /// model identity and usage are journaled (an agent step, BRIEF.md section 12).
     fn agent<'v>(
         name: &str,
         input: Value<'v>,
@@ -457,7 +459,16 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
             "budget_tokens": budget_tokens,
         });
         let request = Payload::new(request.to_string().into_bytes());
-        let outcome = with_activation(|act| act.issue(format!("agent:{name}"), request))?;
+        let budget_tokens = u64::try_from(budget_tokens)
+            .ok()
+            .filter(|budget| *budget > 0)
+            .ok_or_else(|| anyhow::anyhow!("agent(...) needs budget_tokens greater than 0"))?;
+        let command = Command::CallAgent {
+            name: name.to_owned(),
+            request,
+            budget_tokens,
+        };
+        let outcome = with_activation(|act| act.issue_command(command))?;
         match outcome {
             None => suspend_or_fail(Stop::Suspend),
             Some(StepOutcome::Failed(error)) => suspend_or_fail(Stop::StepFailed(error)),

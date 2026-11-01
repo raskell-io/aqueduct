@@ -1,7 +1,7 @@
 //! The run state machine.
 
 use crate::decider::{Command, Env, RunView};
-use crate::journal::{CommandIndex, Entry, Payload, StepOutcome};
+use crate::journal::{AgentResponse, CommandIndex, Entry, Payload, StepOutcome};
 
 /// The lifecycle status of a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,6 +56,20 @@ pub enum CommandKind {
     Recorded,
     /// An escalation, waiting for a person or an agent to resolve it. Its outcome is the resolution.
     Escalation,
+    /// An agent call (a bounded model call), executed by the engine's agent executor. Its outcome is the
+    /// model's response.
+    Agent {
+        /// The most tokens the call may use.
+        budget_tokens: u64,
+    },
+}
+
+impl CommandKind {
+    /// Whether commands of this kind are dispatched for execution (steps and agent calls): they can be
+    /// retried, re-dispatched after a restart, and their late results are dropped.
+    pub fn is_dispatched(self) -> bool {
+        matches!(self, CommandKind::Step | CommandKind::Agent { .. })
+    }
 }
 
 /// A command as recorded in the journal, with its outcome if one has been recorded.
@@ -78,9 +92,30 @@ pub struct ScheduledStep {
 }
 
 impl ScheduledStep {
+    /// The effect that executes this command, if it is executed by the engine.
+    fn dispatch(&self, cmd: CommandIndex) -> Option<Effect> {
+        match self.kind {
+            CommandKind::Step => Some(Effect::DispatchStep {
+                cmd,
+                name: self.name.clone(),
+                input: self.input.clone(),
+            }),
+            CommandKind::Agent { budget_tokens } => Some(Effect::DispatchAgent {
+                cmd,
+                name: self.name.clone(),
+                request: self.input.clone(),
+                budget_tokens,
+            }),
+            _ => None,
+        }
+    }
+
     fn describe(&self) -> String {
         match self.kind {
             CommandKind::Step => format!("step `{}`", self.name),
+            CommandKind::Agent { budget_tokens } => {
+                format!("agent call `{}` (budget {budget_tokens} tokens)", self.name)
+            }
             CommandKind::Sleep { duration_ms, .. } => format!("a sleep of {duration_ms} ms"),
             CommandKind::Signal { timeout_ms, .. } => {
                 format!(
@@ -105,6 +140,14 @@ pub enum Event {
         cmd: CommandIndex,
         /// The step's outcome.
         outcome: StepOutcome,
+    },
+    /// An agent call finished: the model's response with its identity and usage, or a terminal failure.
+    /// May arrive more than once for the same command.
+    AgentResult {
+        /// The command the result belongs to.
+        cmd: CommandIndex,
+        /// The response, or the failure.
+        outcome: Result<AgentResponse, String>,
     },
     /// A step attempt failed with a retryable error, and the engine's retry policy allows another
     /// attempt after `retry_after_ms`. (When it does not, the engine reports a terminal
@@ -159,6 +202,17 @@ pub enum Effect {
         name: String,
         /// The step's input.
         input: Payload,
+    },
+    /// Run an agent call and feed the result back as [`Event::AgentResult`].
+    DispatchAgent {
+        /// The call's command index.
+        cmd: CommandIndex,
+        /// The call's name.
+        name: String,
+        /// The request (JSON).
+        request: Payload,
+        /// The most tokens the call may use.
+        budget_tokens: u64,
     },
     /// The run reached a terminal status.
     Finished(Status),
@@ -264,6 +318,8 @@ pub struct RunState {
     cancel: Option<String>,
     /// The next run's input, if the run continued as new.
     continued_with: Option<Payload>,
+    /// Tokens used by the run's completed agent calls.
+    tokens_used: u64,
     /// A cancellation found no pending command; the next waiting command takes it.
     pending_cancel: bool,
 }
@@ -288,6 +344,7 @@ impl RunState {
             entries: 1,
             cancel: None,
             continued_with: None,
+            tokens_used: 0,
             pending_cancel: false,
         };
         for entry in rest {
@@ -377,8 +434,24 @@ impl RunState {
                 self.expect_kind(*cmd, |kind| kind == CommandKind::Step)?;
                 self.record(*cmd, StepOutcome::Completed(result.clone()))?;
             }
+            Entry::AgentCallScheduled {
+                cmd,
+                name,
+                request,
+                budget_tokens,
+            } => {
+                let kind = CommandKind::Agent {
+                    budget_tokens: *budget_tokens,
+                };
+                self.push_command(*cmd, name, request.clone(), kind)?;
+            }
+            Entry::AgentCallCompleted { cmd, response } => {
+                self.expect_kind(*cmd, |kind| matches!(kind, CommandKind::Agent { .. }))?;
+                self.record(*cmd, StepOutcome::Completed(response.response.clone()))?;
+                self.tokens_used = self.tokens_used.saturating_add(response.tokens());
+            }
             Entry::StepFailed { cmd, error } => {
-                self.expect_kind(*cmd, |kind| kind == CommandKind::Step)?;
+                self.expect_kind(*cmd, CommandKind::is_dispatched)?;
                 self.record(*cmd, StepOutcome::Failed(error.clone()))?;
             }
             Entry::StepRetryScheduled {
@@ -389,7 +462,7 @@ impl RunState {
             } => {
                 let index = self.index(*cmd)?;
                 let step = &mut self.steps[index];
-                let valid = step.kind == CommandKind::Step
+                let valid = step.kind.is_dispatched()
                     && step.outcome.is_none()
                     && step.retry_at.is_none()
                     && *attempt == step.failed_attempts + 1;
@@ -399,7 +472,7 @@ impl RunState {
                 step.failed_attempts = *attempt;
                 step.retry_at = Some(*wake_at);
             }
-            Entry::TimerFired { cmd } if self.command(*cmd)?.kind == CommandKind::Step => {
+            Entry::TimerFired { cmd } if self.command(*cmd)?.kind.is_dispatched() => {
                 // A retry is due: the step is dispatched again; it still has no outcome.
                 let index = self.index(*cmd)?;
                 if self.steps[index].retry_at.take().is_none()
@@ -462,6 +535,7 @@ impl RunState {
         }
         match event {
             Event::StepResult { cmd, outcome } => self.handle_result(cmd, outcome),
+            Event::AgentResult { cmd, outcome } => self.handle_agent_result(cmd, outcome),
             Event::Decision(commands) => self.handle_decision(commands, now_ms),
             Event::TimerFired { cmd } => self.handle_timer(cmd),
             Event::StepAttemptFailed {
@@ -504,7 +578,9 @@ impl RunState {
             .zip(0u32..)
             .filter(|(step, _)| step.outcome.is_none())
             .filter_map(|(step, index)| match step.kind {
-                CommandKind::Step => step.retry_at.map(|wake_at| (CommandIndex(index), wake_at)),
+                CommandKind::Step | CommandKind::Agent { .. } => {
+                    step.retry_at.map(|wake_at| (CommandIndex(index), wake_at))
+                }
                 CommandKind::Sleep { wake_at, .. } => Some((CommandIndex(index), wake_at)),
                 CommandKind::Signal { wake_at, .. } if wake_at > 0 => {
                     Some((CommandIndex(index), wake_at))
@@ -534,13 +610,9 @@ impl RunState {
             .iter()
             .zip(0u32..)
             .filter(|(step, _)| {
-                step.outcome.is_none() && step.kind == CommandKind::Step && step.retry_at.is_none()
+                step.outcome.is_none() && step.kind.is_dispatched() && step.retry_at.is_none()
             })
-            .map(|(step, index)| Effect::DispatchStep {
-                cmd: CommandIndex(index),
-                name: step.name.clone(),
-                input: step.input.clone(),
-            })
+            .filter_map(|(step, index)| step.dispatch(CommandIndex(index)))
             .collect()
     }
 
@@ -602,6 +674,11 @@ impl RunState {
             .filter(|(step, _)| step.kind == CommandKind::Escalation && step.outcome.is_none())
             .map(|(step, index)| (CommandIndex(index), step.name.as_str(), &step.input))
             .collect()
+    }
+
+    /// Tokens used by the run's completed agent calls.
+    pub fn tokens_used(&self) -> u64 {
+        self.tokens_used
     }
 
     /// The next run's input, if the run continued as new.
@@ -741,6 +818,41 @@ impl RunState {
         }
     }
 
+    fn handle_agent_result(
+        &self,
+        cmd: CommandIndex,
+        outcome: Result<AgentResponse, String>,
+    ) -> Transition {
+        let Ok(step) = self.command(cmd) else {
+            return Transition::none();
+        };
+        if step.outcome.is_some() || !matches!(step.kind, CommandKind::Agent { .. }) {
+            // At most once: a repeated call's result is dropped.
+            return Transition::none();
+        }
+        let budget = match step.kind {
+            CommandKind::Agent { budget_tokens } => budget_tokens,
+            _ => 0,
+        };
+        let entry = match outcome {
+            // The budget is a hard limit: an answer that cost more is not recorded as an answer.
+            Ok(response) if response.tokens() > budget => Entry::StepFailed {
+                cmd,
+                error: format!(
+                    "agent call `{}` used {} tokens, over its budget of {budget}",
+                    step.name,
+                    response.tokens()
+                ),
+            },
+            Ok(response) => Entry::AgentCallCompleted { cmd, response },
+            Err(error) => Entry::StepFailed { cmd, error },
+        };
+        Transition {
+            entries: vec![entry],
+            effects: vec![Effect::Activate],
+        }
+    }
+
     fn handle_attempt_failed(
         &self,
         cmd: CommandIndex,
@@ -751,7 +863,7 @@ impl RunState {
         let Ok(step) = self.command(cmd) else {
             return Transition::none();
         };
-        if step.kind != CommandKind::Step || step.outcome.is_some() || step.retry_at.is_some() {
+        if !step.kind.is_dispatched() || step.outcome.is_some() || step.retry_at.is_some() {
             // Already completed, or already waiting to retry (a duplicate report): nothing to do.
             return Transition::none();
         }
@@ -770,23 +882,22 @@ impl RunState {
         let Ok(step) = self.command(cmd) else {
             return Transition::none();
         };
-        if step.kind == CommandKind::Step {
+        if step.kind.is_dispatched() {
             if step.outcome.is_some() || step.retry_at.is_none() {
                 return Transition::none();
             }
             return Transition {
                 entries: vec![Entry::TimerFired { cmd }],
-                effects: vec![Effect::DispatchStep {
-                    cmd,
-                    name: step.name.clone(),
-                    input: step.input.clone(),
-                }],
+                effects: step.dispatch(cmd).into_iter().collect(),
             };
         }
         let has_timer = match step.kind {
             CommandKind::Sleep { .. } => true,
             CommandKind::Signal { wake_at, .. } => wake_at > 0,
-            CommandKind::Step | CommandKind::Recorded | CommandKind::Escalation => false,
+            CommandKind::Step
+            | CommandKind::Recorded
+            | CommandKind::Escalation
+            | CommandKind::Agent { .. } => false,
         };
         if step.outcome.is_some() || !has_timer {
             return Transition::none();
@@ -830,6 +941,9 @@ impl RunState {
         for (position, command) in commands.into_iter().enumerate() {
             let new_kind = match &command {
                 Command::ScheduleStep { .. } => Some(CommandKind::Step),
+                Command::CallAgent { budget_tokens, .. } => Some(CommandKind::Agent {
+                    budget_tokens: *budget_tokens,
+                }),
                 Command::Sleep { duration_ms } => Some(CommandKind::Sleep {
                     duration_ms: *duration_ms,
                     wake_at: now_ms.saturating_add(*duration_ms),
@@ -848,7 +962,12 @@ impl RunState {
             };
             if let Some(kind) = new_kind {
                 let (name, input) = match &command {
-                    Command::ScheduleStep { name, input } => (name.clone(), input.clone()),
+                    Command::ScheduleStep { name, input }
+                    | Command::CallAgent {
+                        name,
+                        request: input,
+                        ..
+                    } => (name.clone(), input.clone()),
                     Command::Escalate { reason, payload } => (reason.clone(), payload.clone()),
                     Command::AwaitSignal { name, .. } | Command::Record { name, .. } => {
                         (name.clone(), Payload::default())
@@ -912,6 +1031,12 @@ impl RunState {
                                 reason: issued.name,
                                 payload: issued.input,
                             },
+                            CommandKind::Agent { budget_tokens } => Entry::AgentCallScheduled {
+                                cmd,
+                                name: issued.name,
+                                request: issued.input,
+                                budget_tokens,
+                            },
                             CommandKind::Recorded => continue,
                         });
                         if !transition.effects.contains(&Effect::Activate) {
@@ -941,6 +1066,20 @@ impl RunState {
                                 cmd,
                                 duration_ms,
                                 wake_at,
+                            });
+                        }
+                        CommandKind::Agent { budget_tokens } => {
+                            transition.entries.push(Entry::AgentCallScheduled {
+                                cmd,
+                                name: issued.name.clone(),
+                                request: issued.input.clone(),
+                                budget_tokens,
+                            });
+                            transition.effects.push(Effect::DispatchAgent {
+                                cmd,
+                                name: issued.name,
+                                request: issued.input,
+                                budget_tokens,
                             });
                         }
                         CommandKind::Escalation => {
@@ -994,7 +1133,8 @@ impl RunState {
                 | Command::Sleep { .. }
                 | Command::AwaitSignal { .. }
                 | Command::Record { .. }
-                | Command::Escalate { .. } => {}
+                | Command::Escalate { .. }
+                | Command::CallAgent { .. } => {}
                 Command::CompleteRun { .. }
                 | Command::FailRun { .. }
                 | Command::Park { .. }
@@ -1061,6 +1201,9 @@ fn same_command(recorded: &ScheduledStep, issued: &ScheduledStep) -> bool {
             ) => a == b,
             (CommandKind::Recorded, CommandKind::Recorded) => true,
             (CommandKind::Escalation, CommandKind::Escalation) => true,
+            (CommandKind::Agent { budget_tokens: a }, CommandKind::Agent { budget_tokens: b }) => {
+                a == b
+            }
             _ => false,
         }
 }

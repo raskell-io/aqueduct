@@ -224,6 +224,9 @@ fn describe(dir: &Path, key: &str) -> Result<String, String> {
             CommandKind::Signal { .. } => format!("wait for signal {}", step.name),
             CommandKind::Recorded => format!("record {}", step.name),
             CommandKind::Escalation => format!("escalation {}", step.name),
+            CommandKind::Agent { budget_tokens } => {
+                format!("agent call {} (budget {budget_tokens} tokens)", step.name)
+            }
         };
         let outcome = match &step.outcome {
             None if step.retry_at.is_some() => {
@@ -368,6 +371,22 @@ fn describe_entry(entry: &Entry) -> String {
         }
         Entry::RunCompleted { output } => format!("run completed with {}", text(output)),
         Entry::ContinuedAsNew { input } => format!("continued as new with {}", text(input)),
+        Entry::AgentCallScheduled {
+            cmd,
+            name,
+            request,
+            budget_tokens,
+        } => format!(
+            "[{cmd}] agent call {name} (budget {budget_tokens} tokens) with {}",
+            text(request)
+        ),
+        Entry::AgentCallCompleted { cmd, response } => format!(
+            "[{cmd}] {} answered with {} ({} + {} tokens)",
+            response.model,
+            text(&response.response),
+            response.input_tokens,
+            response.output_tokens
+        ),
         Entry::RunFailed { error } => format!("run failed: {error}"),
         Entry::Parked { reason } => format!("run parked: {reason}"),
         Entry::CancelRequested { reason } => format!("cancel requested: {reason}"),
@@ -448,6 +467,20 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         Entry::ContinuedAsNew { input } => {
             json!({"kind": "ContinuedAsNew", "input": payload(input)})
         }
+        Entry::AgentCallScheduled {
+            cmd: c,
+            name,
+            request,
+            budget_tokens,
+        } => json!({
+            "kind": "AgentCallScheduled", "cmd": cmd(c), "name": name,
+            "request": payload(request), "budget_tokens": budget_tokens
+        }),
+        Entry::AgentCallCompleted { cmd: c, response } => json!({
+            "kind": "AgentCallCompleted", "cmd": cmd(c), "model": response.model,
+            "params": payload(&response.params), "response": payload(&response.response),
+            "input_tokens": response.input_tokens, "output_tokens": response.output_tokens
+        }),
         Entry::RunFailed { error } => json!({"kind": "RunFailed", "error": error}),
         Entry::Parked { reason } => json!({"kind": "Parked", "reason": reason}),
         Entry::CancelRequested { reason } => json!({"kind": "CancelRequested", "reason": reason}),

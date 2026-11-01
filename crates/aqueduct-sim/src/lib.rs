@@ -56,6 +56,8 @@ pub struct Bugs {
     /// On recovery, do not restart the successor of a run that continued as new when a crash tore its
     /// start off the log.
     pub skip_successor_repair: bool,
+    /// Release dispatches of commands whose result was recorded while they waited for the flush.
+    pub release_stale_dispatches: bool,
 }
 
 /// Parameters of a simulated world. Probabilities are in parts per million.
@@ -164,6 +166,8 @@ pub struct Report {
     pub cancelled: u64,
     /// Escalations resolved by the simulated reviewer.
     pub escalations_resolved: u64,
+    /// Agent calls executed by the simulated model, including repeats before a result was recorded.
+    pub agent_calls: u64,
     /// A fingerprint of the event sequence and the final chain heads. Equal for equal seeds.
     pub trace: u64,
 }
