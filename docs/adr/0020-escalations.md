@@ -40,5 +40,8 @@ escalations at all.
   escalations and settles or declines on their decision. The reference ingest pipeline
   (`crates/aqueduct/examples/ingest.rs`, run in CI) escalates when a review times out and continues with
   the operator's resolution.
-- The simulator does not exercise escalations yet: its workloads have no one to resolve them. A workload
-  whose client resolves escalations, as it sends signals, is the next step for coverage.
+- The simulator exercises escalations: its timers workload escalates a review after the `go` signal, and the
+  simulated reviewer polls the open escalations and resolves each (about one in four declined) over the
+  lossy network, retrying until acknowledged. Invariants: an acknowledged resolution is never lost, and every
+  run ends as the reference, which resolves the same way, says it should. With the injected bug that
+  releases messages before the sync, it finds lost resolutions.

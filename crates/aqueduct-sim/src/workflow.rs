@@ -153,14 +153,29 @@ pub async fn rust_pipeline(
     }
 }
 
-/// A procedure that sleeps one simulated second, then waits for the `go` signal.
+/// A procedure that sleeps one simulated second, waits for the `go` signal, then escalates a review and
+/// goes on only if the reviewer approves.
 pub const STARLARK_TIMERS: &str = r##"
 def run(input):
     extracted = step("extract", input)
     sleep(1)
     go = wait(signal("go"))
+    decision = escalate("review", extracted)
+    if decision != "approve":
+        fail("declined by the reviewer")
     return step("validate", extracted + "#" + go)
 "##;
+
+/// The simulated reviewer's decision for a run with this input: deterministic, so the reference model
+/// resolves exactly as the client does. About one in four runs is declined.
+pub fn review_decision(input: &Payload) -> Payload {
+    let sum: u32 = input.as_bytes().iter().map(|&b| u32::from(b)).sum();
+    if sum.is_multiple_of(4) {
+        Payload::new(*b"\"decline\"")
+    } else {
+        Payload::new(*b"\"approve\"")
+    }
+}
 
 /// Why the simulated client cancels runs.
 pub const CANCEL_REASON: &str = "the client gave up";
@@ -189,6 +204,8 @@ pub struct Workload {
     pub kind: WorkloadKind,
     /// Whether runs wait for a `go` signal from the client.
     pub signals: bool,
+    /// Whether runs escalate, for the client to resolve.
+    pub escalations: bool,
     pub decider: Arc<dyn Decider + Send + Sync>,
     pub execute: fn(&str, &Payload) -> StepOutcome,
 }
@@ -199,18 +216,21 @@ impl Workload {
             WorkloadKind::Pipeline => Workload {
                 kind,
                 signals: false,
+                escalations: false,
                 decider: Arc::new(Pipeline),
                 execute,
             },
             WorkloadKind::RustPipeline => Workload {
                 kind,
                 signals: false,
+                escalations: false,
                 decider: Arc::new(aqueduct_sdk::workflow(rust_pipeline)),
                 execute: execute_json,
             },
             WorkloadKind::StarlarkTimers => Workload {
                 kind,
                 signals: true,
+                escalations: true,
                 decider: Arc::new(
                     Procedure::compile("timers.star", STARLARK_TIMERS)
                         .map_err(|e| e.to_string())?,
@@ -220,6 +240,7 @@ impl Workload {
             WorkloadKind::StarlarkPipeline => Workload {
                 kind,
                 signals: false,
+                escalations: false,
                 decider: Arc::new(
                     Procedure::compile("pipeline.star", STARLARK_PIPELINE)
                         .map_err(|e| e.to_string())?,
@@ -257,6 +278,7 @@ pub fn reference(
     let mut state = RunState::from_journal(&first.entries).map_err(|e| e.to_string())?;
     let mut work = first.effects;
     let mut signalled = false;
+    let decision = review_decision(input);
     loop {
         let event = match work.pop() {
             Some(Effect::Activate) => Event::Decision(workload.decider.decide(&state.view())),
@@ -284,6 +306,11 @@ pub fn reference(
                         payload: Payload::new(GO.to_vec()),
                     }
                 }
+                // The reviewer resolves the open escalation.
+                None if !state.open_escalations().is_empty() => Event::ResolveEscalation {
+                    cmd: state.open_escalations()[0].0,
+                    outcome: decision.clone(),
+                },
                 None => return Err("the reference run is stuck".into()),
             },
         };

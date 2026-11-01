@@ -214,3 +214,45 @@ fn a_successor_torn_off_by_a_crash_is_restarted() {
         failure.message
     );
 }
+
+#[test]
+fn a_lost_escalation_resolution_is_caught() {
+    // The timers workload escalates a review that the simulated reviewer resolves. Acknowledging the
+    // resolution before it is durable lets a crash lose it.
+    let config = Config {
+        workload: WorkloadKind::StarlarkTimers,
+        bugs: Bugs {
+            ack_before_sync: true,
+            ..Bugs::default()
+        },
+        ..Config::default()
+    };
+    let caught = (0..3_000)
+        .filter_map(|seed| run_seed(seed, &config).err())
+        .find(|failure| failure.message.contains("acknowledged resolution"));
+    assert!(
+        caught.is_some(),
+        "the simulator should catch a lost resolution"
+    );
+}
+
+#[test]
+fn escalations_are_resolved_under_faults() {
+    let config = Config {
+        workload: WorkloadKind::StarlarkTimers,
+        ..Config::default()
+    };
+    let (mut resolved, mut completed, mut failed) = (0, 0, 0);
+    for seed in 0..300 {
+        let report = run_seed(seed, &config).unwrap_or_else(|failure| panic!("{failure}"));
+        resolved += report.escalations_resolved;
+        completed += report.completed;
+        failed += report.failed;
+    }
+    // Reviews happen, and both decisions are taken.
+    assert!(resolved > 500, "resolved {resolved}");
+    assert!(
+        completed > 200 && failed > 200,
+        "completed {completed}, failed {failed}"
+    );
+}

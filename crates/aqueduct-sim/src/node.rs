@@ -158,6 +158,32 @@ impl Node {
         }
     }
 
+    pub fn on_resolve(
+        &mut self,
+        run: &str,
+        cmd: CommandIndex,
+        outcome: Payload,
+    ) -> Result<(), String> {
+        match self.partition()?.resolve_escalation(run, cmd, outcome) {
+            Ok(()) | Err(aqueduct_engine::PartitionError::UnknownRun(_)) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Open escalations, as an operator's dashboard would list them: (run id, command).
+    pub fn open_escalations(&self) -> Vec<(String, CommandIndex)> {
+        self.partition
+            .as_ref()
+            .map(|partition| {
+                partition
+                    .open_escalations()
+                    .into_iter()
+                    .map(|(run, cmd, _, _)| (run, cmd))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn on_cancel(&mut self, key: &str) -> Result<(), String> {
         match self
             .partition()?

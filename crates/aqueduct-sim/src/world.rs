@@ -60,6 +60,14 @@ enum Ev {
     ClientCancelAck {
         key: String,
     },
+    NodeResolve {
+        run: String,
+        cmd: CommandIndex,
+        outcome: Payload,
+    },
+    ClientResolveAck {
+        run: String,
+    },
     TimerTick {
         incarnation: u64,
     },
@@ -106,6 +114,8 @@ impl Ev {
             Ev::CheckpointTick { .. } => 17,
             Ev::NodeCancel { .. } => 18,
             Ev::ClientCancelAck { .. } => 19,
+            Ev::NodeResolve { .. } => 20,
+            Ev::ClientResolveAck { .. } => 21,
         }
     }
 
@@ -121,6 +131,8 @@ impl Ev {
                 | Ev::ClientSignalAck { .. }
                 | Ev::NodeCancel { .. }
                 | Ev::ClientCancelAck { .. }
+                | Ev::NodeResolve { .. }
+                | Ev::ClientResolveAck { .. }
                 | Ev::NodeAttemptFailed { .. }
                 | Ev::WorkerAttemptAck { .. }
         )
@@ -149,6 +161,8 @@ struct World<'c> {
     /// Runs the client cancels, and those whose cancellation it saw acknowledged (never lost).
     to_cancel: BTreeSet<String>,
     acked_cancels: BTreeSet<String>,
+    /// Runs whose escalation's resolution the client saw acknowledged (never lost).
+    acked_resolutions: BTreeSet<String>,
     /// Timer firings (run, journal position) already checked against their wake time.
     checked_timers: BTreeSet<(String, usize)>,
     /// Results the worker holds and resends until acknowledged.
@@ -211,6 +225,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         acked_signals: BTreeSet::new(),
         to_cancel: BTreeSet::new(),
         acked_cancels: BTreeSet::new(),
+        acked_resolutions: BTreeSet::new(),
         checked_timers: BTreeSet::new(),
         worker_pending: BTreeMap::new(),
         executions: BTreeMap::new(),
@@ -374,6 +389,15 @@ impl World<'_> {
             Ev::ClientCancelAck { key } => {
                 self.acked_cancels.insert(key);
             }
+            Ev::ClientResolveAck { run } => {
+                self.acked_resolutions.insert(run);
+            }
+            Ev::NodeResolve { run, cmd, outcome } => {
+                if self.node.up {
+                    self.node.on_resolve(&run, cmd, outcome)?;
+                    self.after_node_event();
+                }
+            }
             Ev::NodeCancel { key } => {
                 if self.node.up {
                     self.node.on_cancel(&key)?;
@@ -420,9 +444,23 @@ impl World<'_> {
                     })
                     .cloned()
                     .collect();
+                // The reviewer: looks at the open escalations, as a dashboard would, and resolves each,
+                // retrying until the resolution is acknowledged.
+                let open: Vec<(String, CommandIndex)> = if self.workload.escalations {
+                    self.node.open_escalations()
+                } else {
+                    Vec::new()
+                };
+                let unfinished = self.wanted.iter().any(|(key, _)| {
+                    !self
+                        .latest(key)
+                        .is_some_and(|r| r.state().status().is_terminal())
+                });
                 let pending = !missing.is_empty()
                     || !unsignalled.is_empty()
                     || self.acked_cancels.len() < self.to_cancel.len()
+                    // A run may still escalate: keep looking.
+                    || (self.workload.escalations && unfinished)
                     || (self.workload.signals && self.acked_signals.len() < self.wanted.len());
                 for (key, input) in missing {
                     self.send(Ev::NodeStart { key, input });
@@ -435,6 +473,16 @@ impl World<'_> {
                 for key in uncancelled {
                     if self.rng.chance(300_000) {
                         self.send(Ev::NodeCancel { key });
+                    }
+                }
+                for (run, cmd) in open {
+                    if self.rng.chance(400_000) {
+                        let key = aqueduct_core::split_run_id(&run).0;
+                        let Some((_, input)) = self.wanted.iter().find(|(k, _)| k == key) else {
+                            return Err(format!("an escalation of unknown run {run:?}"));
+                        };
+                        let outcome = workflow::review_decision(input);
+                        self.send(Ev::NodeResolve { run, cmd, outcome });
                     }
                 }
                 if pending {
@@ -523,7 +571,7 @@ impl World<'_> {
                 Outbound::Started { key } => Ev::ClientStartAck { key },
                 Outbound::Signaled { key } => Ev::ClientSignalAck { key },
                 Outbound::Cancelled { key } => Ev::ClientCancelAck { key },
-                Outbound::Resolved { .. } => continue,
+                Outbound::Resolved { key } => Ev::ClientResolveAck { run: key },
                 Outbound::Dispatch {
                     key,
                     cmd,
@@ -610,6 +658,19 @@ impl World<'_> {
             // A cancellation of a run that had already ended is dropped, as specified.
             if run.state().cancel_reason().is_none() && !run.state().status().is_terminal() {
                 return Err(format!("lost acknowledged cancellation of {key}"));
+            }
+        }
+        for id in &self.acked_resolutions {
+            let Some(run) = self.node.runs().get(id) else {
+                return Err(format!("lost run {id:?} with an acknowledged resolution"));
+            };
+            let resolved = run
+                .journal()
+                .iter()
+                .any(|e| matches!(e, Entry::EscalationResolved { .. }));
+            // A resolution for an escalation that a cancellation closed first is dropped, as specified.
+            if !resolved && !run.state().status().is_terminal() {
+                return Err(format!("lost acknowledged resolution of {id:?}"));
             }
         }
         for key in &self.acked_signals {
@@ -721,6 +782,14 @@ impl World<'_> {
                 ));
             }
         }
+
+        self.report.escalations_resolved = self
+            .node
+            .runs()
+            .values()
+            .flat_map(|run| run.journal())
+            .filter(|e| matches!(e, Entry::EscalationResolved { .. }))
+            .count() as u64;
 
         // Every dispatched step is in the final journal as it was dispatched.
         for ((key, cmd), (name, input)) in &self.dispatched {

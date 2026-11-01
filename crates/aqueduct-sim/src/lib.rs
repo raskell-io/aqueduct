@@ -162,6 +162,8 @@ pub struct Report {
     pub failed: u64,
     /// Runs that were cancelled while running (and so failed as cancelled).
     pub cancelled: u64,
+    /// Escalations resolved by the simulated reviewer.
+    pub escalations_resolved: u64,
     /// A fingerprint of the event sequence and the final chain heads. Equal for equal seeds.
     pub trace: u64,
 }
