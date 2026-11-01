@@ -11,6 +11,7 @@ use aqueduct_ai::anthropic::Anthropic;
 use aqueduct_ai::openai::OpenAiCompatible;
 use aqueduct_ai::{AiExecutor, Model};
 use aqueduct_core::{CommandKind, Decider, Entry, Event, Payload, RunState, StepOutcome};
+use aqueduct_engine::counterfactual::{CounterfactualOptions, Outcome, replay_counterfactual};
 use aqueduct_engine::drift::{
     DriftOptions, DriftReport, Recorded, Replayed, Verdict, agent_calls, replay_agent_calls,
 };
@@ -27,6 +28,9 @@ commands:
   verify <dir>                        verify every run's hash chain and print its head
   export <dir> <key>                  a run's journal as JSON Lines (one object per entry)
   replay <dir> <key> <procedure.star> replay a run against a procedure and report divergence
+  counterfactual <dir> <procedure.star> (<key>... | --workflow <name>) [--stubs <file.json>]
+                                      replay past runs against a new procedure version, answering it
+                                      with their recorded results, and report where outcomes differ
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
@@ -69,6 +73,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
             Path::new(arg(1, "data directory")?),
             arg(2, "run key")?,
             Path::new(arg(3, "procedure file")?),
+        ),
+        Some("counterfactual") => counterfactual(
+            Path::new(arg(1, "data directory")?),
+            Path::new(arg(2, "procedure file")?),
+            &args[3..],
         ),
         Some("drift") => drift(Path::new(arg(1, "data directory")?), &args[2..]),
         Some("signal") => signal(
@@ -338,6 +347,109 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
         "replays without divergence: {} entries, {activations} activations checked\n",
         journal.len()
     ))
+}
+
+/// Counterfactual replay (ADR 0028): the chosen runs against a new procedure version.
+fn counterfactual(dir: &Path, procedure: &Path, args: &[String]) -> Result<String, String> {
+    let mut keys: Vec<&str> = Vec::new();
+    let (mut workflow, mut stubs_file) = (None, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--workflow" => workflow = Some(rest.next().ok_or("--workflow needs a name")?.as_str()),
+            "--stubs" => stubs_file = Some(Path::new(rest.next().ok_or("--stubs needs a file")?)),
+            flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
+            key => keys.push(key),
+        }
+    }
+    if keys.is_empty() && workflow.is_none() {
+        return Err("counterfactual needs run keys or --workflow <name>".into());
+    }
+    let mut options = CounterfactualOptions::default();
+    if let Some(path) = stubs_file {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let stubs: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|e| {
+                format!(
+                    "{}: stubs are a JSON object of results by step or agent call name ({e})",
+                    path.display()
+                )
+            })?;
+        options.stubs = stubs
+            .into_iter()
+            .map(|(name, value)| (name, Payload::new(value.to_string().into_bytes())))
+            .collect();
+    }
+    let source =
+        std::fs::read_to_string(procedure).map_err(|e| format!("{}: {e}", procedure.display()))?;
+    let name = procedure
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("procedure");
+    let procedure = Procedure::compile(name, &source).map_err(|e| e.to_string())?;
+
+    let partition = load(dir)?;
+    for key in &keys {
+        if !partition
+            .runs()
+            .keys()
+            .any(|id| aqueduct_core::split_run_id(id).0 == *key)
+        {
+            return Err(format!("no run `{key}`"));
+        }
+    }
+    let mut out = String::new();
+    let mut counts = [0usize; 3];
+    for (run_id, run) in partition.runs() {
+        let key = aqueduct_core::split_run_id(run_id).0;
+        let chosen = keys.contains(&key) || workflow.is_some_and(|w| run.state().workflow() == w);
+        if !chosen {
+            continue;
+        }
+        let replayed = replay_counterfactual(run_id, run.journal(), &procedure, &options)?;
+        let verdict = replayed.verdict();
+        counts[verdict as usize] += 1;
+        out.push_str(&format!(
+            "{}  {}  old: {}  new: {}\n",
+            run_id.replace('\0', "@"),
+            verdict.as_str(),
+            outcome(&replayed.old),
+            outcome(&replayed.new)
+        ));
+        if let Some(difference) = &replayed.first_difference {
+            out.push_str(&format!(
+                "  first difference at command {}: {} -> {}\n",
+                difference.cmd.0,
+                difference.old.as_deref().unwrap_or("(none)"),
+                difference.new.as_deref().unwrap_or("(none)")
+            ));
+        }
+        for unresolved in &replayed.unresolved {
+            out.push_str(&format!(
+                "  unresolved command {}: {}\n",
+                unresolved.cmd.0, unresolved.what
+            ));
+        }
+        if !replayed.stubbed.is_empty() {
+            out.push_str(&format!("  stubbed: {}\n", replayed.stubbed.join(", ")));
+        }
+    }
+    let [same, different, unresolved] = counts;
+    out.push_str(&format!(
+        "{} runs: {same} same, {different} different, {unresolved} unresolved\n",
+        same + different + unresolved
+    ));
+    Ok(out)
+}
+
+fn outcome(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Completed(output) => format!("completed {}", short(output)),
+        Outcome::Failed(error) => format!("failed: {error}"),
+        Outcome::Continued(input) => format!("continued as new with {}", short(input)),
+        Outcome::Parked(reason) => format!("parked: {reason}"),
+        Outcome::Waiting => "waiting".into(),
+    }
 }
 
 /// Model-drift replay (ADR 0027): every recorded agent call of the chosen runs, asked again.

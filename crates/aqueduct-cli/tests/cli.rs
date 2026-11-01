@@ -488,3 +488,105 @@ def run(docs):
     assert!(cli(&["verify", path]).unwrap().contains("batch-1"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn past_runs_are_replayed_against_a_new_procedure_version() {
+    let v1 = r#"
+def run(claim):
+    score = step("score", claim)
+    if score > 50:
+        return {"decision": "review", "score": score}
+    return {"decision": "approve", "score": score}
+"#;
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-cf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_str().unwrap();
+    {
+        let engine = Engine::builder(&dir)
+            .workflow(
+                "claims",
+                Arc::new(Procedure::compile("claims.star", v1).unwrap()),
+            )
+            .step("score", |claim: &Payload| {
+                let claim: serde_json::Value = serde_json::from_slice(claim.as_bytes()).unwrap();
+                let score = claim["amount"].as_u64().unwrap() / 100;
+                Attempt::Completed(Payload::new(score.to_string().into_bytes()))
+            })
+            .open()
+            .unwrap();
+        for (key, amount) in [("c-1", 3000), ("c-2", 6000), ("c-3", 9000)] {
+            let claim = format!("{{\"amount\": {amount}, \"customer\": \"{key}\"}}");
+            engine
+                .start(key, "claims", Payload::new(claim.into_bytes()))
+                .unwrap();
+            engine.wait(key, Duration::from_secs(10)).unwrap();
+        }
+    }
+    let write = |name: &str, text: &str| {
+        let file = dir.join(name);
+        std::fs::write(&file, text).unwrap();
+        file.to_str().unwrap().to_owned()
+    };
+
+    // The same version: every run reaches its recorded outcome.
+    let same = write("v1.star", v1);
+    let report = cli(&["counterfactual", path, &same, "--workflow", "claims"]).unwrap();
+    assert!(
+        report.ends_with("3 runs: 3 same, 0 different, 0 unresolved\n"),
+        "{report}"
+    );
+
+    // A higher threshold: the middle claim is now approved.
+    let v2 = write("v2.star", &v1.replace("score > 50", "score > 80"));
+    let report = cli(&["counterfactual", path, &v2, "--workflow", "claims"]).unwrap();
+    assert!(
+        report.contains(
+            "c-2  different  old: completed {\"decision\":\"review\",\"score\":60}  new: completed {\"decision\":\"approve\",\"score\":60}"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.ends_with("3 runs: 2 same, 1 different, 0 unresolved\n"),
+        "{report}"
+    );
+
+    // A new step the old runs never called: unresolved, unless stubbed.
+    let v3 = write(
+        "v3.star",
+        &v1.replace(
+            "    score = step(\"score\", claim)\n    if score > 50:",
+            "    history = step(\"history\", claim[\"customer\"])\n    score = step(\"score\", claim)\n    if score + history > 50:",
+        ),
+    );
+    let report = cli(&["counterfactual", path, &v3, "c-1"]).unwrap();
+    assert!(
+        report.contains("c-1  unresolved  old: completed"),
+        "{report}"
+    );
+    assert!(
+        report.contains("  first difference at command 0: step `score` {\"amount\":3000,\"customer\":\"c-1\"} -> step `history` \"c-1\""),
+        "{report}"
+    );
+    assert!(
+        report.contains("  unresolved command 0: step `history` with input \"c-1\""),
+        "{report}"
+    );
+    let stubs = write("stubs.json", "{\"history\": 25}");
+    let report = cli(&["counterfactual", path, &v3, "c-1", "c-2", "--stubs", &stubs]).unwrap();
+    // With a history of 25, the first claim (30) now goes to review; the second already did.
+    assert!(report.contains("c-1  different"), "{report}");
+    assert!(report.contains("c-2  same"), "{report}");
+    assert!(report.contains("  stubbed: history"), "{report}");
+
+    assert!(
+        cli(&["counterfactual", path, &v2])
+            .unwrap_err()
+            .contains("--workflow")
+    );
+    assert!(
+        cli(&["counterfactual", path, &v2, "c-9"])
+            .unwrap_err()
+            .contains("no run `c-9`")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

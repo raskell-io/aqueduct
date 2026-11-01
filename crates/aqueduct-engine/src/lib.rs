@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+pub mod counterfactual;
 pub mod drift;
 pub mod embedded;
 mod observe;
