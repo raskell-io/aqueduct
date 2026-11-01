@@ -10,4 +10,7 @@
 pub mod embedded;
 mod partition;
 
-pub use partition::{Deciders, Outbound, Partition, PartitionError, PartitionRun, RetryPolicy};
+pub use aqueduct_storage::Durability;
+pub use partition::{
+    Deciders, Outbound, Partition, PartitionError, PartitionRun, RetryPolicy, ReusePolicy,
+};

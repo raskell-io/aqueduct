@@ -30,7 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub use aqueduct_core::{Payload, Status, StepOutcome};
-pub use aqueduct_engine::RetryPolicy;
+pub use aqueduct_engine::{RetryPolicy, ReusePolicy};
 pub use aqueduct_procedure::Procedure;
 pub use aqueduct_sdk::{
     Either, Saga, WorkflowContext, WorkflowError, join, join_all, select, select_all, workflow,
@@ -38,6 +38,7 @@ pub use aqueduct_sdk::{
 
 /// The embedded engine: a durable engine inside your process.
 pub mod embedded {
+    pub use aqueduct_engine::Durability;
     pub use aqueduct_engine::embedded::{
         Attempt, Builder, Engine, EngineError, EngineStats, Escalation, RunResult,
     };

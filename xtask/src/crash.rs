@@ -25,6 +25,7 @@ use aqueduct_storage::{FileLog, FileLogOptions, LogStore};
 /// Segments are kept small so that the harness also kills writers in the middle of a rotation.
 const OPTIONS: FileLogOptions = FileLogOptions {
     segment_bytes: 64 << 10,
+    durability: aqueduct_storage::Durability::Fsync,
 };
 
 /// The expected record at a position: its position, then 0 to 299 bytes derived from it.

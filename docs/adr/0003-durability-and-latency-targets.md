@@ -35,3 +35,8 @@ about 4 ms at p50 and 5 to 8 ms at p99, with device spikes around 25 ms.
 - Group commit must be adaptive: flush immediately when idle, batch up while a flush is in flight.
 - Benchmarks report results per durability mode and per OS. A benchmark that does not say which
   durability mode it used is invalid.
+- **Measured on 2026-10-31** ([docs/measurements/2026-10-31-engine-m4.md](../measurements/2026-10-31-engine-m4.md)),
+  end to end with the embedded engine: start to first step p99 5.7 to 8.3 ms with `Fsync` and under
+  0.1 ms with `Os`; 72,000 to 180,000 journal entries per second with `Fsync` and group commit, from 64
+  and 256 concurrent clients. All three targets are met on the M4. `Durability::Os` is now selectable with
+  `Builder::durability`.

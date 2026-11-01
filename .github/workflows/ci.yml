@@ -52,6 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask crash --kills 200
       - run: cargo xtask crash-engine --kills 50
+      - run: cargo xtask crash-engine --kills 30 --os
       - run: cargo xtask crash-engine --startup --kills 200
 
   msrv:

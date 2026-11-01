@@ -143,6 +143,8 @@ What holds today, for the embedded engine, and how it is checked:
   `kill -9` at random moments, including during its first start.
 - **A step's result is recorded exactly once**, although a step may run more than once (at least once
   execution), so steps with side effects should be idempotent.
+- **Starts are idempotent per key:** a retried start returns the same run; starting a used key with
+  another workflow or input is refused ([ADR 0019](docs/adr/0019-run-key-reuse.md)).
 - **Determinism:** procedures are deterministic by construction; Rust workflows are checked by replay, and
   a run whose code changed under it is parked, never silently corrupted. The time, random numbers and
   UUIDs come from the context (`ctx.now()`, `ctx.random()`, `ctx.uuid()`): recorded the first time,
