@@ -45,4 +45,5 @@ reasoning.
 ## Timers and waits
 
 - Timers never fire early, and keep their wake time across restarts.
-- A run that has ended has no pending timer that can affect it.
+- A run that has ended (or continued as new) has no pending timer that can affect it; its successor is
+  started even if a crash tore its start off the log.
