@@ -70,12 +70,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.failed += report.failed;
         total.cancelled += report.cancelled;
         total.escalations_resolved += report.escalations_resolved;
+        total.agent_calls += report.agent_calls;
     }
     println!(
         "{count} seeds ({from}..{}, {workload:?}) passed in {:.1} s\n\
          events {}, crashes {} (of which failed syncs {}), torn tails truncated {}, checkpoints {}\n\
          messages dropped {}, duplicated {}\n\
-         step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}, cancelled {}, escalations resolved {}",
+         step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}, cancelled {}, escalations resolved {}, agent calls {}",
         from + count,
         started.elapsed().as_secs_f64(),
         total.events,
@@ -92,6 +93,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.failed,
         total.cancelled,
         total.escalations_resolved,
+        total.agent_calls,
     );
     Ok(())
 }

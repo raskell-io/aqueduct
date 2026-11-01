@@ -102,14 +102,33 @@ pub fn execute(name: &str, input: &Payload) -> StepOutcome {
     }
 }
 
-/// The same pipeline as [`Pipeline`], written as a Starlark procedure. Payloads are JSON strings.
+/// The same pipeline as [`Pipeline`], written as a Starlark procedure, with an agent call that classifies
+/// what was extracted. Payloads are JSON strings.
 pub const STARLARK_PIPELINE: &str = r##"
 def run(input):
     extracted = step("extract", input)
+    label = agent("classify", extracted, prompt = "prompts/classify.md", budget_tokens = 1000)
     a, b = parallel([["map_a", extracted], ["map_b", extracted]])
-    merged = step("merge", a + "#" + b)
+    merged = step("merge", a + "#" + b + "#" + label)
     return step("validate", merged)
 "##;
+
+/// The simulated model: answers deterministically, so the reference model gets the same answers, and
+/// reports a usage that depends on the request.
+pub fn fake_model(name: &str, request: &Payload) -> aqueduct_core::AgentResponse {
+    let input = serde_json::from_slice::<serde_json::Value>(request.as_bytes())
+        .ok()
+        .and_then(|r| r.get("input").and_then(|i| i.as_str()).map(str::to_owned))
+        .unwrap_or_default();
+    let label = format!("{name}:{}", input.len() % 3);
+    aqueduct_core::AgentResponse {
+        model: "sim/fake-model@1".into(),
+        params: Payload::new(*b"{\"temperature\":0}"),
+        response: Payload::new(serde_json::Value::String(label).to_string().into_bytes()),
+        input_tokens: request.as_bytes().len() as u64,
+        output_tokens: 7,
+    }
+}
 
 /// The pipeline as a Rust workflow written with the SDK: the same steps and data flow as
 /// [`STARLARK_PIPELINE`], replayed by re-running the `async fn` on every activation. It first stamps
@@ -285,6 +304,12 @@ pub fn reference(
             Some(Effect::DispatchStep { cmd, name, input }) => Event::StepResult {
                 cmd,
                 outcome: (workload.execute)(&name, &input),
+            },
+            Some(Effect::DispatchAgent {
+                cmd, name, request, ..
+            }) => Event::AgentResult {
+                cmd,
+                outcome: Ok(fake_model(&name, &request)),
             },
             Some(Effect::Finished(_)) => continue,
             // The run continued as new: the key's next run takes over.

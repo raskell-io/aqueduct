@@ -56,6 +56,8 @@ mod kind {
     pub const ESCALATED: u8 = 15;
     pub const ESCALATION_RESOLVED: u8 = 16;
     pub const CONTINUED_AS_NEW: u8 = 17;
+    pub const AGENT_CALL_SCHEDULED: u8 = 18;
+    pub const AGENT_CALL_COMPLETED: u8 = 19;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -150,6 +152,8 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::Escalated { .. } => kind::ESCALATED,
         Entry::EscalationResolved { .. } => kind::ESCALATION_RESOLVED,
         Entry::ContinuedAsNew { .. } => kind::CONTINUED_AS_NEW,
+        Entry::AgentCallScheduled { .. } => kind::AGENT_CALL_SCHEDULED,
+        Entry::AgentCallCompleted { .. } => kind::AGENT_CALL_COMPLETED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -173,6 +177,25 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         }
         Entry::RunCompleted { output } => put_bytes(&mut out, output.as_bytes()),
         Entry::ContinuedAsNew { input } => put_bytes(&mut out, input.as_bytes()),
+        Entry::AgentCallScheduled {
+            cmd,
+            name,
+            request,
+            budget_tokens,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, name.as_bytes());
+            put_bytes(&mut out, request.as_bytes());
+            put_varint(&mut out, *budget_tokens);
+        }
+        Entry::AgentCallCompleted { cmd, response } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, response.model.as_bytes());
+            put_bytes(&mut out, response.params.as_bytes());
+            put_bytes(&mut out, response.response.as_bytes());
+            put_varint(&mut out, response.input_tokens);
+            put_varint(&mut out, response.output_tokens);
+        }
         Entry::RunFailed { error } => put_bytes(&mut out, error.as_bytes()),
         Entry::Parked { reason } | Entry::CancelRequested { reason } => {
             put_bytes(&mut out, reason.as_bytes());
@@ -308,6 +331,22 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         kind::ESCALATION_RESOLVED => Entry::EscalationResolved {
             cmd: reader.cmd()?,
             outcome: reader.payload()?,
+        },
+        kind::AGENT_CALL_SCHEDULED => Entry::AgentCallScheduled {
+            cmd: reader.cmd()?,
+            name: reader.string()?,
+            request: reader.payload()?,
+            budget_tokens: reader.varint()?,
+        },
+        kind::AGENT_CALL_COMPLETED => Entry::AgentCallCompleted {
+            cmd: reader.cmd()?,
+            response: aqueduct_core::AgentResponse {
+                model: reader.string()?,
+                params: reader.payload()?,
+                response: reader.payload()?,
+                input_tokens: reader.varint()?,
+                output_tokens: reader.varint()?,
+            },
         },
         kind::CONTINUED_AS_NEW => Entry::ContinuedAsNew {
             input: reader.payload()?,

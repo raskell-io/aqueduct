@@ -59,6 +59,7 @@ pub(crate) struct Node {
     ack_before_sync: bool,
     pub forget_dirty_runs: bool,
     pub skip_successor_repair: bool,
+    pub release_stale_dispatches: bool,
 }
 
 impl Node {
@@ -84,6 +85,7 @@ impl Node {
             ack_before_sync,
             forget_dirty_runs: false,
             skip_successor_repair: false,
+            release_stale_dispatches: false,
         })
     }
 
@@ -156,6 +158,25 @@ impl Node {
             Ok(()) | Err(aqueduct_engine::PartitionError::UnknownRun(_)) => Ok(()),
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    /// Applies the `release_stale_dispatches` bug to the running partition (recovery applies it to the
+    /// next ones).
+    pub fn inject_release_stale_dispatches(&mut self) {
+        if let Some(partition) = self.partition.as_mut() {
+            partition.inject_release_stale_dispatches();
+        }
+    }
+
+    pub fn on_agent_result(
+        &mut self,
+        key: &str,
+        cmd: CommandIndex,
+        outcome: Result<aqueduct_core::AgentResponse, String>,
+    ) -> Result<(), String> {
+        self.partition()?
+            .agent_result(key, cmd, outcome)
+            .map_err(|e| e.to_string())
     }
 
     pub fn on_resolve(
@@ -256,6 +277,9 @@ impl Node {
         }
         if self.skip_successor_repair {
             partition.inject_skip_successor_repair();
+        }
+        if self.release_stale_dispatches {
+            partition.inject_release_stale_dispatches();
         }
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(SIM_RETRY);

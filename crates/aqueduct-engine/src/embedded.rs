@@ -47,7 +47,10 @@ use std::time::Duration;
 use aqueduct_core::{CommandIndex, Decider, Payload, Status, StepOutcome};
 use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore};
 
-use crate::{Deciders, Observer, Outbound, Partition, PartitionError, RetryPolicy, ReusePolicy};
+use crate::{
+    AgentAttempt, AgentCall, AgentExecutor, Deciders, Observer, Outbound, Partition,
+    PartitionError, RetryPolicy, ReusePolicy,
+};
 
 /// A step implementation.
 pub type StepFn = Arc<dyn Fn(&Payload) -> Attempt + Send + Sync>;
@@ -157,9 +160,17 @@ pub struct Builder {
     retry_policies: BTreeMap<String, RetryPolicy>,
     default_retry: RetryPolicy,
     observer: Option<Arc<dyn Observer>>,
+    agents: Option<Arc<dyn AgentExecutor>>,
 }
 
 impl Builder {
+    /// Sets the executor of agent calls (`aqueduct-ai` provides them for model providers). Without one,
+    /// agent calls are retried until one is registered.
+    pub fn agent_executor(mut self, executor: Arc<dyn AgentExecutor>) -> Self {
+        self.agents = Some(executor);
+        self
+    }
+
     /// Tells `observer` about durable entries, step executions and flushes, for telemetry
     /// (`aqueduct-otel` turns them into OpenTelemetry traces and metrics).
     pub fn observer(mut self, observer: Arc<dyn Observer>) -> Self {
@@ -267,7 +278,16 @@ impl Builder {
                 let steps = Arc::clone(&steps);
                 let results = requests.clone();
                 let observer = self.observer.clone();
-                std::thread::spawn(move || worker(&inbox, &steps, &results, observer.as_deref()))
+                let agents = self.agents.clone();
+                std::thread::spawn(move || {
+                    worker(
+                        &inbox,
+                        &steps,
+                        agents.as_deref(),
+                        &results,
+                        observer.as_deref(),
+                    );
+                })
             })
             .collect();
         let last_checkpoint = partition.log().next_lsn();
@@ -312,6 +332,7 @@ impl Engine {
             retry_policies: BTreeMap::new(),
             default_retry: RetryPolicy::default(),
             observer: None,
+            agents: None,
         }
     }
 
@@ -509,6 +530,11 @@ enum Request {
         cmd: CommandIndex,
         outcome: StepOutcome,
     },
+    AgentResult {
+        key: String,
+        cmd: CommandIndex,
+        outcome: Result<aqueduct_core::AgentResponse, String>,
+    },
     AttemptFailed {
         key: String,
         cmd: CommandIndex,
@@ -525,6 +551,8 @@ struct Job {
     cmd: CommandIndex,
     name: String,
     input: Payload,
+    /// For an agent call: its token budget. `None` for a step.
+    agent: Option<u64>,
 }
 
 struct Processor {
@@ -693,6 +721,11 @@ impl Processor {
                     .step_result(&key, cmd, outcome)
                     .map_err(|e| e.to_string())?;
             }
+            Request::AgentResult { key, cmd, outcome } => {
+                self.partition
+                    .agent_result(&key, cmd, outcome)
+                    .map_err(|e| e.to_string())?;
+            }
             Request::AttemptFailed { key, cmd, error } => {
                 self.partition
                     .step_attempt_failed(&key, cmd, error)
@@ -742,6 +775,22 @@ impl Processor {
                         cmd,
                         name,
                         input,
+                        agent: None,
+                    });
+                }
+                Outbound::DispatchAgent {
+                    key,
+                    cmd,
+                    name,
+                    request,
+                    budget_tokens,
+                } => {
+                    let _ = self.jobs.send(Job {
+                        key,
+                        cmd,
+                        name,
+                        input: request,
+                        agent: Some(budget_tokens),
                     });
                 }
                 Outbound::Signaled { key }
@@ -827,6 +876,7 @@ fn millis(duration: Duration) -> u64 {
 fn worker(
     inbox: &Mutex<Receiver<Job>>,
     steps: &BTreeMap<String, StepFn>,
+    agents: Option<&dyn AgentExecutor>,
     results: &Sender<Request>,
     observer: Option<&dyn Observer>,
 ) {
@@ -839,6 +889,48 @@ fn worker(
             Err(_) => return,
         };
         let (started, clock) = (std::time::SystemTime::now(), std::time::Instant::now());
+        if let Some(budget_tokens) = job.agent {
+            let call = AgentCall {
+                run: &job.key,
+                name: &job.name,
+                request: &job.input,
+                budget_tokens,
+            };
+            let attempt = match agents {
+                None => AgentAttempt::Retry("no agent executor is registered".into()),
+                Some(agents) => catch_unwind(AssertUnwindSafe(|| agents.call(&call)))
+                    .unwrap_or_else(|_| {
+                        AgentAttempt::Retry(format!("agent call `{}` panicked", job.name))
+                    }),
+            };
+            if let Some(observer) = observer {
+                let end = match &attempt {
+                    AgentAttempt::Completed(_) => crate::StepEnd::Completed,
+                    AgentAttempt::Fail(_) => crate::StepEnd::Failed,
+                    AgentAttempt::Retry(_) => crate::StepEnd::Retry,
+                };
+                let name = format!("agent:{}", job.name);
+                observer.step(&job.key, job.cmd, &name, started, clock.elapsed(), end);
+            }
+            let (key, cmd) = (job.key, job.cmd);
+            let request = match attempt {
+                AgentAttempt::Completed(response) => Request::AgentResult {
+                    key,
+                    cmd,
+                    outcome: Ok(response),
+                },
+                AgentAttempt::Fail(error) => Request::AgentResult {
+                    key,
+                    cmd,
+                    outcome: Err(error),
+                },
+                AgentAttempt::Retry(error) => Request::AttemptFailed { key, cmd, error },
+            };
+            if results.send(request).is_err() {
+                return;
+            }
+            continue;
+        }
         let attempt = match steps.get(&job.name) {
             // A deployment problem, not a property of the input: retry, so registering the step heals it.
             None => Attempt::Retry(format!("no step named `{}` is registered", job.name)),

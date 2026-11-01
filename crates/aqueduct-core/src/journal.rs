@@ -39,6 +39,30 @@ pub enum StepOutcome {
     Failed(String),
 }
 
+/// What a model call cost and which model answered it: recorded with the response, so replay never calls
+/// the model again and drift can be traced to a model or parameter change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentResponse {
+    /// The model that answered, as `<provider>/<model>[@<version>]` (for example
+    /// `anthropic/claude-sonnet-5-5`).
+    pub model: String,
+    /// The parameters it was called with (JSON: temperature, max tokens, ...).
+    pub params: Payload,
+    /// The response (JSON), the agent call's outcome.
+    pub response: Payload,
+    /// Tokens read.
+    pub input_tokens: u64,
+    /// Tokens written.
+    pub output_tokens: u64,
+}
+
+impl AgentResponse {
+    /// Tokens used in total.
+    pub fn tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 /// One entry in a run's journal. The encoding is specified in `docs/history-format.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
@@ -57,6 +81,25 @@ pub enum Entry {
         name: String,
         /// The step's input.
         input: Payload,
+    },
+    /// The run issued an agent call: a bounded model call whose response is journaled.
+    AgentCallScheduled {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The agent call's name (for example `classify_documents`).
+        name: String,
+        /// The request (JSON: input, prompt, output schema).
+        request: Payload,
+        /// The most tokens the call may use.
+        budget_tokens: u64,
+    },
+    /// An agent call completed: the model, its parameters, the response and the tokens used. Recorded
+    /// at most once per command.
+    AgentCallCompleted {
+        /// The command this completes.
+        cmd: CommandIndex,
+        /// What answered and what it cost.
+        response: AgentResponse,
     },
     /// A step completed. Recorded at most once per command.
     StepCompleted {

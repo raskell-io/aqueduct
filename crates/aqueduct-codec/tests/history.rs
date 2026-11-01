@@ -26,6 +26,36 @@ fn entry() -> impl Strategy<Value = Entry> {
         (cmd, ".{0,12}").prop_map(|(cmd, error)| Entry::StepFailed { cmd, error }),
         payload().prop_map(|output| Entry::RunCompleted { output }),
         payload().prop_map(|input| Entry::ContinuedAsNew { input }),
+        (any::<u32>(), ".{0,12}", payload(), any::<u64>()).prop_map(
+            |(cmd, name, request, budget_tokens)| Entry::AgentCallScheduled {
+                cmd: CommandIndex(cmd),
+                name,
+                request,
+                budget_tokens,
+            }
+        ),
+        (
+            any::<u32>(),
+            ".{0,12}",
+            payload(),
+            payload(),
+            any::<u64>(),
+            any::<u64>()
+        )
+            .prop_map(
+                |(cmd, model, params, response, input_tokens, output_tokens)| {
+                    Entry::AgentCallCompleted {
+                        cmd: CommandIndex(cmd),
+                        response: aqueduct_core::AgentResponse {
+                            model,
+                            params,
+                            response,
+                            input_tokens,
+                            output_tokens,
+                        },
+                    }
+                }
+            ),
         ".{0,12}".prop_map(|error| Entry::RunFailed { error }),
         ".{0,12}".prop_map(|reason| Entry::Parked { reason }),
         ".{0,12}".prop_map(|reason| Entry::CancelRequested { reason }),

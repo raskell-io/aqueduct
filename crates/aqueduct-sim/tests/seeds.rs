@@ -256,3 +256,39 @@ fn escalations_are_resolved_under_faults() {
         "completed {completed}, failed {failed}"
     );
 }
+
+#[test]
+fn an_agent_call_released_after_its_answer_is_caught() {
+    // Found by the simulator when agent calls were added: a retry's dispatch waits for the flush, a late
+    // answer of the first attempt is recorded meanwhile, and releasing the dispatch calls the model again.
+    let config = Config {
+        workload: WorkloadKind::StarlarkPipeline,
+        bugs: Bugs {
+            release_stale_dispatches: true,
+            ..Bugs::default()
+        },
+        ..Config::default()
+    };
+    let caught = (0..3_000)
+        .filter_map(|seed| run_seed(seed, &config).err())
+        .find(|failure| failure.message.contains("after its response was recorded"));
+    assert!(
+        caught.is_some(),
+        "the simulator should catch an agent call issued again"
+    );
+}
+
+#[test]
+fn agent_calls_hold_every_invariant() {
+    let config = Config {
+        workload: WorkloadKind::StarlarkPipeline,
+        ..Config::default()
+    };
+    let mut calls = 0;
+    for seed in 0..300 {
+        calls += run_seed(seed, &config)
+            .unwrap_or_else(|failure| panic!("{failure}"))
+            .agent_calls;
+    }
+    assert!(calls > 1_000, "agent calls {calls}");
+}

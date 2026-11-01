@@ -7,10 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+mod agent;
 pub mod embedded;
 mod observe;
 mod partition;
 
+pub use agent::{AgentAttempt, AgentCall, AgentExecutor};
 pub use aqueduct_storage::Durability;
 pub use observe::{Observer, StepEnd};
 pub use partition::{

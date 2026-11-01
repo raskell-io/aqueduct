@@ -133,6 +133,19 @@ pub enum Outbound {
         /// The step's input.
         input: Payload,
     },
+    /// An agent call should be executed.
+    DispatchAgent {
+        /// The run id.
+        key: String,
+        /// The call's command index.
+        cmd: CommandIndex,
+        /// The call's name.
+        name: String,
+        /// The request.
+        request: Payload,
+        /// The most tokens the call may use.
+        budget_tokens: u64,
+    },
     /// A step result was recorded (or is no longer needed); the sender can stop resending it.
     ResultRecorded {
         /// The run key.
@@ -243,6 +256,7 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     run_timers: BTreeMap<String, Vec<(CommandIndex, u64)>>,
     evict_finished: bool,
     skip_successor_repair: bool,
+    release_stale_dispatches: bool,
 }
 
 impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
@@ -343,6 +357,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             run_timers: BTreeMap::new(),
             evict_finished: false,
             skip_successor_repair: false,
+            release_stale_dispatches: false,
         })
         .map(|mut partition| {
             let keys: Vec<String> = partition.runs.keys().cloned().collect();
@@ -806,6 +821,28 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         Ok(())
     }
 
+    /// Records an agent call's result: the model's response, or a terminal failure. Recorded at most
+    /// once; acknowledged with [`Outbound::ResultRecorded`] like a step result.
+    pub fn agent_result(
+        &mut self,
+        key: &str,
+        cmd: CommandIndex,
+        outcome: Result<aqueduct_core::AgentResponse, String>,
+    ) -> Result<(), PartitionError> {
+        if let Some(run) = self.runs.get(key) {
+            let transition = run
+                .state
+                .handle_at(Event::AgentResult { cmd, outcome }, self.now_ms);
+            let effects = self.append(key, transition)?;
+            self.perform(key, effects)?;
+        }
+        self.send(Outbound::ResultRecorded {
+            key: key.to_owned(),
+            cmd,
+        });
+        Ok(())
+    }
+
     /// Records a step result (at most once per command).
     pub fn step_result(
         &mut self,
@@ -838,14 +875,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         let mut dispatches = Vec::new();
         for (key, run) in &self.runs {
             for effect in run.state.pending_steps() {
-                if let Effect::DispatchStep { cmd, name, input } = effect {
-                    dispatches.push(Outbound::Dispatch {
-                        key: key.clone(),
-                        cmd,
-                        name,
-                        input,
-                    });
-                }
+                dispatches.extend(dispatch_message(key, effect));
             }
         }
         for dispatch in dispatches {
@@ -875,7 +905,26 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 }
             }
         }
-        Ok(std::mem::take(&mut self.deferred))
+        let mut released = std::mem::take(&mut self.deferred);
+        // A dispatch waits for the flush; meanwhile a late result of an earlier attempt may have been
+        // recorded. Releasing it would run the step (or call the model) again for nothing.
+        if !self.release_stale_dispatches {
+            released.retain(|message| !self.already_recorded(message));
+        }
+        Ok(released)
+    }
+
+    /// Whether `message` dispatches a command whose outcome is already recorded.
+    fn already_recorded(&self, message: &Outbound) -> bool {
+        let (Outbound::Dispatch { key, cmd, .. } | Outbound::DispatchAgent { key, cmd, .. }) =
+            message
+        else {
+            return false;
+        };
+        self.runs
+            .get(key)
+            .and_then(|run| run.state.steps().get(usize::try_from(cmd.0).ok()?))
+            .is_some_and(|step| step.outcome.is_some())
     }
 
     /// Sets the observer told about durable entries and flushes (see [`crate::Observer`]).
@@ -967,6 +1016,14 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         self.ack_before_sync = enabled;
     }
 
+    /// Testing only: release dispatches of commands whose result was recorded while they waited for the
+    /// flush (running the step, or calling the model, again for nothing). A deliberate bug that the
+    /// simulator must catch.
+    #[doc(hidden)]
+    pub fn inject_release_stale_dispatches(&mut self) {
+        self.release_stale_dispatches = true;
+    }
+
     /// Testing only: on recovery, do not restart the successor of a run that continued as new when a
     /// crash tore off its start. A deliberate bug that the simulator must catch.
     #[doc(hidden)]
@@ -1054,13 +1111,10 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     let transition = run.state.handle_at(Event::Decision(commands), self.now_ms);
                     queue.extend(self.append(key, transition)?);
                 }
-                Effect::DispatchStep { cmd, name, input } => {
-                    self.send(Outbound::Dispatch {
-                        key: key.to_owned(),
-                        cmd,
-                        name,
-                        input,
-                    });
+                effect @ (Effect::DispatchStep { .. } | Effect::DispatchAgent { .. }) => {
+                    if let Some(message) = dispatch_message(key, effect) {
+                        self.send(message);
+                    }
                 }
                 Effect::Finished(status) => {
                     self.send(Outbound::Finished {
@@ -1091,4 +1145,29 @@ fn os_seed() -> u64 {
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     hasher.write_u64(0x6171_7565_6475_6374);
     hasher.finish()
+}
+
+/// The message that executes a dispatch effect, if it is one.
+fn dispatch_message(key: &str, effect: Effect) -> Option<Outbound> {
+    match effect {
+        Effect::DispatchStep { cmd, name, input } => Some(Outbound::Dispatch {
+            key: key.to_owned(),
+            cmd,
+            name,
+            input,
+        }),
+        Effect::DispatchAgent {
+            cmd,
+            name,
+            request,
+            budget_tokens,
+        } => Some(Outbound::DispatchAgent {
+            key: key.to_owned(),
+            cmd,
+            name,
+            request,
+            budget_tokens,
+        }),
+        _ => None,
+    }
 }

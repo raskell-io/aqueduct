@@ -289,6 +289,42 @@ impl WorkflowContext {
         )
     }
 
+    /// Calls a model through the engine's agent executor (an agent step) and decodes its response. The
+    /// request carries `input`, the prompt and the output schema; the call may use at most
+    /// `options.budget_tokens` tokens (a response that cost more fails the call). The response, the model
+    /// that gave it and the tokens used are journaled, and replay reads them instead of calling again.
+    pub fn agent<T, I>(
+        &self,
+        name: &str,
+        input: &I,
+        options: &AgentOptions,
+    ) -> impl Future<Output = Result<T, WorkflowError>> + use<T, I>
+    where
+        T: DeserializeOwned,
+        I: Serialize + ?Sized,
+    {
+        let request = serde_json::to_value(input)
+            .map(|input| {
+                serde_json::json!({
+                    "input": input,
+                    "prompt": options.prompt,
+                    "output_schema": options.output_schema,
+                })
+            })
+            .map_err(|e| WorkflowError::Payload(e.to_string()));
+        let command = request.map(|request| Command::CallAgent {
+            name: name.to_owned(),
+            request: Payload::new(request.to_string().into_bytes()),
+            budget_tokens: options.budget_tokens,
+        });
+        let name = format!("agent:{name}");
+        self.call(command, move |outcome| match outcome {
+            StepOutcome::Completed(response) => serde_json::from_slice(response.as_bytes())
+                .map_err(|e| WorkflowError::Payload(e.to_string())),
+            StepOutcome::Failed(error) => Err(WorkflowError::StepFailed { name, error }),
+        })
+    }
+
     /// Escalates a decision to a person or an agent and waits for the resolution, which it decodes.
     /// An escalation is an outcome, not an error: the run waits durably (for days if need be), shows up
     /// in `Engine::escalations`, and continues with whatever the resolver decides. Escalations are
@@ -677,6 +713,18 @@ pub async fn select_all<F: Future>(futures: Vec<F>) -> (usize, F::Output) {
         }
     })
     .await
+}
+
+/// How an agent call is made: its prompt, the schema its output must follow, and its token budget.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentOptions {
+    /// The prompt, or a reference to one (for example `prompts/classify.md`); interpreted by the agent
+    /// executor.
+    pub prompt: String,
+    /// The JSON Schema the response must follow, if any.
+    pub output_schema: Option<serde_json::Value>,
+    /// The most tokens the call may use.
+    pub budget_tokens: u64,
 }
 
 /// A workflow function turned into a [`Decider`].

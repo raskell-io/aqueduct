@@ -13,6 +13,16 @@ pub enum Command {
         /// The step's input.
         input: Payload,
     },
+    /// Call a model, bounded by a token budget (an agent step). The engine's agent executor runs it; the
+    /// response, model identity and usage are journaled, and replay reads them instead of calling again.
+    CallAgent {
+        /// The agent call's name.
+        name: String,
+        /// The request (JSON: input, prompt, output schema).
+        request: Payload,
+        /// The most tokens the call may use.
+        budget_tokens: u64,
+    },
     /// Sleep durably.
     Sleep {
         /// How long, in milliseconds.
@@ -122,6 +132,11 @@ impl<'a> RunView<'a> {
             .ok()
             .and_then(|index| self.state.steps().get(index))
             .is_some_and(|step| step.cancelled)
+    }
+
+    /// Tokens used so far by the run's completed agent calls.
+    pub fn tokens_used(&self) -> u64 {
+        self.state.tokens_used()
     }
 
     /// The reason the run was cancelled, if it was.

@@ -681,3 +681,60 @@ fn a_cancellation_does_not_skip_a_compensation() {
     assert_eq!(state.status(), Status::Failed);
     assert_eq!(state.error(), Some("step `check` failed: bad"));
 }
+
+#[test]
+fn an_agent_call_is_made_once_and_its_answer_survives_a_restart() {
+    use aqueduct_engine::{AgentAttempt, AgentCall, AgentExecutor};
+    use aqueduct_sdk::AgentOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingModel(Arc<AtomicUsize>);
+    impl AgentExecutor for CountingModel {
+        fn call(&self, call: &AgentCall<'_>) -> AgentAttempt {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let request: serde_json::Value =
+                serde_json::from_slice(call.request.as_bytes()).unwrap();
+            assert_eq!(request["prompt"], "Classify the document.");
+            let label = format!("{}-invoice", request["input"].as_str().unwrap());
+            AgentAttempt::Completed(aqueduct_core::AgentResponse {
+                model: "test/model@1".into(),
+                params: json("{}"),
+                response: json(&serde_json::Value::String(label).to_string()),
+                input_tokens: 40,
+                output_tokens: 10,
+            })
+        }
+    }
+    async fn classify(ctx: WorkflowContext, doc: String) -> Result<String, WorkflowError> {
+        let options = AgentOptions {
+            prompt: "Classify the document.".into(),
+            output_schema: None,
+            budget_tokens: 500,
+        };
+        let label: String = ctx.agent("classify", &doc, &options).await?;
+        ctx.sleep(Duration::from_millis(200)).await?;
+        Ok(label)
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dir = std::env::temp_dir().join(format!("aqueduct-sdk-agent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let open = || {
+        Engine::builder(&dir)
+            .workflow("classify", Arc::new(workflow(classify)))
+            .agent_executor(Arc::new(CountingModel(Arc::clone(&calls))))
+            .open()
+            .unwrap()
+    };
+    {
+        let engine = open();
+        engine.start("doc-1", "classify", json("\"d1\"")).unwrap();
+        // Stop during the sleep, after the answer was recorded.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let engine = open();
+    let done = engine.wait("doc-1", Duration::from_secs(10)).unwrap();
+    assert_eq!(done.output, Some(json("\"d1-invoice\"")));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the model was called once");
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
