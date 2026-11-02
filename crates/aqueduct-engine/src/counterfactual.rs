@@ -10,8 +10,9 @@
 //!   the resolution of one with the same reason and payload, a budget escalation by whether more budget was
 //!   approved for the same call, a child run by the outcome of a child of the same workflow with the same
 //!   input; each recorded result answers at most one command;
-//! - the old run's signals arrive in their order, when nothing else can make progress; then timers fire
-//!   (time is skipped, not waited for); then a cancellation, if the old run had one.
+//! - the old run's signals and updates arrive in their order, when nothing else can make progress (an
+//!   update the new version does not wait for is dropped, as the engine would reject it); then timers
+//!   fire (time is skipped, not waited for); then a cancellation, if the old run had one.
 //!
 //! A command the old run never made is answered from a stub (a result by step or agent call name), or
 //! left unresolved: the replay goes on without it as far as it can, and the report names it. Divergence is
@@ -172,7 +173,8 @@ struct Evidence {
     agents: BTreeMap<(String, Vec<u8>), VecDeque<AgentEvidence>>,
     escalations: BTreeMap<(String, Vec<u8>), VecDeque<Payload>>,
     children: BTreeMap<(String, Vec<u8>), VecDeque<StepOutcome>>,
-    signals: VecDeque<(String, String, Payload)>,
+    /// The old run's signals and updates, in their order, as events.
+    messages: VecDeque<Event>,
     cancel: Option<String>,
 }
 
@@ -198,6 +200,8 @@ impl Evidence {
         let mut commands: BTreeMap<CommandIndex, Pending> = BTreeMap::new();
         let mut agents: BTreeMap<CommandIndex, ((String, Vec<u8>), AgentEvidence)> =
             BTreeMap::new();
+        // Update waits by command: their names.
+        let mut updates: BTreeMap<CommandIndex, String> = BTreeMap::new();
         for entry in journal {
             match entry {
                 Entry::StepScheduled { cmd, name, input } => {
@@ -302,9 +306,23 @@ impl Evidence {
                     }
                 }
                 Entry::SignalReceived { name, id, payload } => {
-                    evidence
-                        .signals
-                        .push_back((name.clone(), id.clone(), payload.clone()));
+                    evidence.messages.push_back(Event::Signal {
+                        name: name.clone(),
+                        id: id.clone(),
+                        payload: payload.clone(),
+                    });
+                }
+                Entry::UpdateAwaited { cmd, name, .. } => {
+                    updates.insert(*cmd, name.clone());
+                }
+                Entry::UpdateReceived { cmd, id, payload } => {
+                    if let Some(name) = updates.get(cmd) {
+                        evidence.messages.push_back(Event::Update {
+                            name: name.clone(),
+                            id: id.clone(),
+                            payload: payload.clone(),
+                        });
+                    }
                 }
                 Entry::CancelRequested { reason } => evidence.cancel = Some(reason.clone()),
                 _ => {}
@@ -377,8 +395,8 @@ pub fn replay_counterfactual(
         if new.answer_commands(&mut evidence, options)? {
             continue;
         }
-        if let Some((name, id, payload)) = evidence.signals.pop_front() {
-            new.handle(Event::Signal { name, id, payload })?;
+        if let Some(message) = evidence.messages.pop_front() {
+            new.handle(message)?;
             continue;
         }
         if let Some((cmd, _)) = new.state.timers().into_iter().min_by_key(|(_, at)| *at) {
@@ -560,7 +578,8 @@ impl Replay {
                         None
                     }
                 }
-                // Timers and signals are answered by the replay's loop; recorded values are born complete.
+                // Timers, signals and updates are answered by the replay's loop; recorded values and
+                // responses are born complete.
                 _ => None,
             };
             if let Some(event) = event {
@@ -674,6 +693,16 @@ pub fn describe(step: &ScheduledStep) -> String {
         CommandKind::Escalation => "escalation",
         CommandKind::Agent { .. } => "agent call",
         CommandKind::Child => "child run of",
+        CommandKind::Update { timeout_ms, .. } if timeout_ms > 0 => {
+            return format!("wait for update `{}` ({timeout_ms} ms)", step.name);
+        }
+        CommandKind::Update { .. } => return format!("wait for update `{}`", step.name),
+        CommandKind::Response { update, ok: true } => {
+            return format!("response to update {update} {}", text(&step.input));
+        }
+        CommandKind::Response { update, ok: false } => {
+            return format!("rejection of update {update}: {}", text(&step.input));
+        }
     };
     format!("{kind} `{}` {}", step.name, text(&step.input))
 }

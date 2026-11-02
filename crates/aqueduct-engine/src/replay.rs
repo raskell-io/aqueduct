@@ -43,6 +43,9 @@ pub fn decided(entry: &Entry) -> bool {
             | Entry::ValueRecorded { .. }
             | Entry::Escalated { .. }
             | Entry::ChildStarted { .. }
+            | Entry::UpdateAwaited { .. }
+            | Entry::UpdateCompleted { .. }
+            | Entry::UpdateRejected { .. }
             | Entry::RunCompleted { .. }
             | Entry::RunFailed { .. }
             | Entry::ContinuedAsNew { .. }

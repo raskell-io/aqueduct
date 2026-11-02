@@ -52,6 +52,12 @@ commands:
                                       runs when the engine next opens
   signal <dir> <key> <name> <json> [<id>]
                                       send a signal; with an id, sending it again records it once
+  query <dir> <key> <name>            ask a procedure run a query: the last value it published under
+                                      <name> (ADR 0036)
+  update <dir> <key> <name> <json> [<id>]
+                                      send an update and print the run's answer; if the run must do
+                                      work first, the update is accepted, and sending it again with
+                                      the same id once the engine has run prints the answer
   complete-awakeable <dir> <id> <json>
                                       complete an awakeable with a payload
   cancel <dir> <key> [<reason>]       ask a run to stop: what it waits for fails as cancelled
@@ -160,6 +166,18 @@ pub fn run(args: &[String]) -> Result<String, String> {
             args.get(5).map_or("", String::as_str),
             false,
         ),
+        Some("query") => query(
+            Path::new(arg(1, "data directory")?),
+            arg(2, "run key")?,
+            arg(3, "query name")?,
+        ),
+        Some("update") => update(
+            Path::new(arg(1, "data directory")?),
+            arg(2, "run key")?,
+            arg(3, "update name")?,
+            arg(4, "JSON payload")?,
+            args.get(5).map_or("", String::as_str),
+        ),
         Some("complete-awakeable") => {
             let id = arg(2, "awakeable id")?;
             let (run, name) = aqueduct_core::parse_awakeable_id(id)
@@ -255,6 +273,64 @@ fn signal(
     Ok(format!("signal {name} sent to {key} ({state})\n"))
 }
 
+/// Loads a data directory with the registry's procedures, which answer queries and updates.
+fn load_procedures(dir: &Path) -> Result<Partition<FileLog, RedbStateStore>, String> {
+    let registry = Registry::open(dir).map_err(|e| e.to_string())?;
+    let deciders = registry.deciders().map_err(|e| e.to_string())?;
+    let mut partition = load_with(dir, deciders)?;
+    partition.set_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+    );
+    Ok(partition)
+}
+
+/// Answers a query from the run's procedure, replaying its journal. Nothing is written.
+fn query(dir: &Path, key: &str, name: &str) -> Result<String, String> {
+    let mut partition = load_procedures(dir)?;
+    match partition.query(key, name).map_err(|e| e.to_string())? {
+        Some(answer) => Ok(format!(
+            "{}
+",
+            text(&answer)
+        )),
+        None => Err(format!("run `{key}` has no query `{name}`")),
+    }
+}
+
+/// Sends an update and prints the answer, if the run gives it without doing work first.
+fn update(dir: &Path, key: &str, name: &str, json: &str, id: &str) -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|e| format!("the payload is not JSON ({e}); quote strings, as in '\"yes\"'"))?;
+    let mut partition = load_procedures(dir)?;
+    let status = partition
+        .update(key, name, id, Payload::new(json.as_bytes().to_vec()))
+        .map_err(|e| e.to_string())?;
+    partition.flush().map_err(|e| e.to_string())?;
+    let answer = match status {
+        aqueduct_engine::UpdateStatus::Answered(answer) => Some(answer),
+        aqueduct_engine::UpdateStatus::Accepted { run, cmd } => partition
+            .lookup_run(&run)
+            .map_err(|e| e.to_string())?
+            .and_then(|state| state.response(cmd).cloned()),
+    };
+    match answer {
+        Some(Ok(result)) => Ok(format!(
+            "{}
+",
+            text(&result)
+        )),
+        Some(Err(error)) => Err(format!("update rejected: {error}")),
+        None if id.is_empty() => Ok(format!(
+            "update {name} accepted by {key}; the run answers it when the engine next runs (give the update an id to read the answer by sending it again)\n"
+        )),
+        None => Ok(format!(
+            "update {name} accepted by {key}; the run answers it when the engine next runs: send it again with id {id} to read the answer\n"
+        )),
+    }
+}
+
 /// Loads every run in a data directory: the last checkpoint and the log after it.
 fn load(dir: &Path) -> Result<Partition<FileLog, RedbStateStore>, String> {
     load_with(dir, Deciders::new())
@@ -346,6 +422,16 @@ fn describe(dir: &Path, key: &str) -> Result<String, String> {
                         aqueduct_core::CommandIndex(u32::try_from(index).unwrap_or(u32::MAX))
                     ))
             ),
+            CommandKind::Update { timeout_ms, .. } if timeout_ms > 0 => {
+                format!("wait for update {} (timeout {timeout_ms} ms)", step.name)
+            }
+            CommandKind::Update { .. } => format!("wait for update {}", step.name),
+            CommandKind::Response { update, ok: true } => {
+                format!("respond to update [{update}] with {}", text(&step.input))
+            }
+            CommandKind::Response { update, ok: false } => {
+                format!("reject update [{update}]: {}", text(&step.input))
+            }
         };
         let outcome = match &step.outcome {
             None if step.retry_at.is_some() => {
@@ -1446,6 +1532,32 @@ fn describe_entry(entry: &Entry) -> String {
             format!("[{cmd}] child completed with {}", text(output))
         }
         Entry::ChildFailed { cmd, error } => format!("[{cmd}] child failed: {error}"),
+        Entry::UpdateAwaited {
+            cmd,
+            name,
+            timeout_ms,
+            ..
+        } if *timeout_ms > 0 => {
+            format!("[{cmd}] wait for update {name} (timeout {timeout_ms} ms)")
+        }
+        Entry::UpdateAwaited { cmd, name, .. } => format!("[{cmd}] wait for update {name}"),
+        Entry::UpdateReceived { cmd, id, payload } if id.is_empty() => {
+            format!("[{cmd}] update received: {}", text(payload))
+        }
+        Entry::UpdateReceived { cmd, id, payload } => {
+            format!("[{cmd}] update {id} received: {}", text(payload))
+        }
+        Entry::UpdateCompleted {
+            cmd,
+            update,
+            result,
+        } => format!(
+            "[{cmd}] responded to update [{update}] with {}",
+            text(result)
+        ),
+        Entry::UpdateRejected { cmd, update, error } => {
+            format!("[{cmd}] rejected update [{update}]: {error}")
+        }
     }
 }
 
@@ -1578,6 +1690,35 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         }
         Entry::ChildFailed { cmd: c, error } => {
             json!({"kind": "ChildFailed", "cmd": cmd(c), "error": error})
+        }
+        Entry::UpdateAwaited {
+            cmd: c,
+            name,
+            timeout_ms,
+            wake_at,
+        } => json!({
+            "kind": "UpdateAwaited", "cmd": cmd(c), "name": name,
+            "timeout_ms": timeout_ms, "wake_at": wake_at
+        }),
+        Entry::UpdateReceived {
+            cmd: c,
+            id,
+            payload: p,
+        } => json!({"kind": "UpdateReceived", "cmd": cmd(c), "id": id, "payload": payload(p)}),
+        Entry::UpdateCompleted {
+            cmd: c,
+            update,
+            result,
+        } => json!({
+            "kind": "UpdateCompleted", "cmd": cmd(c), "update": cmd(update),
+            "result": payload(result)
+        }),
+        Entry::UpdateRejected {
+            cmd: c,
+            update,
+            error,
+        } => {
+            json!({"kind": "UpdateRejected", "cmd": cmd(c), "update": cmd(update), "error": error})
         }
     }
 }

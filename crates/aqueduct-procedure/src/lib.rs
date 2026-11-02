@@ -26,6 +26,14 @@
 //! - `sleep(seconds)` sleeps durably; `wait(signal(name), timeout = seconds)` returns the next signal's
 //!   payload, or `None` when the timeout passes first. `minutes(n)`, `hours(n)` and `days(n)` give
 //!   seconds.
+//! - `wait(update(name), timeout = seconds)` waits for an update, a request whose sender waits for the
+//!   answer (ADR 0036). It returns the request, `{"update": ..., "value": payload}`, or `None` when the
+//!   timeout passes first; `respond(request, result)` answers it and `reject(request, reason)` refuses
+//!   it. A rejection in the same activation that receives the update is validation: the update leaves
+//!   no trace in the journal.
+//! - `publish(name, value)` makes `value` the answer to query `name` from this point of the run on. A
+//!   query replays the run to where it is and returns the last value published under its name;
+//!   publishing is not journaled.
 //!
 //! Replay works by re-execution: each call to `step` is a command with the next command index. If the
 //! journal has an outcome for that index, the call returns it; otherwise the command is issued and the
@@ -239,6 +247,20 @@ impl Procedure {
 
 impl Decider for Procedure {
     fn decide(&self, view: &RunView<'_>) -> Vec<Command> {
+        self.run_activation(view).0
+    }
+
+    fn query(&self, view: &RunView<'_>, name: &str) -> Option<Payload> {
+        self.run_activation(view).1.remove(name)
+    }
+}
+
+impl Procedure {
+    /// Runs `run(input)` against the journal: the commands it issues, and the values it published.
+    fn run_activation(
+        &self,
+        view: &RunView<'_>,
+    ) -> (Vec<Command>, std::collections::BTreeMap<String, Payload>) {
         let outcomes: Vec<Option<StepOutcome>> = view.outcomes().map(|o| o.cloned()).collect();
         let cancelled = (0..outcomes.len())
             .map(|index| view.cancelled(aqueduct_core::CommandIndex(index as u32)))
@@ -272,7 +294,7 @@ impl Decider for Procedure {
             }),
         };
         commands.extend(terminal);
-        commands
+        (commands, activation.published)
     }
 }
 
@@ -321,12 +343,20 @@ struct Activation {
     next: usize,
     stop: Option<Stop>,
     in_run: bool,
+    /// The values published for queries, by name: the last one counts.
+    published: std::collections::BTreeMap<String, Payload>,
 }
 
 impl Activation {
     /// Issues the next step command; returns its recorded outcome, if any.
     fn issue(&mut self, name: String, input: Payload) -> anyhow::Result<Option<StepOutcome>> {
         self.issue_command(Command::ScheduleStep { name, input })
+    }
+
+    /// Issues the next command of any kind; returns its index and its recorded outcome, if any.
+    fn issue_indexed(&mut self, command: Command) -> anyhow::Result<(usize, Option<StepOutcome>)> {
+        let index = self.next;
+        Ok((index, self.issue_command(command)?))
     }
 
     /// Issues the next command of any kind; returns its recorded outcome, if any.
@@ -414,6 +444,17 @@ fn milliseconds(seconds: i32) -> anyhow::Result<u64> {
 
 fn to_payload(value: Value<'_>) -> anyhow::Result<Payload> {
     Ok(Payload::new(value.to_json()?.into_bytes()))
+}
+
+/// The wait that received an update, from the request `wait(update(...))` returned.
+fn update_of(request: Value<'_>) -> anyhow::Result<aqueduct_core::CommandIndex> {
+    let request: serde_json::Value = serde_json::from_str(&request.to_json()?)?;
+    request
+        .get("update")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .map(aqueduct_core::CommandIndex)
+        .ok_or_else(|| anyhow::anyhow!("expected a request returned by wait(update(...))"))
 }
 
 fn from_payload(payload: &Payload) -> anyhow::Result<serde_json::Value> {
@@ -577,6 +618,51 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
         }
     }
 
+    /// Makes `value` the answer to query `name`, from this point of the run on (not journaled).
+    fn publish<'v>(name: &str, value: Value<'v>) -> anyhow::Result<NoneType> {
+        if name.is_empty() {
+            anyhow::bail!("publish(name, value) needs a non-empty name");
+        }
+        let value = to_payload(value)?;
+        with_activation(|act| {
+            if !act.in_run {
+                anyhow::bail!("engine functions may only be called inside `run`");
+            }
+            act.published.insert(name.to_owned(), value);
+            Ok(NoneType)
+        })
+    }
+
+    /// Names an update to wait for: `request = wait(update("address"), timeout = days(1))`.
+    fn update<'v>(name: &str, eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
+        Ok(eval.heap().alloc(serde_json::json!({ "__update__": name })))
+    }
+
+    /// Answers an update received by `wait(update(...))` with `result`.
+    fn respond<'v>(
+        request: Value<'v>,
+        #[starlark(default = NoneType)] result: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let update = update_of(request)?;
+        let command = Command::Respond {
+            update,
+            result: Ok(to_payload(result)?),
+        };
+        with_activation(|act| act.issue_command(command))?;
+        Ok(NoneType)
+    }
+
+    /// Refuses an update received by `wait(update(...))`, with the reason its sender gets.
+    fn reject<'v>(request: Value<'v>, reason: &str) -> anyhow::Result<NoneType> {
+        let update = update_of(request)?;
+        let command = Command::Respond {
+            update,
+            result: Err(reason.to_owned()),
+        };
+        with_activation(|act| act.issue_command(command))?;
+        Ok(NoneType)
+    }
+
     /// Names a signal to wait for: `wait(signal("approved"), timeout = days(2))`.
     fn signal<'v>(name: &str, eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
         Ok(eval.heap().alloc(serde_json::json!({ "__signal__": name })))
@@ -590,13 +676,26 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let what: serde_json::Value = serde_json::from_str(&what.to_json()?)?;
-        let Some(name) = what.get("__signal__").and_then(|n| n.as_str()) else {
-            anyhow::bail!("wait() expects signal(name)");
-        };
         let timeout_ms = match timeout.unpack_i32() {
             Some(seconds) => milliseconds(seconds)?,
             None if timeout.is_none() => 0,
             None => anyhow::bail!("wait(timeout = ...) expects a number of seconds"),
+        };
+        if let Some(name) = what.get("__update__").and_then(|n| n.as_str()) {
+            let command = Command::AwaitUpdate {
+                name: name.to_owned(),
+                timeout_ms,
+            };
+            return match with_activation(|act| act.issue_indexed(command))? {
+                (_, None) => suspend_or_fail(Stop::Suspend),
+                (index, Some(StepOutcome::Completed(payload))) => Ok(eval.heap().alloc(
+                    serde_json::json!({ "update": index, "value": from_payload(&payload)? }),
+                )),
+                (_, Some(StepOutcome::Failed(_))) => Ok(Value::new_none()),
+            };
+        }
+        let Some(name) = what.get("__signal__").and_then(|n| n.as_str()) else {
+            anyhow::bail!("wait() expects signal(name) or update(name)");
         };
         let command = Command::AwaitSignal {
             name: name.to_owned(),

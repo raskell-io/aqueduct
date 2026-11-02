@@ -44,12 +44,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use aqueduct_core::{CommandIndex, Decider, Payload, Status, StepOutcome};
+use aqueduct_core::{CommandIndex, Decider, Payload, RunState, Status, StepOutcome};
 use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore};
 
 use crate::{
     AgentAttempt, AgentCall, AgentExecutor, Deciders, Observer, Outbound, Partition,
-    PartitionError, RetryPolicy, ReusePolicy, StartOptions,
+    PartitionError, RetryPolicy, ReusePolicy, StartOptions, UpdateStatus,
 };
 
 /// A step implementation.
@@ -149,6 +149,18 @@ pub enum EngineError {
     /// A run with this key exists, and the start used [`ReusePolicy::Reject`].
     #[error("run `{0}` already exists")]
     AlreadyStarted(String),
+    /// The run rejected the update, could not take it (it has ended, or waits for no update of this
+    /// name), or ended before answering it.
+    #[error("update rejected: {0}")]
+    UpdateRejected(String),
+    /// The run's logic has no such query.
+    #[error("run `{key}` has no query `{name}`")]
+    UnknownQuery {
+        /// The run key.
+        key: String,
+        /// The query asked for.
+        name: String,
+    },
     /// The id is not an escalation id (`<run key>#<command index>`).
     #[error("`{0}` is not an escalation id")]
     InvalidEscalation(String),
@@ -339,6 +351,8 @@ impl Builder {
             waiters: BTreeMap::new(),
             starts: BTreeMap::new(),
             signals: BTreeMap::new(),
+            updates: Vec::new(),
+            answers: Vec::new(),
         };
         let redispatch = self.redispatch;
         let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
@@ -419,6 +433,48 @@ impl Engine {
             id: id.to_owned(),
             payload,
             exact: false,
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// Sends an update to a run (a request its logic answers, ADR 0036) and waits for the answer: the
+    /// result, or [`EngineError::UpdateRejected`]. A run that has ended or is not waiting for an update
+    /// of this name rejects it, and so does logic that rejects it on receipt; neither leaves a trace in
+    /// the journal. An accepted update is durable, and so is its answer, when this returns. Sending
+    /// again with the same `id` (for example, after a [`EngineError::Timeout`]) delivers it once and
+    /// returns the first one's answer; an empty `id` disables that.
+    pub fn update(
+        &self,
+        key: &str,
+        name: &str,
+        id: &str,
+        payload: Payload,
+        timeout: Duration,
+    ) -> Result<Payload, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Update {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            id: id.to_owned(),
+            payload,
+            reply,
+        })?;
+        match answer.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(EngineError::Timeout(key.to_owned())),
+            Err(RecvTimeoutError::Disconnected) => Err(self.stopped()),
+        }
+    }
+
+    /// Asks a run's logic query `name` (a read-only look at its state, ADR 0036): the last value the
+    /// logic published under that name, at the point the run has reached. Nothing is journaled; the
+    /// answer reflects only what is durable.
+    pub fn query(&self, key: &str, name: &str) -> Result<Payload, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Query {
+            key: key.to_owned(),
+            name: name.to_owned(),
             reply,
         })?;
         answer.recv().map_err(|_| self.stopped())?
@@ -558,6 +614,18 @@ enum Request {
         reason: String,
         reply: Sender<Result<(), EngineError>>,
     },
+    Update {
+        key: String,
+        name: String,
+        id: String,
+        payload: Payload,
+        reply: Sender<Result<Payload, EngineError>>,
+    },
+    Query {
+        key: String,
+        name: String,
+        reply: Sender<Result<Payload, EngineError>>,
+    },
     Resolve {
         key: String,
         cmd: CommandIndex,
@@ -605,7 +673,14 @@ struct Processor {
     waiters: BTreeMap<String, Vec<Sender<Result<RunResult, EngineError>>>>,
     starts: BTreeMap<String, Vec<Sender<Result<(), EngineError>>>>,
     signals: BTreeMap<String, Vec<Sender<Result<(), EngineError>>>>,
+    /// Accepted updates waiting for their answer: (run id, the wait that received it, reply).
+    updates: Vec<(String, CommandIndex, AnswerSender)>,
+    /// Answers to send after the next flush, once what they reflect is durable.
+    answers: Vec<(AnswerSender, Result<Payload, EngineError>)>,
 }
+
+/// Where the answer to an update or a query goes.
+type AnswerSender = Sender<Result<Payload, EngineError>>;
 
 impl Processor {
     fn run(mut self, inbox: &Receiver<Request>, redispatch: Duration) -> Result<(), String> {
@@ -765,6 +840,37 @@ impl Processor {
                 }
                 Err(error) => return Err(error.to_string()),
             },
+            Request::Update {
+                key,
+                name,
+                id,
+                payload,
+                reply,
+            } => match self.partition.update(&key, &name, &id, payload) {
+                Ok(UpdateStatus::Answered(answer)) => self
+                    .answers
+                    .push((reply, answer.map_err(EngineError::UpdateRejected))),
+                Ok(UpdateStatus::Accepted { run, cmd }) => self.updates.push((run, cmd, reply)),
+                Err(PartitionError::UnknownRun(key)) => {
+                    let _ = reply.send(Err(EngineError::UnknownRun(key)));
+                }
+                Err(error) => return Err(error.to_string()),
+            },
+            Request::Query { key, name, reply } => {
+                let answer = match self.partition.query(&key, &name) {
+                    Ok(Some(answer)) => Ok(answer),
+                    Ok(None) => Err(EngineError::UnknownQuery { key, name }),
+                    Err(PartitionError::UnknownRun(key)) => Err(EngineError::UnknownRun(key)),
+                    Err(PartitionError::UnknownWorkflow(name)) => {
+                        Err(EngineError::UnknownWorkflow(name))
+                    }
+                    Err(PartitionError::UnknownVersion { workflow, version }) => {
+                        Err(EngineError::UnknownVersion { workflow, version })
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                self.answers.push((reply, answer));
+            }
             Request::StepResult { key, cmd, outcome } => {
                 self.partition
                     .step_result(&key, cmd, outcome)
@@ -802,6 +908,34 @@ impl Processor {
             .map_err(|e| format!("storage failed: {e}"))?;
         self.deliver(outbound);
         self.answer_waiters();
+        self.answer_updates().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Called right after a flush: sends the answers computed before it, and answers accepted updates
+    /// whose run has answered them, or has ended without doing so.
+    fn answer_updates(&mut self) -> Result<(), PartitionError> {
+        for (reply, answer) in self.answers.drain(..) {
+            let _ = reply.send(answer);
+        }
+        let mut waiting = Vec::new();
+        for (run, cmd, reply) in std::mem::take(&mut self.updates) {
+            let answer = match self.partition.run(&run) {
+                Some(held) => update_answer(held.state(), cmd),
+                // Not in memory: it has ended, and its checkpoint holds it.
+                None => self
+                    .partition
+                    .lookup_run(&run)?
+                    .and_then(|state| update_answer(&state, cmd)),
+            };
+            match answer {
+                Some(answer) => {
+                    let _ = reply.send(answer);
+                }
+                None => waiting.push((run, cmd, reply)),
+            }
+        }
+        self.updates = waiting;
         Ok(())
     }
 
@@ -909,6 +1043,18 @@ impl Processor {
                 let _ = reply.send(Ok(result.clone()));
             }
         }
+    }
+}
+
+/// The answer to the update received by the wait `cmd`, once there is one: the logic's response, or a
+/// rejection if the run ended without one.
+fn update_answer(state: &RunState, cmd: CommandIndex) -> Option<Result<Payload, EngineError>> {
+    match state.response(cmd) {
+        Some(answer) => Some(answer.clone().map_err(EngineError::UpdateRejected)),
+        None if state.status().is_terminal() => Some(Err(EngineError::UpdateRejected(
+            "the run ended without answering the update".into(),
+        ))),
+        None => None,
     }
 }
 

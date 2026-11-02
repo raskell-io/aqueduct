@@ -64,6 +64,23 @@ pub enum Command {
         /// The child's run key, if the logic chooses one.
         key: Option<String>,
     },
+    /// Wait for the next update with this name, or until the timeout. Its outcome is the update's
+    /// payload, or `Failed(TIMED_OUT)`. While the wait is pending, the engine accepts an update of this
+    /// name; the logic answers it with [`Command::Respond`].
+    AwaitUpdate {
+        /// The update's name.
+        name: String,
+        /// The timeout in milliseconds; 0 waits forever.
+        timeout_ms: u64,
+    },
+    /// Answer the update received by the wait `update`: with a result, or a rejection. Born completed.
+    /// Each received update is answered at most once.
+    Respond {
+        /// The wait that received the update.
+        update: CommandIndex,
+        /// The result, or why the update is rejected.
+        result: Result<Payload, String>,
+    },
     /// Complete the run. Must be the last command.
     CompleteRun {
         /// The run's output.
@@ -203,4 +220,13 @@ impl<'a> RunView<'a> {
 pub trait Decider {
     /// Returns every command the run has issued, given what it has observed.
     fn decide(&self, view: &RunView<'_>) -> Vec<Command>;
+
+    /// Answers query `name` about the run (a read-only look at its state), or `None` if the logic has
+    /// no such query. Pure, like [`Decider::decide`], and nothing it does is journaled. Procedures and
+    /// Rust workflows answer with the last value they published under the name, replaying the journal
+    /// to where the run is (ADR 0036). The default has no queries.
+    fn query(&self, view: &RunView<'_>, name: &str) -> Option<Payload> {
+        let _ = (view, name);
+        None
+    }
 }

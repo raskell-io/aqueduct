@@ -72,6 +72,21 @@ pub enum CommandKind {
     },
     /// A child run, started by the engine. Its outcome is the child's output, or its failure.
     Child,
+    /// A wait for an update. Its outcome is the update's payload, or `Failed(TIMED_OUT)`.
+    Update {
+        /// The timeout in milliseconds; 0 means none.
+        timeout_ms: u64,
+        /// When the timeout fires; 0 means never.
+        wake_at: u64,
+    },
+    /// A response to the update received by the wait `update`: a result (`ok`) or a rejection. It is
+    /// born completed; the result or the error is the command's input.
+    Response {
+        /// The wait that received the update.
+        update: CommandIndex,
+        /// A result, not a rejection.
+        ok: bool,
+    },
 }
 
 impl CommandKind {
@@ -79,6 +94,12 @@ impl CommandKind {
     /// retried, re-dispatched after a restart, and their late results are dropped.
     pub fn is_dispatched(self) -> bool {
         matches!(self, CommandKind::Step | CommandKind::Agent { .. })
+    }
+
+    /// Whether commands of this kind are complete the moment they are issued (recorded values and
+    /// responses to updates): they never wait, so a cancellation never takes them.
+    pub fn is_born_completed(self) -> bool {
+        matches!(self, CommandKind::Recorded | CommandKind::Response { .. })
     }
 }
 
@@ -202,6 +223,18 @@ impl ScheduledStep {
                 Some(key) => format!("a child run of `{}` under key `{key}`", self.name),
                 None => format!("a child run of `{}`", self.name),
             },
+            CommandKind::Update { timeout_ms, .. } => {
+                format!(
+                    "a wait for update `{}` (timeout {timeout_ms} ms)",
+                    self.name
+                )
+            }
+            CommandKind::Response { update, ok: true } => {
+                format!("a response to the update of command {update}")
+            }
+            CommandKind::Response { update, ok: false } => {
+                format!("a rejection of the update of command {update}")
+            }
         }
     }
 }
@@ -270,6 +303,17 @@ pub enum Event {
         cmd: CommandIndex,
         /// The child's output, or why it failed.
         outcome: StepOutcome,
+    },
+    /// An update was sent to the run. It completes the oldest wait for its name; without one it is
+    /// dropped (the engine rejects it before it gets here).
+    Update {
+        /// The update's name.
+        name: String,
+        /// The sender's id: an update whose id was already recorded is dropped. Empty means no
+        /// deduplication.
+        id: String,
+        /// The update's payload.
+        payload: Payload,
     },
     /// A signal was sent to the run.
     Signal {
@@ -433,6 +477,12 @@ pub enum JournalError {
     /// `CancelRequested` occurs more than once.
     #[error("the run is cancelled more than once")]
     DuplicateCancel,
+    /// Two updates carry the same id.
+    #[error("update id `{0}` is recorded twice")]
+    DuplicateUpdate(String),
+    /// A response refers to a command that is not a received update, or to one already answered.
+    #[error("response to command {0}, which is not a received, unanswered update")]
+    InvalidResponse(CommandIndex),
 }
 
 /// The state of one run: by definition, the fold of its journal.
@@ -460,6 +510,10 @@ pub struct RunState {
     version: Option<String>,
     /// A cancellation found no pending command; the next waiting command takes it.
     pending_cancel: bool,
+    /// The waits that received an update with an id, by that id.
+    update_ids: std::collections::BTreeMap<String, CommandIndex>,
+    /// The responses to received updates, by the wait that received them.
+    responses: std::collections::BTreeMap<CommandIndex, Result<Payload, String>>,
 }
 
 impl RunState {
@@ -492,6 +546,8 @@ impl RunState {
             budget: *budget_tokens,
             version: version.clone(),
             pending_cancel: false,
+            update_ids: std::collections::BTreeMap::new(),
+            responses: std::collections::BTreeMap::new(),
         };
         for entry in rest {
             state.apply(entry)?;
@@ -600,6 +656,38 @@ impl RunState {
                 self.expect_kind(*cmd, |kind| kind == CommandKind::Child)?;
                 self.record(*cmd, StepOutcome::Failed(error.clone()))?;
             }
+            Entry::UpdateAwaited {
+                cmd,
+                name,
+                timeout_ms,
+                wake_at,
+            } => {
+                let kind = CommandKind::Update {
+                    timeout_ms: *timeout_ms,
+                    wake_at: *wake_at,
+                };
+                self.push_command(*cmd, name, Payload::default(), kind)?;
+            }
+            Entry::UpdateReceived { cmd, id, payload } => {
+                self.expect_kind(*cmd, |kind| matches!(kind, CommandKind::Update { .. }))?;
+                if !id.is_empty() && self.update_ids.contains_key(id) {
+                    return Err(JournalError::DuplicateUpdate(id.clone()));
+                }
+                self.record(*cmd, StepOutcome::Completed(payload.clone()))?;
+                if !id.is_empty() {
+                    self.update_ids.insert(id.clone(), *cmd);
+                }
+            }
+            Entry::UpdateCompleted {
+                cmd,
+                update,
+                result,
+            } => {
+                self.respond(*cmd, *update, Ok(result.clone()))?;
+            }
+            Entry::UpdateRejected { cmd, update, error } => {
+                self.respond(*cmd, *update, Err(error.clone()))?;
+            }
             Entry::StepCompleted { cmd, result } => {
                 self.expect_kind(*cmd, |kind| kind == CommandKind::Step)?;
                 self.record(*cmd, StepOutcome::Completed(result.clone()))?;
@@ -704,7 +792,9 @@ impl RunState {
             Entry::TimerFired { cmd } => {
                 let outcome = match self.command(*cmd)?.kind {
                     CommandKind::Sleep { .. } => StepOutcome::Completed(Payload::new(*b"null")),
-                    CommandKind::Signal { wake_at, .. } if wake_at > 0 => {
+                    CommandKind::Signal { wake_at, .. } | CommandKind::Update { wake_at, .. }
+                        if wake_at > 0 =>
+                    {
                         StepOutcome::Failed(TIMED_OUT.to_owned())
                     }
                     _ => return Err(JournalError::InvalidCompletion(*cmd)),
@@ -777,6 +867,7 @@ impl RunState {
                 retry_after_ms,
             } => self.handle_attempt_failed(cmd, error, retry_after_ms, now_ms),
             Event::Signal { name, id, payload } => self.handle_signal(name, id, payload),
+            Event::Update { name, id, payload } => self.handle_update(name, id, payload),
             Event::ChildResult { cmd, outcome } => match self.command(cmd) {
                 Ok(step) if step.kind == CommandKind::Child && step.outcome.is_none() => {
                     Transition {
@@ -874,7 +965,9 @@ impl RunState {
                     step.retry_at.map(|wake_at| (CommandIndex(index), wake_at))
                 }
                 CommandKind::Sleep { wake_at, .. } => Some((CommandIndex(index), wake_at)),
-                CommandKind::Signal { wake_at, .. } if wake_at > 0 => {
+                CommandKind::Signal { wake_at, .. } | CommandKind::Update { wake_at, .. }
+                    if wake_at > 0 =>
+                {
                     Some((CommandIndex(index), wake_at))
                 }
                 _ => None,
@@ -1029,6 +1122,34 @@ impl RunState {
         self.cancel.as_deref()
     }
 
+    /// The oldest wait for an update with this name, if the run is running and has one: the wait an
+    /// update of this name is delivered to.
+    pub fn awaiting_update(&self, name: &str) -> Option<CommandIndex> {
+        if self.status.is_terminal() {
+            return None;
+        }
+        self.steps
+            .iter()
+            .zip(0u32..)
+            .find(|(step, _)| {
+                matches!(step.kind, CommandKind::Update { .. })
+                    && step.name == name
+                    && step.outcome.is_none()
+            })
+            .map(|(_, index)| CommandIndex(index))
+    }
+
+    /// The wait that received the update with this (non-empty) id, if one did.
+    pub fn update_with_id(&self, id: &str) -> Option<CommandIndex> {
+        self.update_ids.get(id).copied()
+    }
+
+    /// The response to the update received by the wait `update`: its result, or why it was rejected.
+    /// `None` while the logic has not answered it.
+    pub fn response(&self, update: CommandIndex) -> Option<&Result<Payload, String>> {
+        self.responses.get(&update)
+    }
+
     /// The number of journal entries applied.
     pub fn len(&self) -> usize {
         self.entries
@@ -1071,7 +1192,7 @@ impl RunState {
             child_key: None,
         });
         // A cancellation that found nothing pending is taken by the next command that waits.
-        if self.pending_cancel && kind != CommandKind::Recorded {
+        if self.pending_cancel && !kind.is_born_completed() {
             self.pending_cancel = false;
             self.cancel_command(cmd)?;
         }
@@ -1136,6 +1257,34 @@ impl RunState {
         }
         step.outcome = Some(outcome);
         self.completion_order.push(cmd);
+        Ok(())
+    }
+
+    /// Whether `update` is a wait that received an update the run has not answered yet.
+    fn answerable(&self, update: CommandIndex) -> bool {
+        self.command(update).is_ok_and(|step| {
+            matches!(step.kind, CommandKind::Update { .. })
+                && matches!(step.outcome, Some(StepOutcome::Completed(_)))
+        }) && !self.responses.contains_key(&update)
+    }
+
+    /// Applies a response command: `cmd` answers the update received by `update`.
+    fn respond(
+        &mut self,
+        cmd: CommandIndex,
+        update: CommandIndex,
+        result: Result<Payload, String>,
+    ) -> Result<(), JournalError> {
+        if !self.answerable(update) {
+            return Err(JournalError::InvalidResponse(update));
+        }
+        let (input, ok) = match &result {
+            Ok(result) => (result.clone(), true),
+            Err(error) => (Payload::new(error.as_bytes().to_vec()), false),
+        };
+        self.push_command(cmd, "", input, CommandKind::Response { update, ok })?;
+        self.record(cmd, StepOutcome::Completed(Payload::new(*b"null")))?;
+        self.responses.insert(update, result);
         Ok(())
     }
 
@@ -1233,12 +1382,15 @@ impl RunState {
         }
         let has_timer = match step.kind {
             CommandKind::Sleep { .. } => true,
-            CommandKind::Signal { wake_at, .. } => wake_at > 0,
+            CommandKind::Signal { wake_at, .. } | CommandKind::Update { wake_at, .. } => {
+                wake_at > 0
+            }
             CommandKind::Step
             | CommandKind::Recorded
             | CommandKind::Escalation
             | CommandKind::Agent { .. }
-            | CommandKind::Child => false,
+            | CommandKind::Child
+            | CommandKind::Response { .. } => false,
         };
         if step.outcome.is_some() || !has_timer {
             return Transition::none();
@@ -1265,6 +1417,20 @@ impl RunState {
         }
     }
 
+    fn handle_update(&self, name: String, id: String, payload: Payload) -> Transition {
+        if !id.is_empty() && self.update_ids.contains_key(&id) {
+            // Already recorded: a retried or duplicated send, which gets the first one's response.
+            return Transition::none();
+        }
+        let Some(cmd) = self.awaiting_update(&name) else {
+            return Transition::none();
+        };
+        Transition {
+            entries: vec![Entry::UpdateReceived { cmd, id, payload }],
+            effects: vec![Effect::Activate],
+        }
+    }
+
     fn handle_decision(&self, commands: Vec<Command>, now_ms: u64) -> Transition {
         let known = self.steps.len();
         let total = commands.len();
@@ -1280,6 +1446,8 @@ impl RunState {
             .iter()
             .map(|(n, _)| n.as_str())
             .collect();
+        // Updates answered by new commands of this decision.
+        let mut answered: Vec<CommandIndex> = Vec::new();
 
         for (position, command) in commands.into_iter().enumerate() {
             let new_kind = match &command {
@@ -1302,6 +1470,18 @@ impl RunState {
                 Command::Record { .. } => Some(CommandKind::Recorded),
                 Command::Escalate { .. } => Some(CommandKind::Escalation),
                 Command::StartChild { .. } => Some(CommandKind::Child),
+                Command::AwaitUpdate { timeout_ms, .. } => Some(CommandKind::Update {
+                    timeout_ms: *timeout_ms,
+                    wake_at: if *timeout_ms > 0 {
+                        now_ms.saturating_add(*timeout_ms)
+                    } else {
+                        0
+                    },
+                }),
+                Command::Respond { update, result } => Some(CommandKind::Response {
+                    update: *update,
+                    ok: result.is_ok(),
+                }),
                 _ => None,
             };
             if let Some(kind) = new_kind {
@@ -1316,9 +1496,16 @@ impl RunState {
                     Command::StartChild {
                         workflow, input, ..
                     } => (workflow.clone(), input.clone()),
-                    Command::AwaitSignal { name, .. } | Command::Record { name, .. } => {
-                        (name.clone(), Payload::default())
-                    }
+                    Command::AwaitSignal { name, .. }
+                    | Command::Record { name, .. }
+                    | Command::AwaitUpdate { name, .. } => (name.clone(), Payload::default()),
+                    Command::Respond { result, .. } => (
+                        String::new(),
+                        match result {
+                            Ok(result) => result.clone(),
+                            Err(error) => Payload::new(error.as_bytes().to_vec()),
+                        },
+                    ),
                     _ => ("sleep".to_owned(), Payload::default()),
                 };
                 let issued = ScheduledStep {
@@ -1353,7 +1540,15 @@ impl RunState {
                         return Transition::park("too many commands in one run".into());
                     };
                     let cmd = CommandIndex(index);
-                    if cancel_next && issued.kind != CommandKind::Recorded {
+                    if let CommandKind::Response { update, .. } = issued.kind {
+                        if !self.answerable(update) || answered.contains(&update) {
+                            return Transition::park(format!(
+                                "command {steps_seen}: the logic answered command {update}, which is not a received update it has not answered yet"
+                            ));
+                        }
+                        answered.push(update);
+                    }
+                    if cancel_next && !issued.kind.is_born_completed() {
                         cancel_next = false;
                         transition.entries.push(match issued.kind {
                             CommandKind::Step => Entry::StepScheduled {
@@ -1395,7 +1590,16 @@ impl RunState {
                                 input: issued.input,
                                 key: issued.child_key,
                             },
-                            CommandKind::Recorded => continue,
+                            CommandKind::Update {
+                                timeout_ms,
+                                wake_at,
+                            } => Entry::UpdateAwaited {
+                                cmd,
+                                name: issued.name,
+                                timeout_ms,
+                                wake_at,
+                            },
+                            CommandKind::Recorded | CommandKind::Response { .. } => continue,
                         });
                         if !transition.effects.contains(&Effect::Activate) {
                             transition.effects.push(Effect::Activate);
@@ -1503,6 +1707,32 @@ impl RunState {
                                 wake_at,
                             });
                         }
+                        CommandKind::Update {
+                            timeout_ms,
+                            wake_at,
+                        } => {
+                            transition.entries.push(Entry::UpdateAwaited {
+                                cmd,
+                                name: issued.name,
+                                timeout_ms,
+                                wake_at,
+                            });
+                        }
+                        CommandKind::Response { update, .. } => {
+                            transition.entries.push(match command {
+                                Command::Respond {
+                                    result: Ok(result), ..
+                                } => Entry::UpdateCompleted {
+                                    cmd,
+                                    update,
+                                    result,
+                                },
+                                Command::Respond {
+                                    result: Err(error), ..
+                                } => Entry::UpdateRejected { cmd, update, error },
+                                _ => continue,
+                            });
+                        }
                     }
                 }
                 steps_seen += 1;
@@ -1515,7 +1745,9 @@ impl RunState {
                 | Command::Record { .. }
                 | Command::Escalate { .. }
                 | Command::CallAgent { .. }
-                | Command::StartChild { .. } => {}
+                | Command::StartChild { .. }
+                | Command::AwaitUpdate { .. }
+                | Command::Respond { .. } => {}
                 Command::CompleteRun { .. }
                 | Command::FailRun { .. }
                 | Command::Park { .. }
@@ -1580,7 +1812,15 @@ fn same_command(recorded: &ScheduledStep, issued: &ScheduledStep) -> bool {
             (
                 CommandKind::Signal { timeout_ms: a, .. },
                 CommandKind::Signal { timeout_ms: b, .. },
+            )
+            | (
+                CommandKind::Update { timeout_ms: a, .. },
+                CommandKind::Update { timeout_ms: b, .. },
             ) => a == b,
+            (
+                CommandKind::Response { update: a, ok: x },
+                CommandKind::Response { update: b, ok: y },
+            ) => a == b && x == y,
             (CommandKind::Recorded, CommandKind::Recorded) => true,
             (CommandKind::Escalation, CommandKind::Escalation)
             | (CommandKind::Child, CommandKind::Child) => true,
