@@ -221,6 +221,7 @@ version = "0.0.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
+ "aqueduct-procedure",
  "serde",
  "serde_json",
  "thiserror",

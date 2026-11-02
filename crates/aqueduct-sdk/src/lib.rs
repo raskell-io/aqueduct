@@ -58,6 +58,14 @@ pub enum WorkflowError {
         /// The step's error.
         error: String,
     },
+    /// A child run failed, or could not be started.
+    #[error("child run of `{workflow}` failed: {error}")]
+    ChildFailed {
+        /// The child's workflow.
+        workflow: String,
+        /// Why it failed.
+        error: String,
+    },
     /// A value could not be encoded or decoded as JSON.
     #[error("payload: {0}")]
     Payload(String),
@@ -322,6 +330,63 @@ impl WorkflowContext {
             StepOutcome::Completed(response) => serde_json::from_slice(response.as_bytes())
                 .map_err(|e| WorkflowError::Payload(e.to_string())),
             StepOutcome::Failed(error) => Err(WorkflowError::StepFailed { name, error }),
+        })
+    }
+
+    /// Starts a child run of `workflow` (a code workflow or a procedure registered with the engine) with
+    /// a JSON-encoded input, waits durably for it to end, and decodes its output (ADR 0034). The child
+    /// runs under a key derived from this run's (`<key>#<command>`); cancelling this run while it
+    /// waits cancels the child too.
+    pub fn child<T, I>(
+        &self,
+        workflow: &str,
+        input: &I,
+    ) -> impl Future<Output = Result<T, WorkflowError>> + use<T, I>
+    where
+        T: DeserializeOwned,
+        I: Serialize + ?Sized,
+    {
+        self.start_child(workflow, None, input)
+    }
+
+    /// Like [`WorkflowContext::child`], under a run key of your choosing: if the key already has a run of
+    /// the same workflow with the same input, that run is the child, and every run that waits for it
+    /// gets its outcome.
+    pub fn child_with_key<T, I>(
+        &self,
+        workflow: &str,
+        key: &str,
+        input: &I,
+    ) -> impl Future<Output = Result<T, WorkflowError>> + use<T, I>
+    where
+        T: DeserializeOwned,
+        I: Serialize + ?Sized,
+    {
+        self.start_child(workflow, Some(key.to_owned()), input)
+    }
+
+    fn start_child<T, I>(
+        &self,
+        workflow: &str,
+        key: Option<String>,
+        input: &I,
+    ) -> impl Future<Output = Result<T, WorkflowError>> + use<T, I>
+    where
+        T: DeserializeOwned,
+        I: Serialize + ?Sized,
+    {
+        let command = serde_json::to_vec(input)
+            .map_err(|e| WorkflowError::Payload(e.to_string()))
+            .map(|input| Command::StartChild {
+                workflow: workflow.to_owned(),
+                input: Payload::new(input),
+                key,
+            });
+        let workflow = workflow.to_owned();
+        self.call(command, move |outcome| match outcome {
+            StepOutcome::Completed(output) => serde_json::from_slice(output.as_bytes())
+                .map_err(|e| WorkflowError::Payload(e.to_string())),
+            StepOutcome::Failed(error) => Err(WorkflowError::ChildFailed { workflow, error }),
         })
     }
 

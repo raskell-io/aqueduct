@@ -73,8 +73,12 @@ fn reference(decider: &dyn Decider, n: u64) -> Result<String, String> {
                 cmd,
                 outcome: execute(&name, &input),
             },
-            // The crash workload's procedure never continues as new or calls agents.
-            Effect::Finished(_) | Effect::ContinueAsNew { .. } | Effect::DispatchAgent { .. } => {
+            // The crash workload's procedure never continues as new, calls agents or starts children.
+            Effect::Finished(_)
+            | Effect::ContinueAsNew { .. }
+            | Effect::DispatchAgent { .. }
+            | Effect::StartChild { .. }
+            | Effect::CancelChild { .. } => {
                 continue;
             }
         };

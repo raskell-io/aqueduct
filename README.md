@@ -172,6 +172,9 @@ What holds today, for the embedded engine, and how it is checked:
 - **Counterfactual replay:** a new procedure version is replayed against past runs, answered with their
   recorded results, and the runs it would decide differently are reported with where they diverge
   ([ADR 0028](docs/adr/0028-counterfactual-replay.md)).
+- **Child runs:** procedures and code workflows call each other (`call("payment", input)` in a
+  procedure, `ctx.child("payment", &input)` in Rust) as durable child runs; cancelling a parent cancels
+  its children ([ADR 0034](docs/adr/0034-child-runs.md)).
 - **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
   once per signal id.** **Retries** follow a policy with journaled backoff.
 - **Agent steps:** a model call is a step whose answer, model identity and token cost are journaled, so

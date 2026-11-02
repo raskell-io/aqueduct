@@ -64,6 +64,10 @@ mod kind {
     pub const AGENT_ANSWER_ESCALATED: u8 = 23;
     pub const STARTED_VERSION: u8 = 24;
     pub const STARTED_VERSION_WITH_BUDGET: u8 = 25;
+    pub const CHILD_STARTED: u8 = 26;
+    pub const CHILD_STARTED_WITH_KEY: u8 = 27;
+    pub const CHILD_COMPLETED: u8 = 28;
+    pub const CHILD_FAILED: u8 = 29;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -182,6 +186,10 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::AgentCallEscalated { .. } => kind::AGENT_CALL_ESCALATED,
         Entry::BudgetApproved { .. } => kind::BUDGET_APPROVED,
         Entry::AgentAnswerEscalated { .. } => kind::AGENT_ANSWER_ESCALATED,
+        Entry::ChildStarted { key: None, .. } => kind::CHILD_STARTED,
+        Entry::ChildStarted { key: Some(_), .. } => kind::CHILD_STARTED_WITH_KEY,
+        Entry::ChildCompleted { .. } => kind::CHILD_COMPLETED,
+        Entry::ChildFailed { .. } => kind::CHILD_FAILED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -210,9 +218,26 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_varint(&mut out, u64::from(cmd.0));
             put_bytes(&mut out, result.as_bytes());
         }
-        Entry::StepFailed { cmd, error } => {
+        Entry::StepFailed { cmd, error } | Entry::ChildFailed { cmd, error } => {
             put_varint(&mut out, u64::from(cmd.0));
             put_bytes(&mut out, error.as_bytes());
+        }
+        Entry::ChildStarted {
+            cmd,
+            workflow,
+            input,
+            key,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, workflow.as_bytes());
+            put_bytes(&mut out, input.as_bytes());
+            if let Some(key) = key {
+                put_bytes(&mut out, key.as_bytes());
+            }
+        }
+        Entry::ChildCompleted { cmd, output } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, output.as_bytes());
         }
         Entry::RunCompleted { output } => put_bytes(&mut out, output.as_bytes()),
         Entry::ContinuedAsNew { input } => put_bytes(&mut out, input.as_bytes()),
@@ -459,6 +484,26 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         },
         kind::CANCEL_REQUESTED => Entry::CancelRequested {
             reason: reader.string()?,
+        },
+        kind::CHILD_STARTED => Entry::ChildStarted {
+            cmd: reader.cmd()?,
+            workflow: reader.string()?,
+            input: reader.payload()?,
+            key: None,
+        },
+        kind::CHILD_STARTED_WITH_KEY => Entry::ChildStarted {
+            cmd: reader.cmd()?,
+            workflow: reader.string()?,
+            input: reader.payload()?,
+            key: Some(reader.string()?),
+        },
+        kind::CHILD_COMPLETED => Entry::ChildCompleted {
+            cmd: reader.cmd()?,
+            output: reader.payload()?,
+        },
+        kind::CHILD_FAILED => Entry::ChildFailed {
+            cmd: reader.cmd()?,
+            error: reader.string()?,
         },
         other => return Err(DecodeError::UnknownKind(other)),
     };

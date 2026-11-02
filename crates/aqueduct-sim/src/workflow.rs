@@ -344,6 +344,9 @@ pub fn reference(
                 outcome: Ok(fake_model(&name, &request)),
             },
             Some(Effect::Finished(_)) => continue,
+            Some(Effect::StartChild { .. } | Effect::CancelChild { .. }) => {
+                return Err("the simulated workloads start no child runs".into());
+            }
             // The run continued as new: the key's next run takes over.
             Some(Effect::ContinueAsNew { input }) => {
                 let left = state

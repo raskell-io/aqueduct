@@ -8,7 +8,8 @@
 //! - a step by a recorded result of a step with the same name and input, an agent call by a recorded
 //!   answer to the same name and request (checked against the new call's output schema), an escalation by
 //!   the resolution of one with the same reason and payload, a budget escalation by whether more budget was
-//!   approved for the same call; each recorded result answers at most one command;
+//!   approved for the same call, a child run by the outcome of a child of the same workflow with the same
+//!   input; each recorded result answers at most one command;
 //! - the old run's signals arrive in their order, when nothing else can make progress; then timers fire
 //!   (time is skipped, not waited for); then a cancellation, if the old run had one.
 //!
@@ -170,6 +171,7 @@ struct Evidence {
     steps: BTreeMap<(String, Vec<u8>), VecDeque<StepOutcome>>,
     agents: BTreeMap<(String, Vec<u8>), VecDeque<AgentEvidence>>,
     escalations: BTreeMap<(String, Vec<u8>), VecDeque<Payload>>,
+    children: BTreeMap<(String, Vec<u8>), VecDeque<StepOutcome>>,
     signals: VecDeque<(String, String, Payload)>,
     cancel: Option<String>,
 }
@@ -228,6 +230,35 @@ impl Evidence {
                         *cmd,
                         Pending::Escalation(reason.clone(), payload.as_bytes().to_vec()),
                     );
+                }
+                Entry::ChildStarted {
+                    cmd,
+                    workflow,
+                    input,
+                    ..
+                } => {
+                    commands.insert(
+                        *cmd,
+                        Pending::Child(workflow.clone(), input.as_bytes().to_vec()),
+                    );
+                }
+                Entry::ChildCompleted { cmd, output } => {
+                    if let Some(Pending::Child(workflow, input)) = commands.get(cmd) {
+                        evidence
+                            .children
+                            .entry((workflow.clone(), input.clone()))
+                            .or_default()
+                            .push_back(StepOutcome::Completed(output.clone()));
+                    }
+                }
+                Entry::ChildFailed { cmd, error } => {
+                    if let Some(Pending::Child(workflow, input)) = commands.get(cmd) {
+                        evidence
+                            .children
+                            .entry((workflow.clone(), input.clone()))
+                            .or_default()
+                            .push_back(StepOutcome::Failed(error.clone()));
+                    }
                 }
                 Entry::BudgetApproved { cmd, .. } => {
                     if let Some((_, agent)) = agents.get_mut(cmd) {
@@ -289,6 +320,7 @@ impl Evidence {
 enum Pending {
     Step(String, Vec<u8>),
     Escalation(String, Vec<u8>),
+    Child(String, Vec<u8>),
 }
 
 /// Replays a past run (its run id and journal) against `decider`, the new version.
@@ -503,6 +535,31 @@ impl Replay {
                         None
                     }
                 }
+                (CommandKind::Child, _) => {
+                    if let Some(outcome) = evidence
+                        .children
+                        .get_mut(&key)
+                        .and_then(VecDeque::pop_front)
+                    {
+                        Some(Event::ChildResult { cmd, outcome })
+                    } else if let Some(stub) = options.stubs.get(&step.name) {
+                        self.stubbed.push(step.name.clone());
+                        Some(Event::ChildResult {
+                            cmd,
+                            outcome: StepOutcome::Completed(stub.clone()),
+                        })
+                    } else {
+                        self.unresolvable(
+                            cmd,
+                            format!(
+                                "child run of `{}` with input {}: the old run has no outcome for it",
+                                step.name,
+                                text(&step.input)
+                            ),
+                        );
+                        None
+                    }
+                }
                 // Timers and signals are answered by the replay's loop; recorded values are born complete.
                 _ => None,
             };
@@ -616,6 +673,7 @@ pub fn describe(step: &ScheduledStep) -> String {
         CommandKind::Recorded => return format!("value `{}`", step.name),
         CommandKind::Escalation => "escalation",
         CommandKind::Agent { .. } => "agent call",
+        CommandKind::Child => "child run of",
     };
     format!("{kind} `{}` {}", step.name, text(&step.input))
 }

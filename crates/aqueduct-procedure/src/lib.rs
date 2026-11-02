@@ -12,6 +12,11 @@
 //! - `agent(name, input, prompt = ..., output_schema = ..., budget_tokens = ...)` calls a model through
 //!   the engine's agent executor and returns its response; the model, its parameters and the tokens used
 //!   are journaled, and replay never calls it again (ADR 0023).
+//! - `call(workflow, input = None, key = None, fallible = False)` starts a child run of another
+//!   procedure or code workflow (or this one), waits durably for it to end and returns its output; a
+//!   child that fails fails the run, unless `fallible = True` (then `{"ok": ..., ...}` as for `step`).
+//!   With `key`, the child runs under that run key, and a run the key already has of the same workflow
+//!   with the same input is the child; without one, the child's key is derived from the run's (ADR 0034).
 //! - `escalate(reason, payload = None)` hands a decision to a person or an agent, waits durably for
 //!   the resolution and returns it (ADR 0020).
 //! - `continue_as_new(input)` ends the run and starts a new run of the procedure under the same key with
@@ -494,6 +499,41 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
             Some(StepOutcome::Failed(error)) => suspend_or_fail(Stop::StepFailed(error)),
             Some(StepOutcome::Completed(result)) => Ok(eval.heap().alloc(from_payload(&result)?)),
         }
+    }
+
+    /// Starts a child run of `workflow` with `input`, waits for it to end, and returns its output.
+    fn call<'v>(
+        workflow: &str,
+        #[starlark(default = NoneType)] input: Value<'v>,
+        #[starlark(require = named, default = NoneType)] key: Value<'v>,
+        #[starlark(require = named, default = false)] fallible: bool,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        let key = match key.unpack_str() {
+            Some(key) if !aqueduct_core::valid_key(key) => {
+                anyhow::bail!("call(key = ...) needs a non-empty key without NUL")
+            }
+            Some(key) => Some(key.to_owned()),
+            None if key.is_none() => None,
+            None => anyhow::bail!("call(key = ...) expects a string"),
+        };
+        let command = Command::StartChild {
+            workflow: workflow.to_owned(),
+            input: to_payload(input)?,
+            key,
+        };
+        let value = match with_activation(|act| act.issue_command(command))? {
+            None => return suspend_or_fail(Stop::Suspend),
+            Some(StepOutcome::Completed(output)) if fallible => {
+                serde_json::json!({ "ok": true, "value": from_payload(&output)? })
+            }
+            Some(StepOutcome::Completed(output)) => from_payload(&output)?,
+            Some(StepOutcome::Failed(error)) if fallible => {
+                serde_json::json!({ "ok": false, "error": error })
+            }
+            Some(StepOutcome::Failed(error)) => return suspend_or_fail(Stop::StepFailed(error)),
+        };
+        Ok(eval.heap().alloc(value))
     }
 
     /// Sleeps durably for a number of seconds.
