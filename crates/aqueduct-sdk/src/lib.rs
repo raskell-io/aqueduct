@@ -9,6 +9,10 @@
 //! [`join`] or [`join_all`]) are issued together; [`select`] and [`select_all`] wait for the first to
 //! finish, in the order the journal recorded them (ADR 0016).
 //!
+//! Queries read what the workflow publishes with [`WorkflowContext::publish`]; updates are requests it
+//! waits for with [`WorkflowContext::wait_update`] and answers with [`WorkflowContext::respond`] or
+//! [`WorkflowContext::reject`] (ADR 0036).
+//!
 //! ```
 //! use aqueduct_core::{Command, Decider, Payload, RunState, start};
 //! use aqueduct_sdk::{WorkflowContext, WorkflowError, join, workflow};
@@ -105,6 +109,8 @@ struct Activation {
     /// The latest completion (by rank) among the calls resolved since [`select`] last reset it; `None`
     /// when none was. Values recorded in this activation rank after everything in the journal.
     resolved: Option<usize>,
+    /// The values published for queries, by name: the last one counts.
+    published: std::collections::BTreeMap<String, Payload>,
 }
 
 impl Activation {
@@ -291,6 +297,78 @@ impl WorkflowContext {
     ) -> impl Future<Output = Result<(), WorkflowError>> + use<> {
         let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         self.call(Ok(Command::Sleep { duration_ms }), |_| Ok(()))
+    }
+
+    /// Makes `value` the answer to query `name`, from this point of the workflow on (ADR 0036). A query
+    /// replays the run to where it is and returns the last value published under its name; publishing
+    /// is not journaled, so it can be called as often as the state it shows changes.
+    pub fn publish<V: Serialize + ?Sized>(
+        &self,
+        name: &str,
+        value: &V,
+    ) -> Result<(), WorkflowError> {
+        let value = serde_json::to_vec(value).map_err(|e| WorkflowError::Payload(e.to_string()))?;
+        self.activation
+            .borrow_mut()
+            .published
+            .insert(name.to_owned(), Payload::new(value));
+        Ok(())
+    }
+
+    /// Waits for the next update with this name (a request whose sender waits for the answer, ADR
+    /// 0036) and decodes its payload, or returns `None` when the timeout passes first. Answer it with
+    /// [`WorkflowContext::respond`] or [`WorkflowContext::reject`]. Rejecting it before the workflow
+    /// waits for anything else is validation: the update leaves no trace in the journal, and the wait
+    /// stays open for the next one.
+    pub fn wait_update<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = Result<Option<Update<T>>, WorkflowError>> + use<T> {
+        let timeout_ms = timeout.map_or(0, |t| {
+            u64::try_from(t.as_millis()).unwrap_or(u64::MAX).max(1)
+        });
+        self.call_indexed(
+            Ok(Command::AwaitUpdate {
+                name: name.to_owned(),
+                timeout_ms,
+            }),
+            |index, outcome| match outcome {
+                StepOutcome::Completed(payload) => serde_json::from_slice(payload.as_bytes())
+                    .map(|value| {
+                        Some(Update {
+                            value,
+                            cmd: aqueduct_core::CommandIndex(
+                                u32::try_from(index).unwrap_or(u32::MAX),
+                            ),
+                        })
+                    })
+                    .map_err(|e| WorkflowError::Payload(e.to_string())),
+                StepOutcome::Failed(_) => Ok(None),
+            },
+        )
+    }
+
+    /// Answers an update with `result`, which its sender receives. Each update is answered once.
+    pub fn respond<T, R: Serialize + ?Sized>(
+        &self,
+        update: &Update<T>,
+        result: &R,
+    ) -> Result<(), WorkflowError> {
+        let result =
+            serde_json::to_vec(result).map_err(|e| WorkflowError::Payload(e.to_string()))?;
+        self.answer(update.cmd, Ok(Payload::new(result)));
+        Ok(())
+    }
+
+    /// Refuses an update; its sender receives `reason` as the rejection.
+    pub fn reject<T>(&self, update: &Update<T>, reason: &str) {
+        self.answer(update.cmd, Err(reason.to_owned()));
+    }
+
+    fn answer(&self, update: aqueduct_core::CommandIndex, result: Result<Payload, String>) {
+        let (index, _) = self.issue(Command::Respond { update, result });
+        self.activation.borrow_mut().resolve(index);
     }
 
     /// Waits for the next signal with this name and decodes its payload, or returns `None` when the
@@ -510,6 +588,18 @@ impl WorkflowContext {
     where
         G: FnOnce(StepOutcome) -> Result<R, WorkflowError>,
     {
+        self.call_indexed(command, move |_, outcome| finish(outcome))
+    }
+
+    /// [`WorkflowContext::call`], with the command's index passed to `finish`.
+    fn call_indexed<R, G>(
+        &self,
+        command: Result<Command, WorkflowError>,
+        finish: G,
+    ) -> impl Future<Output = Result<R, WorkflowError>> + use<R, G>
+    where
+        G: FnOnce(usize, StepOutcome) -> Result<R, WorkflowError>,
+    {
         let context = self.clone();
         let mut state = Some((command, finish));
         let mut outcome: Option<Option<StepOutcome>> = None;
@@ -537,7 +627,7 @@ impl WorkflowContext {
                             Some(cancelled) => Poll::Ready(Err(cancelled)),
                             None => {
                                 drop(activation);
-                                Poll::Ready(finish(result))
+                                Poll::Ready(finish(index, result))
                             }
                         }
                     }
@@ -800,6 +890,15 @@ pub async fn select_all<F: Future>(futures: Vec<F>) -> (usize, F::Output) {
     .await
 }
 
+/// An update a workflow received ([`WorkflowContext::wait_update`]): its payload, and which wait
+/// received it, to answer it by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Update<T> {
+    /// The update's payload.
+    pub value: T,
+    cmd: aqueduct_core::CommandIndex,
+}
+
 /// How an agent call is made: its prompt, the schema its output must follow, and its token budget.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentOptions {
@@ -841,6 +940,26 @@ where
     O: Serialize,
 {
     fn decide(&self, view: &RunView<'_>) -> Vec<Command> {
+        self.activate(view).0
+    }
+
+    fn query(&self, view: &RunView<'_>, name: &str) -> Option<Payload> {
+        self.activate(view).1.remove(name)
+    }
+}
+
+impl<F, Fut, I, O> Workflow<F, I, O, Fut>
+where
+    F: Fn(WorkflowContext, I) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<O, WorkflowError>>,
+    I: DeserializeOwned,
+    O: Serialize,
+{
+    /// Runs the workflow against the journal: the commands it issues, and the values it published.
+    fn activate(
+        &self,
+        view: &RunView<'_>,
+    ) -> (Vec<Command>, std::collections::BTreeMap<String, Payload>) {
         let outcomes: Vec<Option<StepOutcome>> = view.outcomes().map(|o| o.cloned()).collect();
         let mut ranks = vec![None; outcomes.len()];
         for (rank, cmd) in view.completion_order().iter().enumerate() {
@@ -867,13 +986,15 @@ where
             env: view.env(),
             key: view.key().to_owned(),
             resolved: None,
+            published: std::collections::BTreeMap::new(),
         }));
         let input: I = match serde_json::from_slice(view.input().as_bytes()) {
             Ok(input) => input,
             Err(e) => {
-                return vec![Command::Park {
+                let park = Command::Park {
                     reason: format!("the run's input does not decode: {e}"),
-                }];
+                };
+                return (vec![park], std::collections::BTreeMap::new());
             }
         };
         let context = WorkflowContext {
@@ -889,6 +1010,7 @@ where
         CURRENT.with(|current| *current.borrow_mut() = None);
         drop(future);
         let mut commands = std::mem::take(&mut activation.borrow_mut().commands);
+        let published = std::mem::take(&mut activation.borrow_mut().published);
         match polled {
             Poll::Pending => {}
             Poll::Ready(Ok(output)) => match serde_json::to_vec(&output) {
@@ -911,6 +1033,6 @@ where
                 error: error.to_string(),
             }),
         }
-        commands
+        (commands, published)
     }
 }

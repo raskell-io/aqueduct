@@ -68,6 +68,10 @@ mod kind {
     pub const CHILD_STARTED_WITH_KEY: u8 = 27;
     pub const CHILD_COMPLETED: u8 = 28;
     pub const CHILD_FAILED: u8 = 29;
+    pub const UPDATE_AWAITED: u8 = 30;
+    pub const UPDATE_RECEIVED: u8 = 31;
+    pub const UPDATE_COMPLETED: u8 = 32;
+    pub const UPDATE_REJECTED: u8 = 33;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -190,6 +194,10 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::ChildStarted { key: Some(_), .. } => kind::CHILD_STARTED_WITH_KEY,
         Entry::ChildCompleted { .. } => kind::CHILD_COMPLETED,
         Entry::ChildFailed { .. } => kind::CHILD_FAILED,
+        Entry::UpdateAwaited { .. } => kind::UPDATE_AWAITED,
+        Entry::UpdateReceived { .. } => kind::UPDATE_RECEIVED,
+        Entry::UpdateCompleted { .. } => kind::UPDATE_COMPLETED,
+        Entry::UpdateRejected { .. } => kind::UPDATE_REJECTED,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -238,6 +246,36 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::ChildCompleted { cmd, output } => {
             put_varint(&mut out, u64::from(cmd.0));
             put_bytes(&mut out, output.as_bytes());
+        }
+        Entry::UpdateAwaited {
+            cmd,
+            name,
+            timeout_ms,
+            wake_at,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, name.as_bytes());
+            put_varint(&mut out, *timeout_ms);
+            put_varint(&mut out, *wake_at);
+        }
+        Entry::UpdateReceived { cmd, id, payload } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, id.as_bytes());
+            put_bytes(&mut out, payload.as_bytes());
+        }
+        Entry::UpdateCompleted {
+            cmd,
+            update,
+            result,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_varint(&mut out, u64::from(update.0));
+            put_bytes(&mut out, result.as_bytes());
+        }
+        Entry::UpdateRejected { cmd, update, error } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_varint(&mut out, u64::from(update.0));
+            put_bytes(&mut out, error.as_bytes());
         }
         Entry::RunCompleted { output } => put_bytes(&mut out, output.as_bytes()),
         Entry::ContinuedAsNew { input } => put_bytes(&mut out, input.as_bytes()),
@@ -503,6 +541,27 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         },
         kind::CHILD_FAILED => Entry::ChildFailed {
             cmd: reader.cmd()?,
+            error: reader.string()?,
+        },
+        kind::UPDATE_AWAITED => Entry::UpdateAwaited {
+            cmd: reader.cmd()?,
+            name: reader.string()?,
+            timeout_ms: reader.varint()?,
+            wake_at: reader.varint()?,
+        },
+        kind::UPDATE_RECEIVED => Entry::UpdateReceived {
+            cmd: reader.cmd()?,
+            id: reader.string()?,
+            payload: reader.payload()?,
+        },
+        kind::UPDATE_COMPLETED => Entry::UpdateCompleted {
+            cmd: reader.cmd()?,
+            update: reader.cmd()?,
+            result: reader.payload()?,
+        },
+        kind::UPDATE_REJECTED => Entry::UpdateRejected {
+            cmd: reader.cmd()?,
+            update: reader.cmd()?,
             error: reader.string()?,
         },
         other => return Err(DecodeError::UnknownKind(other)),

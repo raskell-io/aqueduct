@@ -333,6 +333,24 @@ pub enum PartitionError {
     InvalidResolution(String),
 }
 
+/// What an update sent to a run came to, so far (ADR 0036).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateStatus {
+    /// Answered: the logic's result, or why the update was rejected. An update the run cannot take
+    /// (it has ended, or waits for no update of this name) and one the logic rejects as it receives it
+    /// are rejected without being journaled.
+    Answered(Result<Payload, String>),
+    /// Accepted: the update is journaled as received by the wait `cmd` of run `run`, and the logic has
+    /// not answered it yet. Its answer will be [`RunState::response`] for `cmd`; if the run ends
+    /// without one, it never comes.
+    Accepted {
+        /// The run id.
+        run: String,
+        /// The wait that received it.
+        cmd: CommandIndex,
+    },
+}
+
 /// How a run is started.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StartOptions {
@@ -1001,6 +1019,142 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             key: run.to_owned(),
         });
         Ok(())
+    }
+
+    /// Sends an update to a key's latest run: a request that its logic answers (ADR 0036). It is
+    /// delivered to the run's oldest wait for an update of this name; a run that has ended, or waits
+    /// for none, rejects it. Before it is journaled, the logic's reaction is tried on a copy of the run:
+    /// if the logic rejects the update as it receives it (validation), nothing is journaled and the
+    /// rejection is the answer. Otherwise the update and that reaction are journaled. An update whose
+    /// non-empty `id` the run has already received is not delivered again; it gets the first one's
+    /// answer.
+    pub fn update(
+        &mut self,
+        key: &str,
+        name: &str,
+        id: &str,
+        payload: Payload,
+    ) -> Result<UpdateStatus, PartitionError> {
+        let run = self
+            .latest(key)?
+            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        let ended = || {
+            Ok(UpdateStatus::Answered(Err(format!(
+                "run `{key}` has ended"
+            ))))
+        };
+        let Some(state) = self.runs.get(&run).map(|r| &r.state) else {
+            // Not in memory: it has ended. A retried update may still have its answer there.
+            let state = self
+                .lookup_run(&run)?
+                .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+            return match (!id.is_empty())
+                .then(|| state.update_with_id(id))
+                .flatten()
+                .and_then(|cmd| state.response(cmd))
+            {
+                Some(answer) => Ok(UpdateStatus::Answered(answer.clone())),
+                None => ended(),
+            };
+        };
+        if let Some(cmd) = (!id.is_empty()).then(|| state.update_with_id(id)).flatten() {
+            return match state.response(cmd) {
+                Some(answer) => Ok(UpdateStatus::Answered(answer.clone())),
+                None if state.status().is_terminal() => ended(),
+                None => Ok(UpdateStatus::Accepted { run, cmd }),
+            };
+        }
+        if state.status().is_terminal() {
+            return ended();
+        }
+        let Some(cmd) = state.awaiting_update(name) else {
+            return Ok(UpdateStatus::Answered(Err(format!(
+                "run `{key}` is not waiting for update `{name}`"
+            ))));
+        };
+        let event = Event::Update {
+            name: name.to_owned(),
+            id: id.to_owned(),
+            payload,
+        };
+        let received = state.handle_at(event, self.now_ms);
+        let env = Env {
+            now_ms: self.now_ms,
+            seed: self.next_seed(),
+        };
+        let state = &self.runs[&run].state;
+        // The logic's reaction, tried on a copy: a rejection here leaves no trace in the journal.
+        let reaction = match self.deciders.for_run(state.workflow(), state.version()) {
+            Some(decider) => {
+                let mut trial = state.clone();
+                for entry in &received.entries {
+                    trial.apply(entry).map_err(|e| {
+                        PartitionError::Internal(format!(
+                            "run {run}: the core produced an invalid entry: {e}"
+                        ))
+                    })?;
+                }
+                let commands = decider.decide(&trial.view_at(&run, env));
+                Some(trial.handle_at(Event::Decision(commands), self.now_ms))
+            }
+            None => None,
+        };
+        let rejected = reaction.as_ref().and_then(|reaction| {
+            reaction.entries.iter().find_map(|entry| match entry {
+                Entry::UpdateRejected { update, error, .. } if *update == cmd => {
+                    Some(error.clone())
+                }
+                _ => None,
+            })
+        });
+        if let Some(error) = rejected {
+            return Ok(UpdateStatus::Answered(Err(error)));
+        }
+        match reaction {
+            // The reaction was computed for the run with the update received: journal both, so the
+            // logic is not asked twice.
+            Some(reaction) => {
+                let received = Transition {
+                    entries: received.entries,
+                    effects: Vec::new(),
+                };
+                self.append(&run, received)?;
+                let effects = self.append(&run, reaction)?;
+                self.perform(&run, effects)?;
+            }
+            None => {
+                let effects = self.append(&run, received)?;
+                self.perform(&run, effects)?;
+            }
+        }
+        Ok(UpdateStatus::Accepted { run, cmd })
+    }
+
+    /// Answers query `name` about a key's latest run, from its logic (ADR 0036): `None` if the logic
+    /// has no such query. Nothing is journaled. The run is read as it is in memory, which may include
+    /// entries not yet durable: a caller that must not show those answers after the next flush.
+    pub fn query(&mut self, key: &str, name: &str) -> Result<Option<Payload>, PartitionError> {
+        let run = self
+            .latest(key)?
+            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        let state = self
+            .lookup_run(&run)?
+            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        let decider = self
+            .deciders
+            .for_run(state.workflow(), state.version())
+            .ok_or_else(|| match state.version() {
+                Some(version) => PartitionError::UnknownVersion {
+                    workflow: state.workflow().to_owned(),
+                    version: version.to_owned(),
+                },
+                None => PartitionError::UnknownWorkflow(state.workflow().to_owned()),
+            })?;
+        let env = Env {
+            now_ms: self.now_ms,
+            seed: 0,
+        };
+        Ok(decider.query(&state.view_at(&run, env), name))
     }
 
     /// Records a signal for a run in memory; a run that is not in memory has ended and drops it.

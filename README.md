@@ -179,6 +179,11 @@ What holds today, for the embedded engine, and how it is checked:
   procedure) keeps runs that already passed that point on the old code and sends every other run down
   the new one; `aqueduct_engine::replay::check` replays a corpus of journals against new code to prove
   it ([ADR 0035](docs/adr/0035-patched.md)).
+- **Queries and updates:** a run publishes state (`publish("address", address)`, `ctx.publish(...)`)
+  that queries read without journaling anything (`aqueduct query`, `Engine::query`); an update is a
+  request whose sender waits for the run's answer (`wait(update("change"))`, then `respond` or
+  `reject`; `Engine::update`, `aqueduct update`), journaled, deduplicated by id, and validated: an
+  update rejected on receipt leaves no trace ([ADR 0036](docs/adr/0036-queries-and-updates.md)).
 - **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
   once per signal id.** **Retries** follow a policy with journaled backoff.
 - **Agent steps:** a model call is a step whose answer, model identity and token cost are journaled, so

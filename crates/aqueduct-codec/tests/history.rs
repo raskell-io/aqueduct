@@ -82,6 +82,35 @@ fn entry() -> impl Strategy<Value = Entry> {
             cmd: CommandIndex(cmd),
             error
         }),
+        (any::<u32>(), ".{0,12}", any::<u64>(), any::<u64>()).prop_map(
+            |(cmd, name, timeout_ms, wake_at)| Entry::UpdateAwaited {
+                cmd: CommandIndex(cmd),
+                name,
+                timeout_ms,
+                wake_at,
+            }
+        ),
+        (any::<u32>(), ".{0,12}", payload()).prop_map(|(cmd, id, payload)| {
+            Entry::UpdateReceived {
+                cmd: CommandIndex(cmd),
+                id,
+                payload,
+            }
+        }),
+        (any::<u32>(), any::<u32>(), payload()).prop_map(|(cmd, update, result)| {
+            Entry::UpdateCompleted {
+                cmd: CommandIndex(cmd),
+                update: CommandIndex(update),
+                result,
+            }
+        }),
+        (any::<u32>(), any::<u32>(), ".{0,12}").prop_map(|(cmd, update, error)| {
+            Entry::UpdateRejected {
+                cmd: CommandIndex(cmd),
+                update: CommandIndex(update),
+                error,
+            }
+        }),
         (any::<u32>(), any::<u64>()).prop_map(|(cmd, tokens)| Entry::BudgetApproved {
             cmd: CommandIndex(cmd),
             tokens

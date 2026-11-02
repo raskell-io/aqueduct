@@ -65,11 +65,16 @@ record = version:u8  kind:u8  prev:hash  fields
 | 27 | `ChildStarted` (under a chosen key) | `cmd:cmd`, `workflow:string`, `input:bytes`, `key:string` |
 | 28 | `ChildCompleted` | `cmd:cmd`, `output:bytes` |
 | 29 | `ChildFailed` | `cmd:cmd`, `error:string` |
+| 30 | `UpdateAwaited` | `cmd:cmd`, `name:string`, `timeout_ms:varint`, `wake_at:varint` |
+| 31 | `UpdateReceived` | `cmd:cmd`, `id:string`, `payload:bytes` |
+| 32 | `UpdateCompleted` | `cmd:cmd`, `update:cmd`, `result:bytes` |
+| 33 | `UpdateRejected` | `cmd:cmd`, `update:cmd`, `error:string` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
-issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
-its sender; a run never records two signals with the same non-empty id, which makes retried sends
-exactly-once.
+issued; `timeout_ms` and `wake_at` are 0 when a signal or update wait has no timeout. A signal's `id` is
+chosen by its sender; a run never records two signals with the same non-empty id, which makes retried
+sends exactly-once. The same holds for updates, separately: a run never records two updates with the same
+non-empty id.
 
 A recorded value is something the run's logic observed from outside itself (the time, random bits, a
 local computation), journaled the first time the logic observed it and read back on replay. Its `name`
@@ -104,8 +109,8 @@ A decoded history is a valid journal if:
 
 1. The first entry is `Started`, and it occurs only once.
 2. `StepScheduled`, `TimerStarted`, `SignalAwaited`, `ValueRecorded`, `Escalated`,
-   `AgentCallScheduled`, `AgentCallEscalated` and `ChildStarted` share one sequence of command indexes: 0, 1, 2, ... in
-   order, without gaps.
+   `AgentCallScheduled`, `AgentCallEscalated`, `ChildStarted`, `UpdateAwaited`, `UpdateCompleted` and
+   `UpdateRejected` share one sequence of command indexes: 0, 1, 2, ... in order, without gaps.
 3. Each command has at most one outcome. `StepCompleted` and `StepFailed` complete a step. `TimerFired`
    completes a sleep (outcome `null`) or times out a signal wait that has a timeout. A `SignalReceived`
    completes the oldest signal wait with the same name that has no outcome yet; if there is none, the
@@ -129,11 +134,18 @@ A decoded history is a valid journal if:
    child failed, or could not be started) complete it; nothing else does, except a cancellation. The
    child's own history is that of an ordinary run; a child continued as new has not ended, so its
    outcome is that of the last run of its chain.
+   `UpdateAwaited` waits for an update (a request whose sender waits for the answer, ADR 0036).
+   `UpdateReceived` completes the wait `cmd`, which has no outcome yet, with outcome `payload`; updates
+   are never kept for a later wait. `TimerFired` times out an update wait that has a timeout.
+   `UpdateCompleted` and `UpdateRejected` answer the update received by the wait `update`, which must
+   have received one (and not have been completed by a timeout or a cancellation), and not have been
+   answered before. They are commands, born completed (outcome `null`). An update the logic rejects in
+   the activation that receives it is not recorded at all.
    `CancelRequested` occurs at most once. It completes every command that has no outcome yet (a step,
    including one waiting to retry, a sleep or a signal wait) as failed with the error
    `cancelled: <reason>`, in command order, and marks them cancelled. If no command is waiting, the next
-   command other than `ValueRecorded` (a `StepScheduled`, `TimerStarted`, `SignalAwaited`,
-   `ChildStarted`, ...) is completed that way when it is recorded (a
+   command other than `ValueRecorded`, `UpdateCompleted` and `UpdateRejected` (a `StepScheduled`,
+   `TimerStarted`, `SignalAwaited`, `ChildStarted`, ...) is completed that way when it is recorded (a
    cancelled signal wait takes no kept signal). Commands after that are not affected.
 4. `StepRetryScheduled` records a failed, retryable attempt of a step that has no outcome and no pending
    retry; `attempt` counts 1, 2, 3, ... per step. The next `TimerFired` for that step dispatches it again

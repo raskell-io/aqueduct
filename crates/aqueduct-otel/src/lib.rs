@@ -324,6 +324,35 @@ impl Observer for OtelObserver {
                 vec![cmd_attribute(*cmd)],
                 Some(error.clone()),
             ),
+            Entry::UpdateAwaited { cmd, name, .. } => point(
+                format!("wait for update {name}"),
+                vec![cmd_attribute(*cmd)],
+                None,
+            ),
+            Entry::UpdateReceived { cmd, id, .. } => point(
+                "update received".into(),
+                vec![
+                    cmd_attribute(*cmd),
+                    KeyValue::new("aqueduct.update.id", id.clone()),
+                ],
+                None,
+            ),
+            Entry::UpdateCompleted { cmd, update, .. } => point(
+                "update answered".into(),
+                vec![
+                    cmd_attribute(*cmd),
+                    KeyValue::new("aqueduct.update.cmd", i64::from(update.0)),
+                ],
+                None,
+            ),
+            Entry::UpdateRejected { cmd, update, error } => point(
+                "update rejected".into(),
+                vec![
+                    cmd_attribute(*cmd),
+                    KeyValue::new("aqueduct.update.cmd", i64::from(update.0)),
+                ],
+                Some(error.clone()),
+            ),
             Entry::CancelRequested { reason } => point(
                 "cancel requested".into(),
                 vec![KeyValue::new("aqueduct.reason", reason.clone())],

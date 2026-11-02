@@ -261,6 +261,48 @@ pub enum Entry {
         /// Why.
         error: String,
     },
+    /// The run started waiting for an update (a synchronous request that the logic answers),
+    /// optionally with a timeout.
+    UpdateAwaited {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The update's name.
+        name: String,
+        /// The timeout in milliseconds; 0 means no timeout.
+        timeout_ms: u64,
+        /// When the timeout fires (milliseconds since the Unix epoch); 0 means never.
+        wake_at: u64,
+    },
+    /// An update was accepted: it completes the wait `cmd` with its payload. Updates are only accepted
+    /// while a wait for their name is pending, so, unlike a signal, an update is never kept for later.
+    UpdateReceived {
+        /// The wait it completes.
+        cmd: CommandIndex,
+        /// The sender's id for this update; a second update with the same id is not recorded, and
+        /// gets the first one's response. Empty means no deduplication.
+        id: String,
+        /// The update's payload.
+        payload: Payload,
+    },
+    /// The run responded to a received update with a result. A command, born completed.
+    UpdateCompleted {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The wait that received the update.
+        update: CommandIndex,
+        /// The result, returned to the update's sender.
+        result: Payload,
+    },
+    /// The run rejected a received update. A command, born completed. (An update the logic rejects in
+    /// the same activation that receives it is not journaled at all.)
+    UpdateRejected {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The wait that received the update.
+        update: CommandIndex,
+        /// Why, returned to the update's sender.
+        error: String,
+    },
     /// The run ended and asked for a new run of the same workflow under the same key, with this input
     /// (continue-as-new). The engine starts it as the key's next generation.
     ContinuedAsNew {

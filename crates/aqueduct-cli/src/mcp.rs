@@ -28,8 +28,8 @@ const INSTRUCTIONS: &str = "Aqueduct runs procedures: hermetic Starlark scripts 
 step(), agent(), wait(), escalate() and other engine functions, each journaled. Write a procedure, check it with \
 validate_procedure, see how it would have decided past runs with replay_draft, then propose_version and \
 replay_version to record the evidence. A person approves and activates versions; you cannot. Start runs with \
-start_run (they run when the engine next opens), inspect them with describe_run and run_journal, and resolve \
-escalations with resolve_escalation.";
+start_run (they run when the engine next opens), inspect them with describe_run, run_journal and query_run, \
+and resolve escalations with resolve_escalation.";
 
 /// The server: a data directory, who it acts as, and whether it may change anything.
 pub struct Server {
@@ -171,6 +171,17 @@ const TOOLS: &[Tool] = &[
         name: "describe_run",
         description: "A run's status, version, input, output and commands.",
         schema: || object(json!({"key": string("The run key.")}), &["key"]),
+        writes: false,
+    },
+    Tool {
+        name: "query_run",
+        description: "Ask a run a query: the last value its procedure published under the name (publish(name, value)), where the run is now.",
+        schema: || {
+            object(
+                json!({"key": string("The run key."), "name": string("The query's name.")}),
+                &["key", "name"],
+            )
+        },
         writes: false,
     },
     Tool {
@@ -377,6 +388,7 @@ impl Server {
             "list_runs" => cli(&["runs", dir]),
             "describe_run" => cli(&["describe", dir, text("key")?]),
             "run_journal" => cli(&["export", dir, text("key")?]),
+            "query_run" => cli(&["query", dir, text("key")?, text("name")?]),
             "list_escalations" => {
                 let open = cli(&["escalations", dir])?;
                 Ok(if open.is_empty() {
