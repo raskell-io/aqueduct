@@ -12,7 +12,7 @@ use std::path::Path;
 use aqueduct_ai::anthropic::Anthropic;
 use aqueduct_ai::openai::OpenAiCompatible;
 use aqueduct_ai::{AiExecutor, Model};
-use aqueduct_core::{CommandKind, Decider, Entry, Event, Payload, RunState, StepOutcome};
+use aqueduct_core::{CommandKind, Entry, Payload, RunState, StepOutcome};
 use aqueduct_engine::counterfactual::{CounterfactualOptions, Outcome, replay_counterfactual};
 use aqueduct_engine::drift::{
     DriftOptions, DriftReport, Recorded, Replayed, Verdict, agent_calls, replay_agent_calls,
@@ -414,7 +414,7 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
         .and_then(|n| n.to_str())
         .unwrap_or("procedure");
     let procedure = Procedure::compile(name, &source).map_err(|e| e.to_string())?;
-    let mut state = RunState::from_journal(&journal[..1]).map_err(|e| e.to_string())?;
+    let state = RunState::from_journal(&journal[..1]).map_err(|e| e.to_string())?;
     // A pinned run is decided by its own version only; checking another one is allowed, and said.
     let note = match state.version() {
         Some(pinned) if pinned != procedure.version() => format!(
@@ -424,32 +424,23 @@ fn replay(dir: &Path, key: &str, procedure: &Path) -> Result<String, String> {
         ),
         _ => String::new(),
     };
-    let mut activations = 0;
-    for (position, entry) in journal.iter().enumerate().skip(1) {
-        // Before every entry the logic wrote, ask the procedure what it does now.
-        if starts_commands(entry) {
-            activations += 1;
-            let transition = state.handle(Event::Decision(procedure.decide(&state.view())));
-            if let Some(Entry::Parked { reason }) = transition.entries.first() {
-                return Ok(format!(
-                    "{note}diverges at journal entry {position}: {reason}\n"
-                ));
-            }
+    match aqueduct_engine::replay::check(key, &journal, &procedure) {
+        Ok(activations) => Ok(format!(
+            "{note}replays without divergence: {} entries, {activations} activations checked\n",
+            journal.len()
+        )),
+        Err(aqueduct_engine::replay::ReplayError::Diverged { position, reason })
+            if position == journal.len() =>
+        {
+            Ok(format!(
+                "{note}diverges at the end of the journal: {reason}\n"
+            ))
         }
-        state
-            .apply(entry)
-            .map_err(|e| format!("journal entry {position}: {e}"))?;
+        Err(aqueduct_engine::replay::ReplayError::Diverged { position, reason }) => Ok(format!(
+            "{note}diverges at journal entry {position}: {reason}\n"
+        )),
+        Err(e) => Err(e.to_string()),
     }
-    let transition = state.handle(Event::Decision(procedure.decide(&state.view())));
-    if let Some(Entry::Parked { reason }) = transition.entries.first() {
-        return Ok(format!(
-            "{note}diverges at the end of the journal: {reason}\n"
-        ));
-    }
-    Ok(format!(
-        "{note}replays without divergence: {} entries, {activations} activations checked\n",
-        journal.len()
-    ))
 }
 
 /// Per-version metrics (ADR 0031), with each version's registry state and replay evidence if the data
@@ -1341,19 +1332,6 @@ fn short(payload: &Payload) -> String {
 }
 
 /// Entries the run's logic writes (commands and its end), as opposed to completions from outside.
-fn starts_commands(entry: &Entry) -> bool {
-    matches!(
-        entry,
-        Entry::StepScheduled { .. }
-            | Entry::AgentCallScheduled { .. }
-            | Entry::AgentCallEscalated { .. }
-            | Entry::TimerStarted { .. }
-            | Entry::SignalAwaited { .. }
-            | Entry::RunCompleted { .. }
-            | Entry::RunFailed { .. }
-    )
-}
-
 fn describe_entry(entry: &Entry) -> String {
     match entry {
         Entry::Started {

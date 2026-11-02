@@ -75,7 +75,7 @@ pub use awakeable::{
     AWAKEABLE_PREFIX, awakeable_id, awakeable_signal, child_key, parse_awakeable_id,
     parse_command_id,
 };
-pub use decider::{Command, Decider, Env, RunView};
+pub use decider::{Command, Decider, Env, PATCH_PREFIX, RunView, patch_marker};
 pub use journal::{AgentResponse, CommandIndex, Entry, IdempotencyKey, Payload, StepOutcome};
 pub use run::{
     BUDGET_ESCALATION, CommandKind, Effect, Event, Hold, JournalError, RunState, SCHEMA_ESCALATION,

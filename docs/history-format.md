@@ -73,7 +73,9 @@ exactly-once.
 
 A recorded value is something the run's logic observed from outside itself (the time, random bits, a
 local computation), journaled the first time the logic observed it and read back on replay. Its `name`
-says what it is (the Rust SDK uses `now`, `random`, `uuid` and names chosen by the workflow).
+says what it is (the Rust SDK uses `now`, `random`, `uuid` and names chosen by the workflow). Names
+starting with `$patch/` are reserved: `$patch/<id>` with the value `true` marks that the run took patch
+`<id>`'s new code at that point (ADR 0035).
 
 Payload fields (`input`, `result`, `output`, `value`, `payload`, `outcome`, `request`, `params`,
 `response`) are opaque to this format. Their encoding is declared by the SDK's codec.
