@@ -17,6 +17,8 @@
 //!   child that fails fails the run, unless `fallible = True` (then `{"ok": ..., ...}` as for `step`).
 //!   With `key`, the child runs under that run key, and a run the key already has of the same workflow
 //!   with the same input is the child; without one, the child's key is derived from the run's (ADR 0034).
+//! - `patched(id)` is `True` when the run takes a patch's new code and `False` when it reached this point
+//!   with the old code before the patch, which it then keeps to (ADR 0035): `if patched("review"): ...`.
 //! - `escalate(reason, payload = None)` hands a decision to a person or an agent, waits durably for
 //!   the resolution and returns it (ADR 0020).
 //! - `continue_as_new(input)` ends the run and starts a new run of the procedure under the same key with
@@ -241,9 +243,16 @@ impl Decider for Procedure {
         let cancelled = (0..outcomes.len())
             .map(|index| view.cancelled(aqueduct_core::CommandIndex(index as u32)))
             .collect();
+        let patches = (0..outcomes.len())
+            .map(|index| {
+                view.patch_at(aqueduct_core::CommandIndex(index as u32))
+                    .map(str::to_owned)
+            })
+            .collect();
         let installed = Installed::new(Activation {
             outcomes,
             cancelled,
+            patches,
             cancel_reason: view.cancel_reason().unwrap_or_default().to_owned(),
             ..Activation::default()
         });
@@ -303,6 +312,8 @@ struct Activation {
     outcomes: Vec<Option<StepOutcome>>,
     /// Which commands a cancellation completed.
     cancelled: Vec<bool>,
+    /// For each command in the journal, the patch it marks, if it is a patch marker.
+    patches: Vec<Option<String>>,
     cancel_reason: String,
     /// The script reached a command that a cancellation completed.
     cancel_hit: bool,
@@ -534,6 +545,27 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
             Some(StepOutcome::Failed(error)) => return suspend_or_fail(Stop::StepFailed(error)),
         };
         Ok(eval.heap().alloc(value))
+    }
+
+    /// Whether the run takes patch `id`'s new code: `False` only for a run that reached this point with
+    /// the old code before the patch.
+    fn patched(id: &str) -> anyhow::Result<bool> {
+        if id.is_empty() {
+            anyhow::bail!("patched(id) needs a non-empty id");
+        }
+        with_activation(|act| {
+            if !act.in_run {
+                anyhow::bail!("engine functions may only be called inside `run`");
+            }
+            let index = act.next;
+            let journaled = index < act.outcomes.len();
+            if journaled && act.patches.get(index).and_then(Option::as_deref) != Some(id) {
+                return Ok(false);
+            }
+            act.next += 1;
+            act.commands.push(aqueduct_core::patch_marker(id));
+            Ok(true)
+        })
     }
 
     /// Sleeps durably for a number of seconds.

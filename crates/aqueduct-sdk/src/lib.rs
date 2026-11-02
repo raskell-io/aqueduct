@@ -96,6 +96,8 @@ struct Activation {
     ranks: Vec<Option<usize>>,
     /// Which commands a cancellation completed.
     cancelled: Vec<bool>,
+    /// For each command in the journal, the patch it marks, if it is a patch marker.
+    patches: Vec<Option<String>>,
     cancel_reason: String,
     commands: Vec<Command>,
     env: Env,
@@ -174,6 +176,24 @@ impl WorkflowContext {
         }
         activation.resolve(index);
         value
+    }
+
+    /// Whether this run takes patch `id`'s new code (ADR 0035): `if ctx.patched("add-review") { new }
+    /// else { old }`. A run that reached this point before the patch was deployed keeps to the old code,
+    /// so its journal still replays; every other run takes the new code, and the choice is journaled,
+    /// so it never changes for a run. Once no run on the old code is left, the old branch can be
+    /// deleted; the `patched` call stays, so the runs that took the new code still replay.
+    pub fn patched(&self, id: &str) -> bool {
+        let mut activation = self.activation.borrow_mut();
+        let index = activation.commands.len();
+        let journaled = index < activation.outcomes.len();
+        let marked = activation.patches.get(index).and_then(Option::as_deref) == Some(id);
+        if journaled && !marked {
+            return false;
+        }
+        activation.commands.push(aqueduct_core::patch_marker(id));
+        activation.resolve(index);
+        true
     }
 
     /// The current time, recorded: the engine's clock the first time, the same instant on every replay.
@@ -831,10 +851,17 @@ where
         let cancelled = (0..outcomes.len())
             .map(|index| view.cancelled(aqueduct_core::CommandIndex(index as u32)))
             .collect();
+        let patches = (0..outcomes.len())
+            .map(|index| {
+                view.patch_at(aqueduct_core::CommandIndex(index as u32))
+                    .map(str::to_owned)
+            })
+            .collect();
         let activation = Rc::new(RefCell::new(Activation {
             outcomes,
             ranks,
             cancelled,
+            patches,
             cancel_reason: view.cancel_reason().unwrap_or_default().to_owned(),
             commands: Vec::new(),
             env: view.env(),

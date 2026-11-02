@@ -175,6 +175,10 @@ What holds today, for the embedded engine, and how it is checked:
 - **Child runs:** procedures and code workflows call each other (`call("payment", input)` in a
   procedure, `ctx.child("payment", &input)` in Rust) as durable child runs; cancelling a parent cancels
   its children ([ADR 0034](docs/adr/0034-child-runs.md)).
+- **Changing code under running runs:** `if ctx.patched("add-review") { ... }` (or `patched(...)` in a
+  procedure) keeps runs that already passed that point on the old code and sends every other run down
+  the new one; `aqueduct_engine::replay::check` replays a corpus of journals against new code to prove
+  it ([ADR 0035](docs/adr/0035-patched.md)).
 - **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
   once per signal id.** **Retries** follow a policy with journaled backoff.
 - **Agent steps:** a model call is a step whose answer, model identity and token cost are journaled, so

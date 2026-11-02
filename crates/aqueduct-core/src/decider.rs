@@ -88,6 +88,18 @@ pub enum Command {
     },
 }
 
+/// The prefix of the names of recorded values that mark a patch (see [`RunView::patched`]). Value names
+/// starting with it are reserved.
+pub const PATCH_PREFIX: &str = "$patch/";
+
+/// The recorded value that marks patch `id`: [`Command::Record`] under this name, with the value `true`.
+pub fn patch_marker(id: &str) -> Command {
+    Command::Record {
+        name: format!("{PATCH_PREFIX}{id}"),
+        value: Payload::new(*b"true"),
+    }
+}
+
 /// What the engine offers a decider for new [`Command::Record`] values in one activation: its clock
 /// and a random seed. Values taken from it are journaled; replay never reads it again.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -136,6 +148,25 @@ impl<'a> RunView<'a> {
     /// The outcome of every scheduled step command, by command index (`None` while pending).
     pub fn outcomes(&self) -> impl Iterator<Item = Option<&'a StepOutcome>> + 'a {
         self.state.steps().iter().map(|step| step.outcome.as_ref())
+    }
+
+    /// Whether the run takes patch `id`'s new code at command `cmd`, the next command the logic issues
+    /// (ADR 0035). A run that has not reached `cmd` yet takes it, and so does one whose journal has the
+    /// patch's marker there: the logic then issues the marker ([`patch_marker`]) as command `cmd`. A run
+    /// whose journal has another command there passed this point with the old code, and keeps to it:
+    /// the logic issues nothing for the patch and continues with the old code at `cmd`.
+    pub fn patched(&self, cmd: CommandIndex, id: &str) -> bool {
+        let journaled = usize::try_from(cmd.0).is_ok_and(|index| index < self.state.steps().len());
+        !journaled || self.patch_at(cmd) == Some(id)
+    }
+
+    /// The id of the patch whose marker the journal holds as command `cmd`, if it holds one there.
+    pub fn patch_at(&self, cmd: CommandIndex) -> Option<&'a str> {
+        let step = self.state.steps().get(usize::try_from(cmd.0).ok()?)?;
+        if step.kind != crate::CommandKind::Recorded {
+            return None;
+        }
+        step.name.strip_prefix(PATCH_PREFIX)
     }
 
     /// Whether a cancellation completed this command (its outcome is then a failure).
