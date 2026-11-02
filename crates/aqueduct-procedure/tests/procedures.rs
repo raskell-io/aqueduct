@@ -81,7 +81,25 @@ fn run(
                 });
                 Event::AgentResult { cmd, outcome }
             }
-            Effect::Finished(_) | Effect::ContinueAsNew { .. } => continue,
+            // Child runs are answered by the same world too, as `child:<workflow>`.
+            Effect::StartChild {
+                cmd,
+                workflow,
+                input,
+                ..
+            } => {
+                let input: Value = serde_json::from_slice(input.as_bytes()).unwrap();
+                let outcome = match execute(&format!("child:{workflow}"), &input) {
+                    Ok(output) => {
+                        StepOutcome::Completed(Payload::new(output.to_string().into_bytes()))
+                    }
+                    Err(error) => StepOutcome::Failed(error),
+                };
+                Event::ChildResult { cmd, outcome }
+            }
+            Effect::Finished(_) | Effect::ContinueAsNew { .. } | Effect::CancelChild { .. } => {
+                continue;
+            }
         };
         let transition = state.handle(event);
         for entry in &transition.entries {

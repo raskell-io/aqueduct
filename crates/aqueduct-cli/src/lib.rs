@@ -336,6 +336,16 @@ fn describe(dir: &Path, key: &str) -> Result<String, String> {
             CommandKind::Agent { budget_tokens } => {
                 format!("agent call {} (budget {budget_tokens} tokens)", step.name)
             }
+            CommandKind::Child => format!(
+                "child run of {} under key {}",
+                step.name,
+                step.child_key
+                    .clone()
+                    .unwrap_or_else(|| aqueduct_core::child_key(
+                        key,
+                        aqueduct_core::CommandIndex(u32::try_from(index).unwrap_or(u32::MAX))
+                    ))
+            ),
         };
         let outcome = match &step.outcome {
             None if step.retry_at.is_some() => {
@@ -1443,6 +1453,21 @@ fn describe_entry(entry: &Entry) -> String {
         Entry::EscalationResolved { cmd, outcome } => {
             format!("[{cmd}] escalation resolved: {}", text(outcome))
         }
+        Entry::ChildStarted {
+            cmd,
+            workflow,
+            input,
+            key,
+        } => format!(
+            "[{cmd}] child run of {workflow}{} with {}",
+            key.as_ref()
+                .map_or(String::new(), |key| format!(" under key {key}")),
+            text(input)
+        ),
+        Entry::ChildCompleted { cmd, output } => {
+            format!("[{cmd}] child completed with {}", text(output))
+        }
+        Entry::ChildFailed { cmd, error } => format!("[{cmd}] child failed: {error}"),
     }
 }
 
@@ -1561,6 +1586,20 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         } => json!({"kind": "Escalated", "cmd": cmd(c), "reason": reason, "payload": payload(p)}),
         Entry::EscalationResolved { cmd: c, outcome } => {
             json!({"kind": "EscalationResolved", "cmd": cmd(c), "outcome": payload(outcome)})
+        }
+        Entry::ChildStarted {
+            cmd: c,
+            workflow,
+            input,
+            key,
+        } => {
+            json!({"kind": "ChildStarted", "cmd": cmd(c), "workflow": workflow, "input": payload(input), "key": key})
+        }
+        Entry::ChildCompleted { cmd: c, output } => {
+            json!({"kind": "ChildCompleted", "cmd": cmd(c), "output": payload(output)})
+        }
+        Entry::ChildFailed { cmd: c, error } => {
+            json!({"kind": "ChildFailed", "cmd": cmd(c), "error": error})
         }
     }
 }

@@ -24,6 +24,19 @@ pub fn awakeable_id(run: &str, cmd: CommandIndex) -> String {
     }
 }
 
+/// The run key of the child run that command `cmd` of the run with this run id starts, when the logic
+/// does not choose one: the same form as an awakeable id, `<run key>#<command index>` (or
+/// `<run key>#<generation>.<command index>`), read as "the run started by this command".
+///
+/// ```
+/// use aqueduct_core::{CommandIndex, child_key, run_id};
+/// assert_eq!(child_key("claims:7", CommandIndex(3)), "claims:7#3");
+/// assert_eq!(child_key(&run_id("claims:7", 2), CommandIndex(3)), "claims:7#2.3");
+/// ```
+pub fn child_key(run: &str, cmd: CommandIndex) -> String {
+    awakeable_id(run, cmd)
+}
+
 /// Splits an awakeable id into the run id and the signal name to send, or `None` if it is not one.
 ///
 /// ```

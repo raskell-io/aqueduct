@@ -72,7 +72,8 @@ mod run;
 mod run_id;
 
 pub use awakeable::{
-    AWAKEABLE_PREFIX, awakeable_id, awakeable_signal, parse_awakeable_id, parse_command_id,
+    AWAKEABLE_PREFIX, awakeable_id, awakeable_signal, child_key, parse_awakeable_id,
+    parse_command_id,
 };
 pub use decider::{Command, Decider, Env, RunView};
 pub use journal::{AgentResponse, CommandIndex, Entry, IdempotencyKey, Payload, StepOutcome};

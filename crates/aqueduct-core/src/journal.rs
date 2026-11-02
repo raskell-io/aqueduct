@@ -234,6 +234,33 @@ pub enum Entry {
         /// The signal's payload.
         payload: Payload,
     },
+    /// The run started a child run: a run of another (or the same) workflow whose outcome is this
+    /// command's outcome. The engine starts it under `key`, or, without one, under the key
+    /// [`crate::child_key`] derives from the parent's run id and the command.
+    ChildStarted {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The child's workflow.
+        workflow: String,
+        /// The child's input.
+        input: Payload,
+        /// The child's run key, if the logic chose one.
+        key: Option<String>,
+    },
+    /// A child run completed with an output. Recorded at most once per command.
+    ChildCompleted {
+        /// The command this completes.
+        cmd: CommandIndex,
+        /// The child's output.
+        output: Payload,
+    },
+    /// A child run failed, or could not be started. Recorded at most once per command.
+    ChildFailed {
+        /// The command this completes.
+        cmd: CommandIndex,
+        /// Why.
+        error: String,
+    },
     /// The run ended and asked for a new run of the same workflow under the same key, with this input
     /// (continue-as-new). The engine starts it as the key's next generation.
     ContinuedAsNew {

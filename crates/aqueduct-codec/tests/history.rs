@@ -62,6 +62,26 @@ fn entry() -> impl Strategy<Value = Entry> {
                 answer,
             }
         }),
+        (
+            any::<u32>(),
+            ".{0,12}",
+            payload(),
+            prop::option::of(".{1,12}")
+        )
+            .prop_map(|(cmd, workflow, input, key)| Entry::ChildStarted {
+                cmd: CommandIndex(cmd),
+                workflow,
+                input,
+                key,
+            }),
+        (any::<u32>(), payload()).prop_map(|(cmd, output)| Entry::ChildCompleted {
+            cmd: CommandIndex(cmd),
+            output
+        }),
+        (any::<u32>(), ".{0,12}").prop_map(|(cmd, error)| Entry::ChildFailed {
+            cmd: CommandIndex(cmd),
+            error
+        }),
         (any::<u32>(), any::<u64>()).prop_map(|(cmd, tokens)| Entry::BudgetApproved {
             cmd: CommandIndex(cmd),
             tokens

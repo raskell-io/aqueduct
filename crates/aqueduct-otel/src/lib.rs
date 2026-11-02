@@ -304,6 +304,26 @@ impl Observer for OtelObserver {
                     None,
                 );
             }
+            Entry::ChildStarted {
+                cmd, workflow, key, ..
+            } => {
+                let mut attributes = vec![
+                    cmd_attribute(*cmd),
+                    KeyValue::new("aqueduct.child.workflow", workflow.clone()),
+                ];
+                if let Some(key) = key {
+                    attributes.push(KeyValue::new("aqueduct.child.key", key.clone()));
+                }
+                point(format!("child run {workflow}"), attributes, None);
+            }
+            Entry::ChildCompleted { cmd, .. } => {
+                point("child completed".into(), vec![cmd_attribute(*cmd)], None);
+            }
+            Entry::ChildFailed { cmd, error } => point(
+                "child failed".into(),
+                vec![cmd_attribute(*cmd)],
+                Some(error.clone()),
+            ),
             Entry::CancelRequested { reason } => point(
                 "cancel requested".into(),
                 vec![KeyValue::new("aqueduct.reason", reason.clone())],

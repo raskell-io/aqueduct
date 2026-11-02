@@ -61,6 +61,10 @@ record = version:u8  kind:u8  prev:hash  fields
 | 23 | `AgentAnswerEscalated` | `cmd:cmd`, `error:string`, `answer:bytes` |
 | 24 | `Started` (pinned to a version) | `workflow:string`, `input:bytes`, `version:string` |
 | 25 | `Started` (pinned to a version, with a budget) | `workflow:string`, `input:bytes`, `version:string`, `budget_tokens:varint` |
+| 26 | `ChildStarted` | `cmd:cmd`, `workflow:string`, `input:bytes` |
+| 27 | `ChildStarted` (under a chosen key) | `cmd:cmd`, `workflow:string`, `input:bytes`, `key:string` |
+| 28 | `ChildCompleted` | `cmd:cmd`, `output:bytes` |
+| 29 | `ChildFailed` | `cmd:cmd`, `error:string` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal wait has no timeout. A signal's `id` is chosen by
@@ -98,7 +102,7 @@ A decoded history is a valid journal if:
 
 1. The first entry is `Started`, and it occurs only once.
 2. `StepScheduled`, `TimerStarted`, `SignalAwaited`, `ValueRecorded`, `Escalated`,
-   `AgentCallScheduled` and `AgentCallEscalated` share one sequence of command indexes: 0, 1, 2, ... in
+   `AgentCallScheduled`, `AgentCallEscalated` and `ChildStarted` share one sequence of command indexes: 0, 1, 2, ... in
    order, without gaps.
 3. Each command has at most one outcome. `StepCompleted` and `StepFailed` complete a step. `TimerFired`
    completes a sleep (outcome `null`) or times out a signal wait that has a timeout. A `SignalReceived`
@@ -117,10 +121,17 @@ A decoded history is a valid journal if:
    declines it, or a cancellation closes it. `AgentAnswerEscalated` holds an agent call whose answers did
    not match its output schema once its retries were spent; an `EscalationResolved` for it completes the
    call with the supplied answer (as does a late `AgentCallCompleted`), or a cancellation closes it.
+   `ChildStarted` starts a child run: a run of `workflow` with `input` under `key`, or, for kind 26,
+   under the key `<run key>#<cmd>` (`<run key>#<generation>.<cmd>` for a later generation of the
+   parent's key). `ChildCompleted` (outcome `output`, the child's output) and `ChildFailed` (the
+   child failed, or could not be started) complete it; nothing else does, except a cancellation. The
+   child's own history is that of an ordinary run; a child continued as new has not ended, so its
+   outcome is that of the last run of its chain.
    `CancelRequested` occurs at most once. It completes every command that has no outcome yet (a step,
    including one waiting to retry, a sleep or a signal wait) as failed with the error
    `cancelled: <reason>`, in command order, and marks them cancelled. If no command is waiting, the next
-   `StepScheduled`, `TimerStarted` or `SignalAwaited` is completed that way when it is recorded (a
+   command other than `ValueRecorded` (a `StepScheduled`, `TimerStarted`, `SignalAwaited`,
+   `ChildStarted`, ...) is completed that way when it is recorded (a
    cancelled signal wait takes no kept signal). Commands after that are not affected.
 4. `StepRetryScheduled` records a failed, retryable attempt of a step that has no outcome and no pending
    retry; `attempt` counts 1, 2, 3, ... per step. The next `TimerFired` for that step dispatches it again

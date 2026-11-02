@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use aqueduct_codec::{ChainWriter, decode_log_record, encode_log_record, verify_chain};
 use aqueduct_core::{
-    CommandIndex, Decider, Effect, Entry, Env, Event, Payload, RunState, Status, StepOutcome,
-    Transition, run_id, split_run_id, start_version, valid_key,
+    CommandIndex, CommandKind, Decider, Effect, Entry, Env, Event, Payload, RunState, Status,
+    StepOutcome, Transition, child_key, run_id, split_run_id, start_version, valid_key,
 };
 use aqueduct_storage::{LogStore, NoStateStore, StateStore, StorageError};
 
@@ -397,6 +397,12 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     evict_finished: bool,
     skip_successor_repair: bool,
     release_stale_dispatches: bool,
+    /// Child runs that parents wait for, by the child's run key: (parent run id, command).
+    children: BTreeMap<String, BTreeSet<(String, CommandIndex)>>,
+    /// Effects raised while effects are being performed (a child's start, a parent's result): performed
+    /// in turn by the outermost call, so a chain of children does not deepen the stack.
+    queued: VecDeque<(String, Vec<Effect>)>,
+    performing: bool,
 }
 
 impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
@@ -498,11 +504,15 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             evict_finished: false,
             skip_successor_repair: false,
             release_stale_dispatches: false,
+            children: BTreeMap::new(),
+            queued: VecDeque::new(),
+            performing: false,
         })
         .map(|mut partition| {
             let keys: Vec<String> = partition.runs.keys().cloned().collect();
             for key in keys {
                 partition.refresh_timers(&key);
+                partition.index_children(&key);
             }
             partition
         })
@@ -561,11 +571,26 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         input: Payload,
         options: impl Into<StartOptions>,
     ) -> Result<(), PartitionError> {
+        self.start_run(key, workflow, input, options.into())?;
+        self.send(Outbound::Started {
+            key: key.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Starts a run, or applies the reuse policy if the key already has one, without acknowledging it.
+    fn start_run(
+        &mut self,
+        key: &str,
+        workflow: &str,
+        input: Payload,
+        options: StartOptions,
+    ) -> Result<(), PartitionError> {
         let StartOptions {
             reuse: policy,
             budget_tokens,
             version,
-        } = options.into();
+        } = options;
         if !valid_key(key) {
             return Err(PartitionError::InvalidKey(key.to_owned()));
         }
@@ -607,10 +632,162 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 version,
             )?;
         }
-        self.send(Outbound::Started {
-            key: key.to_owned(),
-        });
         Ok(())
+    }
+
+    /// Indexes the children a run waits for.
+    fn index_children(&mut self, id: &str) {
+        let Some(run) = self.runs.get(id) else {
+            return;
+        };
+        if run.state.status().is_terminal() {
+            return;
+        }
+        let waiting: Vec<(String, CommandIndex)> = run
+            .state
+            .steps()
+            .iter()
+            .zip(0u32..)
+            .filter(|(step, _)| step.kind == CommandKind::Child && step.outcome.is_none())
+            .map(|(step, index)| {
+                let cmd = CommandIndex(index);
+                let child = step.child_key.clone().unwrap_or_else(|| child_key(id, cmd));
+                (child, cmd)
+            })
+            .collect();
+        for (child, cmd) in waiting {
+            self.children
+                .entry(child)
+                .or_default()
+                .insert((id.to_owned(), cmd));
+        }
+    }
+
+    /// Starts the child run of command `cmd` of run `parent` (or finds the run its key has), and
+    /// delivers its outcome if it has already ended. A child that cannot be started fails the command.
+    fn start_child(
+        &mut self,
+        parent: &str,
+        cmd: CommandIndex,
+        workflow: &str,
+        input: Payload,
+        key: Option<String>,
+    ) -> Result<(), PartitionError> {
+        let child = key.unwrap_or_else(|| child_key(parent, cmd));
+        self.children
+            .entry(child.clone())
+            .or_default()
+            .insert((parent.to_owned(), cmd));
+        match self.start_run(&child, workflow, input, StartOptions::default()) {
+            Ok(()) => {}
+            Err(
+                e @ (PartitionError::UnknownWorkflow(_)
+                | PartitionError::UnknownVersion { .. }
+                | PartitionError::KeyConflict(_)
+                | PartitionError::AlreadyStarted(_)
+                | PartitionError::InvalidKey(_)),
+            ) => {
+                self.forget_child(&child, parent, cmd);
+                let error = format!("child run `{child}` could not be started: {e}");
+                return self.deliver_child(parent, cmd, StepOutcome::Failed(error));
+            }
+            Err(e) => return Err(e),
+        }
+        if let Some(outcome) = self.child_outcome(&child)? {
+            self.forget_child(&child, parent, cmd);
+            self.deliver_child(parent, cmd, outcome)?;
+        }
+        Ok(())
+    }
+
+    /// The outcome of a child key's run, if it has ended: its output or its failure. A run continued as
+    /// new has not ended (its successor carries on), and a parked one may still be repaired.
+    fn child_outcome(&mut self, child: &str) -> Result<Option<StepOutcome>, PartitionError> {
+        let Some(state) = self.lookup(child)? else {
+            return Ok(None);
+        };
+        Ok(match state.status() {
+            Status::Completed => Some(StepOutcome::Completed(
+                state.output().cloned().unwrap_or_default(),
+            )),
+            Status::Failed => Some(StepOutcome::Failed(
+                state.error().unwrap_or_default().to_owned(),
+            )),
+            Status::Running | Status::Parked | Status::Continued => None,
+        })
+    }
+
+    fn forget_child(&mut self, child: &str, parent: &str, cmd: CommandIndex) {
+        if let Some(waiting) = self.children.get_mut(child) {
+            waiting.remove(&(parent.to_owned(), cmd));
+            if waiting.is_empty() {
+                self.children.remove(child);
+            }
+        }
+    }
+
+    /// Records a child's outcome in its parent, if the parent still waits for it.
+    fn deliver_child(
+        &mut self,
+        parent: &str,
+        cmd: CommandIndex,
+        outcome: StepOutcome,
+    ) -> Result<(), PartitionError> {
+        let Some(run) = self.runs.get(parent) else {
+            return Ok(());
+        };
+        let transition = run
+            .state
+            .handle_at(Event::ChildResult { cmd, outcome }, self.now_ms);
+        let effects = self.append(parent, transition)?;
+        self.perform(parent, effects)
+    }
+
+    /// A run ended: the parents waiting for its key get its outcome.
+    fn child_ended(&mut self, id: &str) -> Result<(), PartitionError> {
+        let key = split_run_id(id).0;
+        if !self.children.contains_key(key) {
+            return Ok(());
+        }
+        let Some(outcome) = self.child_outcome(key)? else {
+            return Ok(());
+        };
+        for (parent, cmd) in self.children.remove(key).unwrap_or_default() {
+            self.deliver_child(&parent, cmd, outcome.clone())?;
+        }
+        Ok(())
+    }
+
+    /// The parent was cancelled while it waited for this child: the child is cancelled too, unless
+    /// another parent still waits for it (a child shared under a chosen key).
+    fn cancel_child(&mut self, parent: &str, cmd: CommandIndex) -> Result<(), PartitionError> {
+        let Some(step) = self
+            .runs
+            .get(parent)
+            .and_then(|run| run.state.steps().get(usize::try_from(cmd.0).ok()?))
+        else {
+            return Ok(());
+        };
+        let child = step
+            .child_key
+            .clone()
+            .unwrap_or_else(|| child_key(parent, cmd));
+        self.forget_child(&child, parent, cmd);
+        if self.children.contains_key(&child) {
+            return Ok(());
+        }
+        let Some(id) = self.latest(&child)? else {
+            return Ok(());
+        };
+        let Some(run) = self.runs.get(&id) else {
+            return Ok(());
+        };
+        let event = Event::Cancel {
+            reason: format!("its parent run `{parent}` was cancelled"),
+        };
+        let transition = run.state.handle_at(event, self.now_ms);
+        let effects = self.append(&id, transition)?;
+        self.perform(&id, effects)
     }
 
     /// Creates a run with this run id, logs its start and activates it.
@@ -1336,7 +1513,27 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         Ok(transition.effects)
     }
 
+    /// Performs a run's effects. Effects raised meanwhile (by children, parents, successors) are
+    /// queued and performed in turn, so the stack stays flat however deep the chain of runs.
     fn perform(&mut self, key: &str, effects: Vec<Effect>) -> Result<(), PartitionError> {
+        self.queued.push_back((key.to_owned(), effects));
+        if self.performing {
+            return Ok(());
+        }
+        self.performing = true;
+        let mut result = Ok(());
+        while let Some((key, effects)) = self.queued.pop_front() {
+            result = self.perform_now(&key, effects);
+            if result.is_err() {
+                self.queued.clear();
+                break;
+            }
+        }
+        self.performing = false;
+        result
+    }
+
+    fn perform_now(&mut self, key: &str, effects: Vec<Effect>) -> Result<(), PartitionError> {
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
             match effect {
@@ -1371,7 +1568,17 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                         key: key.to_owned(),
                         status,
                     });
+                    if matches!(status, Status::Completed | Status::Failed) {
+                        self.child_ended(key)?;
+                    }
                 }
+                Effect::StartChild {
+                    cmd,
+                    workflow,
+                    input,
+                    key: child,
+                } => self.start_child(key, cmd, &workflow, input, child)?,
+                Effect::CancelChild { cmd } => self.cancel_child(key, cmd)?,
                 Effect::ContinueAsNew { input } => {
                     let (workflow, budget) = self
                         .runs

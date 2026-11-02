@@ -52,6 +52,18 @@ pub enum Command {
         /// What the resolver needs to decide.
         payload: Payload,
     },
+    /// Start a child run of `workflow` with `input`, and wait for its outcome: its output, or its
+    /// failure. Under `key`, a child run is shared: if the key already has a run of the same workflow
+    /// with the same input, its outcome is the command's. Without one, the key is derived from the
+    /// parent's run id and the command ([`crate::child_key`]), so the child is the parent's alone.
+    StartChild {
+        /// The child's workflow.
+        workflow: String,
+        /// The child's input.
+        input: Payload,
+        /// The child's run key, if the logic chooses one.
+        key: Option<String>,
+    },
     /// Complete the run. Must be the last command.
     CompleteRun {
         /// The run's output.

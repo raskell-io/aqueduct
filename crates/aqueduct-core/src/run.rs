@@ -70,6 +70,8 @@ pub enum CommandKind {
         /// The most tokens the call may use.
         budget_tokens: u64,
     },
+    /// A child run, started by the engine. Its outcome is the child's output, or its failure.
+    Child,
 }
 
 impl CommandKind {
@@ -100,6 +102,9 @@ pub struct ScheduledStep {
     /// For an agent call held for a person or an agent (an open escalation): why, and what they need to
     /// know. The call is not made, or its answer not accepted, meanwhile.
     pub held: Option<Hold>,
+    /// For a child run started under a key the logic chose: that key. (The name is the child's
+    /// workflow, the input its input.)
+    pub child_key: Option<String>,
 }
 
 /// Why an agent call is held.
@@ -168,6 +173,16 @@ impl ScheduledStep {
         }
     }
 
+    /// The effect that starts this command's child run, if it is one.
+    fn start_child(&self, cmd: CommandIndex) -> Option<Effect> {
+        (self.kind == CommandKind::Child).then(|| Effect::StartChild {
+            cmd,
+            workflow: self.name.clone(),
+            input: self.input.clone(),
+            key: self.child_key.clone(),
+        })
+    }
+
     fn describe(&self) -> String {
         match self.kind {
             CommandKind::Step => format!("step `{}`", self.name),
@@ -183,6 +198,10 @@ impl ScheduledStep {
             }
             CommandKind::Recorded => format!("a recorded value `{}`", self.name),
             CommandKind::Escalation => format!("an escalation `{}`", self.name),
+            CommandKind::Child => match &self.child_key {
+                Some(key) => format!("a child run of `{}` under key `{key}`", self.name),
+                None => format!("a child run of `{}`", self.name),
+            },
         }
     }
 }
@@ -245,6 +264,13 @@ pub enum Event {
         /// Why.
         reason: String,
     },
+    /// A child run ended (completed or failed), or could not be started. Only the first outcome counts.
+    ChildResult {
+        /// The command that started the child.
+        cmd: CommandIndex,
+        /// The child's output, or why it failed.
+        outcome: StepOutcome,
+    },
     /// A signal was sent to the run.
     Signal {
         /// The signal's name.
@@ -281,6 +307,24 @@ pub enum Effect {
         request: Payload,
         /// The most tokens the call may use.
         budget_tokens: u64,
+    },
+    /// Start a child run (or find the run its key already has) and feed its outcome back as
+    /// [`Event::ChildResult`] once it ends. Starting is idempotent: the effect is performed again after
+    /// a restart for every child the run still waits for.
+    StartChild {
+        /// The command that starts it.
+        cmd: CommandIndex,
+        /// The child's workflow.
+        workflow: String,
+        /// The child's input.
+        input: Payload,
+        /// The child's run key; without one, [`crate::child_key`] of the run and the command.
+        key: Option<String>,
+    },
+    /// The run was cancelled while it waited for this child: cancel the child too.
+    CancelChild {
+        /// The command that started it.
+        cmd: CommandIndex,
     },
     /// The run reached a terminal status.
     Finished(Status),
@@ -538,6 +582,24 @@ impl RunState {
                 self.push_command(*cmd, name, Payload::default(), CommandKind::Recorded)?;
                 self.record(*cmd, StepOutcome::Completed(value.clone()))?;
             }
+            Entry::ChildStarted {
+                cmd,
+                workflow,
+                input,
+                key,
+            } => {
+                self.push_command(*cmd, workflow, input.clone(), CommandKind::Child)?;
+                let index = self.index(*cmd)?;
+                self.steps[index].child_key.clone_from(key);
+            }
+            Entry::ChildCompleted { cmd, output } => {
+                self.expect_kind(*cmd, |kind| kind == CommandKind::Child)?;
+                self.record(*cmd, StepOutcome::Completed(output.clone()))?;
+            }
+            Entry::ChildFailed { cmd, error } => {
+                self.expect_kind(*cmd, |kind| kind == CommandKind::Child)?;
+                self.record(*cmd, StepOutcome::Failed(error.clone()))?;
+            }
             Entry::StepCompleted { cmd, result } => {
                 self.expect_kind(*cmd, |kind| kind == CommandKind::Step)?;
                 self.record(*cmd, StepOutcome::Completed(result.clone()))?;
@@ -715,6 +777,19 @@ impl RunState {
                 retry_after_ms,
             } => self.handle_attempt_failed(cmd, error, retry_after_ms, now_ms),
             Event::Signal { name, id, payload } => self.handle_signal(name, id, payload),
+            Event::ChildResult { cmd, outcome } => match self.command(cmd) {
+                Ok(step) if step.kind == CommandKind::Child && step.outcome.is_none() => {
+                    Transition {
+                        entries: vec![match outcome {
+                            StepOutcome::Completed(output) => Entry::ChildCompleted { cmd, output },
+                            StepOutcome::Failed(error) => Entry::ChildFailed { cmd, error },
+                        }],
+                        effects: vec![Effect::Activate],
+                    }
+                }
+                // Not a child, or already completed (a repeated result, or the parent was cancelled).
+                _ => Transition::none(),
+            },
             Event::ResolveEscalation { cmd, outcome } => {
                 match self.command(cmd) {
                     Ok(step) if step.kind == CommandKind::Escalation && step.outcome.is_none() => {
@@ -765,9 +840,21 @@ impl RunState {
                 if self.cancel.is_some() {
                     return Transition::none();
                 }
+                // Children the run waits for are cancelled before the run reacts, so a crash cannot keep
+                // the run's end and lose its children's cancellation.
+                let mut effects: Vec<Effect> = self
+                    .steps
+                    .iter()
+                    .zip(0u32..)
+                    .filter(|(step, _)| step.kind == CommandKind::Child && step.outcome.is_none())
+                    .map(|(_, index)| Effect::CancelChild {
+                        cmd: CommandIndex(index),
+                    })
+                    .collect();
+                effects.push(Effect::Activate);
                 Transition {
                     entries: vec![Entry::CancelRequested { reason }],
-                    effects: vec![Effect::Activate],
+                    effects,
                 }
             }
         }
@@ -803,6 +890,17 @@ impl RunState {
         }
         let mut effects = vec![Effect::Activate];
         effects.extend(self.pending_steps());
+        // Children: started again (idempotent) if the run still waits for them, which also delivers
+        // the outcome of a child that ended while its parent's record of it was lost; cancelled again
+        // if a cancellation completed them.
+        for (step, index) in self.steps.iter().zip(0u32..) {
+            let cmd = CommandIndex(index);
+            if step.outcome.is_none() {
+                effects.extend(step.start_child(cmd));
+            } else if step.kind == CommandKind::Child && step.cancelled {
+                effects.push(Effect::CancelChild { cmd });
+            }
+        }
         effects
     }
 
@@ -970,6 +1068,7 @@ impl RunState {
             retry_at: None,
             cancelled: false,
             held: None,
+            child_key: None,
         });
         // A cancellation that found nothing pending is taken by the next command that waits.
         if self.pending_cancel && kind != CommandKind::Recorded {
@@ -1138,7 +1237,8 @@ impl RunState {
             CommandKind::Step
             | CommandKind::Recorded
             | CommandKind::Escalation
-            | CommandKind::Agent { .. } => false,
+            | CommandKind::Agent { .. }
+            | CommandKind::Child => false,
         };
         if step.outcome.is_some() || !has_timer {
             return Transition::none();
@@ -1201,6 +1301,7 @@ impl RunState {
                 }),
                 Command::Record { .. } => Some(CommandKind::Recorded),
                 Command::Escalate { .. } => Some(CommandKind::Escalation),
+                Command::StartChild { .. } => Some(CommandKind::Child),
                 _ => None,
             };
             if let Some(kind) = new_kind {
@@ -1212,6 +1313,9 @@ impl RunState {
                         ..
                     } => (name.clone(), input.clone()),
                     Command::Escalate { reason, payload } => (reason.clone(), payload.clone()),
+                    Command::StartChild {
+                        workflow, input, ..
+                    } => (workflow.clone(), input.clone()),
                     Command::AwaitSignal { name, .. } | Command::Record { name, .. } => {
                         (name.clone(), Payload::default())
                     }
@@ -1226,6 +1330,10 @@ impl RunState {
                     retry_at: None,
                     cancelled: false,
                     held: None,
+                    child_key: match &command {
+                        Command::StartChild { key, .. } => key.clone(),
+                        _ => None,
+                    },
                 };
                 if let Some(recorded) = self.steps.get(steps_seen) {
                     if !same_command(recorded, &issued) {
@@ -1280,6 +1388,12 @@ impl RunState {
                                 name: issued.name,
                                 request: issued.input,
                                 budget_tokens,
+                            },
+                            CommandKind::Child => Entry::ChildStarted {
+                                cmd,
+                                workflow: issued.name,
+                                input: issued.input,
+                                key: issued.child_key,
                             },
                             CommandKind::Recorded => continue,
                         });
@@ -1346,6 +1460,15 @@ impl RunState {
                                 payload: issued.input,
                             });
                         }
+                        CommandKind::Child => {
+                            transition.effects.extend(issued.start_child(cmd));
+                            transition.entries.push(Entry::ChildStarted {
+                                cmd,
+                                workflow: issued.name,
+                                input: issued.input,
+                                key: issued.child_key,
+                            });
+                        }
                         CommandKind::Recorded => {
                             let value = match command {
                                 Command::Record { value, .. } => value,
@@ -1391,7 +1514,8 @@ impl RunState {
                 | Command::AwaitSignal { .. }
                 | Command::Record { .. }
                 | Command::Escalate { .. }
-                | Command::CallAgent { .. } => {}
+                | Command::CallAgent { .. }
+                | Command::StartChild { .. } => {}
                 Command::CompleteRun { .. }
                 | Command::FailRun { .. }
                 | Command::Park { .. }
@@ -1446,6 +1570,7 @@ impl RunState {
 fn same_command(recorded: &ScheduledStep, issued: &ScheduledStep) -> bool {
     recorded.name == issued.name
         && recorded.input == issued.input
+        && recorded.child_key == issued.child_key
         && match (recorded.kind, issued.kind) {
             (CommandKind::Step, CommandKind::Step) => true,
             (
@@ -1457,7 +1582,8 @@ fn same_command(recorded: &ScheduledStep, issued: &ScheduledStep) -> bool {
                 CommandKind::Signal { timeout_ms: b, .. },
             ) => a == b,
             (CommandKind::Recorded, CommandKind::Recorded) => true,
-            (CommandKind::Escalation, CommandKind::Escalation) => true,
+            (CommandKind::Escalation, CommandKind::Escalation)
+            | (CommandKind::Child, CommandKind::Child) => true,
             (CommandKind::Agent { budget_tokens: a }, CommandKind::Agent { budget_tokens: b }) => {
                 a == b
             }
