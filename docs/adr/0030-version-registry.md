@@ -64,6 +64,7 @@ connects them.
   signature: anyone who can write to the directory can append an event in someone else's name, and a
   rewritten chain is undetectable without an outside anchor. Signing approvals with a person's key, and
   an identity to check it against, is the next step; the event format leaves room for a signature field.
+  (Done in ADR 0033.)
 - The registry is single-writer, like the rest of the data directory: the CLI changes it while the engine
   is stopped, or between deployments.
 - Per-version metrics (escalation rate, cost, divergence, runs per version) build on the pinned versions

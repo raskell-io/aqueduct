@@ -16,6 +16,8 @@ workspace = true
 [dependencies]
 aqueduct-engine.workspace = true
 aqueduct-procedure.workspace = true
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
+getrandom = "0.3"
 serde_json = "1"
 sha2.workspace = true
 thiserror.workspace = true

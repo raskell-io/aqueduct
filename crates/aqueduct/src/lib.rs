@@ -44,8 +44,9 @@ pub use aqueduct_sdk::{
 /// lifecycle.
 pub mod registry {
     pub use aqueduct_registry::{
-        Action, Approval, Event, Policy, Provenance, Registry, RegistryError, ReplayEvidence,
-        State, Version, diff,
+        Action, Approval, Event, Identities, Policy, Provenance, PublicKey, Registry,
+        RegistryError, ReplayEvidence, SecretKey, Signature, State, Version, approval_statement,
+        diff,
     };
 }
 

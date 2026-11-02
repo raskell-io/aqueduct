@@ -6,8 +6,8 @@
 //! escalations it resolves continue when the engine next opens.
 //!
 //! What it does not do: approve or activate versions. Those are a person's decisions, made with
-//! `aqueduct versions approve` and `activate`; until approvals are signed, a name given over MCP is not
-//! proof of who decided. Every change it makes is attributed to the identity the server was started as
+//! `aqueduct versions approve` (signed with the person's own key, ADR 0033) and `activate`; a server
+//! holding someone's key would let its agent approve in their name. Every change it makes is attributed to the identity the server was started as
 //! (`--as`), never to a name the client supplies.
 
 use std::io::{BufRead, Write};

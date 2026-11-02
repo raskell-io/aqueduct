@@ -20,7 +20,10 @@ use aqueduct_engine::drift::{
 use aqueduct_engine::metrics::version_metrics;
 use aqueduct_engine::{Deciders, Partition};
 use aqueduct_procedure::Procedure;
-use aqueduct_registry::{Action, Provenance, Registry, RegistryError, ReplayEvidence, State};
+use aqueduct_registry::{
+    Action, Identities, Provenance, Registry, RegistryError, ReplayEvidence, SecretKey, Signature,
+    State,
+};
 use aqueduct_storage::{FileLog, FileLogOptions, RedbStateStore};
 
 const USAGE: &str = "usage: aqueduct <command> <data-dir> [arguments]
@@ -65,6 +68,11 @@ versions (ADR 0030; every change names who makes it with --by):
   versions prove <dir> <workflow> <version> --by <name> [--stubs <file.json>]
                                       replay the workflow's past runs against it and record the report
   versions approve <dir> <workflow> <version> --by <name> [--note <text>]
+                    [--key <file> | --signature <ed25519:key:sig>]
+                                      approve the version and its current replay report, signed
+                                      with the approver's key (or a signature made elsewhere)
+  versions statement <dir> <workflow> <version> --by <name> [--note <text>]
+                                      the statement an approval signs, for signing elsewhere
   versions activate <dir> <workflow> <version> --by <name>
                                       new runs start on it; the active version starts draining
   versions retire <dir> <workflow> <version> --by <name>
@@ -72,6 +80,15 @@ versions (ADR 0030; every change names who makes it with --by):
   versions diff <dir> <workflow> <version> <version>
   versions log <dir>                  every lifecycle event, verified
   A version can be given by a prefix of its id. Engines deploy the registry with Registry::deploy.
+  Every versions command takes --identities <file> to read who holds which keys from <file>
+  instead of the registry's identities.json.
+
+keys (ADR 0033: approvals signed with Ed25519):
+  keys generate <file> --name <name>  a new signing key in <file> (readable by you only); prints the
+                                      public key, for the registry's identities.json
+  keys public <file>                  a key file's public key
+  keys sign <file> <statement-file>   sign a statement (from versions statement); prints the
+                                      signature for versions approve --signature
 
 drift options:
   --model anthropic/<model>           the Claude API (ANTHROPIC_API_KEY)
@@ -111,6 +128,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
             &args[3..],
         ),
         Some("versions") => versions(&args[1..]),
+        Some("keys") => keys(&args[1..]),
         Some("mcp") => {
             let dir = Path::new(arg(1, "data directory")?);
             let (mut identity, mut read_only) = ("agent/mcp".to_owned(), false);
@@ -501,6 +519,55 @@ fn metrics(dir: &Path, workflow: Option<&str>) -> Result<String, String> {
     Ok(out)
 }
 
+/// A public key, shortened for tables: `ed25519:` and its first 12 hex digits.
+fn short_key(key: &aqueduct_registry::PublicKey) -> String {
+    key.to_string().chars().take(20).collect()
+}
+
+/// Signing keys (ADR 0033).
+fn keys(args: &[String]) -> Result<String, String> {
+    let err = |e: RegistryError| e.to_string();
+    let file = || {
+        args.get(1)
+            .map(Path::new)
+            .ok_or_else(|| format!("keys: missing key file\n\n{USAGE}"))
+    };
+    match args.first().map(String::as_str) {
+        Some("generate") => {
+            let name = match args.get(2..) {
+                Some([flag, name]) if flag == "--name" => name,
+                _ => return Err("keys generate <file> --name <name>".into()),
+            };
+            let key = SecretKey::generate().map_err(err)?;
+            key.write(file()?, name).map_err(err)?;
+            Ok(format!(
+                "wrote a signing key for {name} to {}\npublic key: {}\nadd it to registry/identities.json: {{\"{name}\": [\"{}\"]}}\n",
+                file()?.display(),
+                key.public(),
+                key.public()
+            ))
+        }
+        Some("public") => Ok(format!(
+            "{}\n",
+            SecretKey::read(file()?).map_err(err)?.public()
+        )),
+        Some("sign") => {
+            let key = SecretKey::read(file()?).map_err(err)?;
+            let path = Path::new(args.get(2).ok_or("keys sign <key file> <statement file>")?);
+            let statement =
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok(format!(
+                "{}\n",
+                Signature {
+                    key: key.public(),
+                    signature: key.sign(statement.as_bytes()),
+                }
+            ))
+        }
+        _ => Err(format!("keys needs generate, public or sign\n\n{USAGE}")),
+    }
+}
+
 /// The version registry's commands (ADR 0030).
 fn versions(args: &[String]) -> Result<String, String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
@@ -512,7 +579,18 @@ fn versions(args: &[String]) -> Result<String, String> {
             let value = rest
                 .next()
                 .ok_or_else(|| format!("--{flag} needs a value"))?;
-            if !["by", "explored-by", "cases", "note", "stubs"].contains(&flag) {
+            if ![
+                "by",
+                "explored-by",
+                "cases",
+                "note",
+                "stubs",
+                "key",
+                "signature",
+                "identities",
+            ]
+            .contains(&flag)
+            {
                 return Err(format!("unknown option `--{flag}`"));
             }
             flags.insert(flag, value);
@@ -534,6 +612,9 @@ fn versions(args: &[String]) -> Result<String, String> {
     let dir = Path::new(at(0, "data directory")?);
     let mut registry = Registry::open(dir).map_err(|e| e.to_string())?;
     let err = |e: RegistryError| e.to_string();
+    if let Some(path) = flags.get("identities") {
+        registry.set_identities(Identities::read(Path::new(path)).map_err(err)?);
+    }
     match sub {
         "list" => {
             let pinned = pinned_runs(dir);
@@ -590,9 +671,26 @@ fn versions(args: &[String]) -> Result<String, String> {
                     r.runs, r.same, r.different, r.unresolved, r.report_sha256
                 ));
             }
+            let valid = registry.valid_approvals(v);
             for a in &v.approvals {
+                let signed = match &a.signature {
+                    None => "unsigned".to_owned(),
+                    Some(s) if registry.trusted(a) => format!("signed with {}", short_key(&s.key)),
+                    Some(s) => format!(
+                        "signed with {}, which is not one of {}'s keys",
+                        short_key(&s.key),
+                        a.by
+                    ),
+                };
+                let counts = if valid.iter().any(|b| std::ptr::eq(*b, a)) {
+                    ""
+                } else if a.replay_sha256.as_ref() != v.replay.as_ref().map(|r| &r.report_sha256) {
+                    ", of an earlier replay report (does not count)"
+                } else {
+                    ", does not count under the policy"
+                };
                 out.push_str(&format!(
-                    "approved  by {}{}\n",
+                    "approved  by {} ({signed}{counts}){}\n",
                     a.by,
                     a.note.as_ref().map_or(String::new(), |n| format!(": {n}"))
                 ));
@@ -642,14 +740,45 @@ fn versions(args: &[String]) -> Result<String, String> {
         "approve" => {
             let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
             let note = flags.get("note").map(|s| (*s).to_owned());
-            let state = registry.approve(workflow, id, by()?, note).map_err(err)?;
+            let by = by()?;
+            let signature = match (flags.get("key"), flags.get("signature")) {
+                (Some(_), Some(_)) => return Err("give --key or --signature, not both".into()),
+                (Some(path), None) => {
+                    let key = SecretKey::read(Path::new(path)).map_err(err)?;
+                    let statement = registry
+                        .statement(workflow, id, by, note.as_deref())
+                        .map_err(err)?;
+                    Some(Signature {
+                        key: key.public(),
+                        signature: key.sign(statement.as_bytes()),
+                    })
+                }
+                (None, Some(text)) => Some(Signature::parse(text).map_err(err)?),
+                (None, None) => None,
+            };
+            let signed = signature.is_some();
+            let state = registry
+                .approve_signed(workflow, id, by, note, signature)
+                .map_err(err)?;
+            let signed = if signed { "signed " } else { "unsigned " };
             Ok(match state {
-                State::Approved => format!("{workflow} version {id} approved\n"),
+                State::Approved => {
+                    format!("{signed}approval recorded; {workflow} version {id} approved\n")
+                }
                 _ => format!(
-                    "approval recorded; {workflow} version {id} needs more approvals ({} so far)\n",
-                    registry.version(workflow, id).map_err(err)?.approvals.len()
+                    "{signed}approval recorded; {workflow} version {id} needs more approvals ({} of {} so far)\n",
+                    registry
+                        .valid_approvals(registry.version(workflow, id).map_err(err)?)
+                        .len(),
+                    registry.policy(workflow).approvals
                 ),
             })
+        }
+        "statement" => {
+            let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
+            registry
+                .statement(workflow, id, by()?, flags.get("note").copied())
+                .map_err(err)
         }
         "activate" => {
             let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);
@@ -708,7 +837,18 @@ fn versions(args: &[String]) -> Result<String, String> {
                         " {} runs: {} same, {} different, {} unresolved",
                         r.runs, r.same, r.different, r.unresolved
                     ),
-                    Action::Approval { note: Some(note) } => format!(": {note}"),
+                    Action::Approval {
+                        note, signature, ..
+                    } => format!(
+                        " ({}){}",
+                        signature
+                            .as_ref()
+                            .map_or("unsigned".to_owned(), |s| format!(
+                                "signed with {}",
+                                short_key(&s.key)
+                            )),
+                        note.as_ref().map_or(String::new(), |n| format!(": {n}"))
+                    ),
                     _ => String::new(),
                 };
                 out.push_str(&format!(

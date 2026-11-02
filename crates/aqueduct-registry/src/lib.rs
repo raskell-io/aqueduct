@@ -12,13 +12,17 @@
 //! - `events.log`: the lifecycle, one event per line, each naming who did it and when, and each chained
 //!   to the one before by a SHA-256 hash, so an edited or removed event is detected when the registry is
 //!   opened;
-//! - `policy.json` (optional, written by hand): which evidence each workflow's transitions need.
+//! - `policy.json` (optional, written by hand): which evidence each workflow's transitions need;
+//! - `identities.json` (optional, written by hand): which Ed25519 public keys belong to whom, so that
+//!   approvals can be signed ([`identity`], ADR 0033).
 //!
 //! Every transition is checked when it is made: its starting state, and the policy. The engine is given
 //! the deployable versions (approved, active and draining) with [`Registry::deploy`]; the active one is
 //! where new runs start.
 
 #![forbid(unsafe_code)]
+
+pub mod identity;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -30,6 +34,8 @@ use aqueduct_engine::Deciders;
 use aqueduct_engine::embedded::Builder;
 use aqueduct_procedure::{Procedure, version_of};
 use serde_json::{Value, json};
+
+pub use identity::{Identities, PublicKey, SecretKey, Signature, approval_statement};
 
 /// A version's place in the lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -108,6 +114,13 @@ pub struct Approval {
     pub at_ms: u64,
     /// Why, or on what conditions.
     pub note: Option<String>,
+    /// The SHA-256 of the replay report approved, if the version had one. Only approvals of the
+    /// version's current report count towards the policy.
+    pub replay_sha256: Option<String>,
+    /// The approver's signature of the [approval statement](approval_statement), if signed. It was
+    /// checked when the registry was opened; whether its key is the approver's is
+    /// [`Registry::trusted`].
+    pub signature: Option<Signature>,
 }
 
 /// A registered version and what is known about it.
@@ -142,6 +155,10 @@ pub enum Action {
     Approval {
         /// Why, or on what conditions.
         note: Option<String>,
+        /// The SHA-256 of the replay report approved.
+        replay_sha256: Option<String>,
+        /// The approver's signature of the approval statement.
+        signature: Option<Signature>,
     },
     /// Its approvals met the policy (state: approved).
     Approved,
@@ -206,6 +223,10 @@ pub struct Policy {
     pub approvers: Vec<String>,
     /// Whether the version's author may approve it. Default: false (four eyes).
     pub author_may_approve: bool,
+    /// Whether approvals must be signed with a key `identities.json` gives the approver. Deployment
+    /// checks it again, so a version whose signed approvals no longer meet the policy is not run.
+    /// Default: false.
+    pub require_signatures: bool,
 }
 
 impl Default for Policy {
@@ -218,6 +239,7 @@ impl Default for Policy {
             approvals: 1,
             approvers: Vec::new(),
             author_may_approve: false,
+            require_signatures: false,
         }
     }
 }
@@ -254,6 +276,9 @@ impl Policy {
                 }
                 "author_may_approve" => {
                     policy.author_may_approve = value.as_bool().ok_or_else(wrong)?;
+                }
+                "require_signatures" => {
+                    policy.require_signatures = value.as_bool().ok_or_else(wrong)?;
                 }
                 other => return Err(format!("unknown policy field `{other}`")),
             }
@@ -326,6 +351,7 @@ pub struct Registry {
     versions: BTreeMap<(String, String), Version>,
     default_policy: Policy,
     policies: BTreeMap<String, Policy>,
+    identities: Identities,
 }
 
 impl Registry {
@@ -339,8 +365,10 @@ impl Registry {
             versions: BTreeMap::new(),
             default_policy: Policy::default(),
             policies: BTreeMap::new(),
+            identities: Identities::default(),
         };
         registry.load_policy()?;
+        registry.identities = Identities::read(&registry.dir.join("identities.json"))?;
         let log = match std::fs::read_to_string(registry.dir.join("events.log")) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -395,6 +423,58 @@ impl Registry {
     /// The policy for a workflow.
     pub fn policy(&self, workflow: &str) -> &Policy {
         self.policies.get(workflow).unwrap_or(&self.default_policy)
+    }
+
+    /// Who holds which keys.
+    pub fn identities(&self) -> &Identities {
+        &self.identities
+    }
+
+    /// Uses `identities` instead of the registry's `identities.json`: for keeping the identities
+    /// somewhere the registry's writers cannot change them.
+    pub fn set_identities(&mut self, identities: Identities) {
+        self.identities = identities;
+    }
+
+    /// Whether an approval is signed with one of its approver's keys.
+    pub fn trusted(&self, approval: &Approval) -> bool {
+        approval
+            .signature
+            .as_ref()
+            .is_some_and(|s| self.identities.trusts(&approval.by, &s.key))
+    }
+
+    /// The approvals of a version that count towards its policy now: of its current replay report, by
+    /// someone the policy lets approve it, and signed with one of their keys if the policy says so.
+    pub fn valid_approvals<'a>(&self, version: &'a Version) -> Vec<&'a Approval> {
+        let policy = self.policy(&version.workflow);
+        let current = version.replay.as_ref().map(|r| r.report_sha256.as_str());
+        version
+            .approvals
+            .iter()
+            .filter(|a| a.replay_sha256.as_deref() == current)
+            .filter(|a| policy.author_may_approve || a.by != version.provenance.author)
+            .filter(|a| policy.approvers.is_empty() || policy.approvers.contains(&a.by))
+            .filter(|a| !policy.require_signatures || self.trusted(a))
+            .collect()
+    }
+
+    /// The statement `by` signs to approve a version as it is now: see [`approval_statement`].
+    pub fn statement(
+        &self,
+        workflow: &str,
+        id: &str,
+        by: &str,
+        note: Option<&str>,
+    ) -> Result<String, RegistryError> {
+        let version = self.version(workflow, id)?;
+        Ok(approval_statement(
+            workflow,
+            &version.id,
+            by,
+            version.replay.as_ref().map(|r| r.report_sha256.as_str()),
+            note,
+        ))
     }
 
     /// Every event, in order.
@@ -500,14 +580,28 @@ impl Registry {
         self.append(by, workflow, &version.id, Action::Proven(evidence))
     }
 
-    /// Records `by`'s approval. Once the approvals meet the policy, the version is approved. Returns
-    /// the version's state afterwards.
+    /// Records `by`'s unsigned approval: see [`Registry::approve_signed`].
     pub fn approve(
         &mut self,
         workflow: &str,
         id: &str,
         by: &str,
         note: Option<String>,
+    ) -> Result<State, RegistryError> {
+        self.approve_signed(workflow, id, by, note, None)
+    }
+
+    /// Records `by`'s approval of the version and its current replay report, with `by`'s signature of
+    /// the [statement](Registry::statement) if given: it must verify, with a key `identities.json`
+    /// gives `by`. The policy may require one. Once the valid approvals meet the policy, the version
+    /// is approved. Returns the version's state afterwards.
+    pub fn approve_signed(
+        &mut self,
+        workflow: &str,
+        id: &str,
+        by: &str,
+        note: Option<String>,
+        signature: Option<Signature>,
     ) -> Result<State, RegistryError> {
         let version = self.version(workflow, id)?.clone();
         let policy = self.policy(workflow).clone();
@@ -528,10 +622,40 @@ impl Registry {
                 policy.approvers.join(", ")
             )));
         }
-        if version.approvals.iter().any(|a| a.by == by) {
+        let replay_sha256 = version.replay.as_ref().map(|r| r.report_sha256.clone());
+        if version
+            .approvals
+            .iter()
+            .any(|a| a.by == by && a.replay_sha256 == replay_sha256)
+        {
             return Err(RegistryError::Denied(format!(
                 "{by} has already approved it"
             )));
+        }
+        match &signature {
+            Some(signature) => {
+                let statement = self.statement(workflow, &version.id, by, note.as_deref())?;
+                if !signature
+                    .key
+                    .verifies(statement.as_bytes(), &signature.signature)
+                {
+                    return Err(RegistryError::Denied(
+                        "the signature does not verify: it was not made over this approval's statement with this key".into(),
+                    ));
+                }
+                if !self.identities.trusts(by, &signature.key) {
+                    return Err(RegistryError::Denied(format!(
+                        "{} is not one of {by}'s keys in identities.json",
+                        signature.key
+                    )));
+                }
+            }
+            None if policy.require_signatures => {
+                return Err(RegistryError::Denied(format!(
+                    "approvals of `{workflow}` must be signed"
+                )));
+            }
+            None => {}
         }
         if policy.require_replay {
             let replay = version
@@ -559,8 +683,20 @@ impl Registry {
                 )));
             }
         }
-        self.append(by, workflow, &version.id, Action::Approval { note })?;
-        if version.approvals.len() + 1 >= policy.approvals {
+        self.append(
+            by,
+            workflow,
+            &version.id,
+            Action::Approval {
+                note,
+                replay_sha256,
+                signature,
+            },
+        )?;
+        let valid = self
+            .valid_approvals(self.version(workflow, &version.id)?)
+            .len();
+        if valid >= policy.approvals {
             self.append(by, workflow, &version.id, Action::Approved)?;
         }
         Ok(self.version(workflow, &version.id)?.state)
@@ -610,6 +746,7 @@ impl Registry {
     /// active ones.
     pub fn deploy(&self, mut builder: Builder) -> Result<Builder, RegistryError> {
         for version in self.versions.values().filter(|v| v.state.is_deployed()) {
+            self.check_signed(version)?;
             let source = self.source(version)?;
             let procedure = Procedure::compile(&format!("{}.star", version.workflow), &source)
                 .map_err(|e| RegistryError::Invalid(e.to_string()))?;
@@ -626,6 +763,7 @@ impl Registry {
     pub fn deciders(&self) -> Result<Deciders, RegistryError> {
         let mut deciders = Deciders::new();
         for version in self.versions.values().filter(|v| v.state.is_deployed()) {
+            self.check_signed(version)?;
             let source = self.source(version)?;
             let procedure = Procedure::compile(&format!("{}.star", version.workflow), &source)
                 .map_err(|e| RegistryError::Invalid(e.to_string()))?;
@@ -637,6 +775,26 @@ impl Registry {
             }
         }
         Ok(deciders)
+    }
+
+    /// Where the policy requires signatures, whether a deployed version's signed approvals still meet
+    /// it, with the identities as they are now.
+    fn check_signed(&self, version: &Version) -> Result<(), RegistryError> {
+        let policy = self.policy(&version.workflow);
+        if !policy.require_signatures {
+            return Ok(());
+        }
+        let valid = self.valid_approvals(version).len();
+        if valid < policy.approvals {
+            return Err(RegistryError::Denied(format!(
+                "{} version {} is {} but has {valid} valid signed approvals of {} needed; it will not be deployed",
+                version.workflow,
+                version.id,
+                version.state.as_str(),
+                policy.approvals
+            )));
+        }
+        Ok(())
     }
 
     fn append(
@@ -713,11 +871,44 @@ impl Registry {
                 version.replay = Some(evidence.clone());
                 (&[State::Proposed, State::Proven], Some(State::Proven))
             }
-            Action::Approval { note } => {
+            Action::Approval {
+                note,
+                replay_sha256,
+                signature,
+            } => {
+                // An approval names the report it approved; one without (written before reports
+                // were recorded) opens, but no longer counts.
+                let current = version.replay.as_ref().map(|r| &r.report_sha256);
+                if replay_sha256.is_some() && replay_sha256.as_ref() != current {
+                    return Err(RegistryError::Invalid(format!(
+                        "an approval of version {} names a replay report it does not have",
+                        version.id
+                    )));
+                }
+                if let Some(signature) = signature {
+                    let statement = approval_statement(
+                        &event.workflow,
+                        &event.version,
+                        &event.by,
+                        replay_sha256.as_deref(),
+                        note.as_deref(),
+                    );
+                    if !signature
+                        .key
+                        .verifies(statement.as_bytes(), &signature.signature)
+                    {
+                        return Err(RegistryError::Invalid(format!(
+                            "the signature on {}'s approval of version {} does not verify",
+                            event.by, version.id
+                        )));
+                    }
+                }
                 version.approvals.push(Approval {
                     by: event.by.clone(),
                     at_ms: event.at_ms,
                     note: note.clone(),
+                    replay_sha256: replay_sha256.clone(),
+                    signature: signature.clone(),
                 });
                 (&[State::Proposed, State::Proven], None)
             }
@@ -797,7 +988,18 @@ fn event_json(event: &Event) -> Value {
             value["unresolved"] = json!(e.unresolved);
             value["report_sha256"] = json!(e.report_sha256);
         }
-        Action::Approval { note } => value["note"] = json!(note),
+        Action::Approval {
+            note,
+            replay_sha256,
+            signature,
+        } => {
+            value["note"] = json!(note);
+            value["replay_sha256"] = json!(replay_sha256);
+            if let Some(signature) = signature {
+                value["key"] = json!(signature.key.to_string());
+                value["signature"] = json!(signature.signature);
+            }
+        }
         _ => {}
     }
     value
@@ -834,6 +1036,15 @@ fn parse_event(body: &str, hash: &str) -> Result<Event, String> {
         }),
         "approval" => Action::Approval {
             note: opt_text("note"),
+            replay_sha256: opt_text("replay_sha256"),
+            signature: match (opt_text("key"), opt_text("signature")) {
+                (Some(key), Some(signature)) => Some(Signature {
+                    key: PublicKey::parse(&key).map_err(|e| e.to_string())?,
+                    signature,
+                }),
+                (None, None) => None,
+                _ => return Err("an approval has a key without a signature, or the reverse".into()),
+            },
         },
         "approved" => Action::Approved,
         "activated" => Action::Activated,
@@ -1065,6 +1276,137 @@ mod tests {
             registry.source(version),
             Err(RegistryError::Tampered { .. })
         ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rewrites the log with `edit` applied to every event's JSON, recomputing the whole chain: what
+    /// someone who can write to the directory can do, and the chain alone cannot detect.
+    fn rewrite_chain(dir: &Path, edit: impl Fn(&str) -> String) {
+        let log = dir.join("registry/events.log");
+        let text = std::fs::read_to_string(&log).unwrap();
+        let mut prev = GENESIS.to_owned();
+        let mut out = String::new();
+        for line in text.lines() {
+            let body = edit(line.split_once(' ').unwrap().1);
+            prev = chain_hash(&prev, &body);
+            out.push_str(&format!("{prev} {body}\n"));
+        }
+        std::fs::write(&log, out).unwrap();
+    }
+
+    fn sign(registry: &Registry, key: &SecretKey, workflow: &str, id: &str, by: &str) -> Signature {
+        let statement = registry.statement(workflow, id, by, None).unwrap();
+        Signature {
+            key: key.public(),
+            signature: key.sign(statement.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn signed_approvals_are_checked_when_made_read_and_deployed() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("registry")).unwrap();
+        std::fs::write(
+            dir.join("registry/policy.json"),
+            r#"{"default": {"require_signatures": true}}"#,
+        )
+        .unwrap();
+        let grace = SecretKey::from_seed([1; 32]);
+        let eve = SecretKey::from_seed([2; 32]);
+        std::fs::write(
+            dir.join("registry/identities.json"),
+            format!(r#"{{"grace": ["{}"]}}"#, grace.public()),
+        )
+        .unwrap();
+        let mut registry = Registry::open(&dir).unwrap();
+        let v1 = registry.register("claims", V1, by("ada")).unwrap();
+        registry.propose("claims", &v1, "ada").unwrap();
+        registry.prove("claims", &v1, "ada", clean(3)).unwrap();
+
+        // Unsigned, signed by someone else's key, or signed over something else: refused.
+        let denied = |r: Result<State, RegistryError>| matches!(r, Err(RegistryError::Denied(_)));
+        assert!(denied(registry.approve("claims", &v1, "grace", None)));
+        let forged = sign(&registry, &eve, "claims", &v1, "grace");
+        assert!(denied(registry.approve_signed(
+            "claims",
+            &v1,
+            "grace",
+            None,
+            Some(forged)
+        )));
+        let elsewhere = sign(&registry, &grace, "claims", &v1, "grace");
+        assert!(denied(registry.approve_signed(
+            "claims",
+            &v1,
+            "grace",
+            Some("with a note it did not sign".into()),
+            Some(elsewhere.clone())
+        )));
+        assert_eq!(
+            registry
+                .approve_signed("claims", &v1, "grace", None, Some(elsewhere))
+                .unwrap(),
+            State::Approved
+        );
+        registry.activate("claims", &v1, "grace").unwrap();
+        assert!(registry.deciders().is_ok());
+        let reopened = Registry::open(&dir).unwrap();
+        let approval = &reopened.version("claims", &v1).unwrap().approvals[0];
+        assert!(reopened.trusted(approval));
+        assert_eq!(
+            approval.replay_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+
+        // A rewritten log keeps its chain, but not its signatures.
+        let log = std::fs::read_to_string(dir.join("registry/events.log")).unwrap();
+        rewrite_chain(&dir, |body| {
+            body.replace("\"by\":\"grace\",", "\"by\":\"linus\",")
+        });
+        let err = Registry::open(&dir).unwrap_err();
+        assert!(err.to_string().contains("does not verify"), "{err}");
+        std::fs::write(dir.join("registry/events.log"), &log).unwrap();
+
+        // If grace's key is no longer trusted, the active version is not deployed.
+        let mut registry = Registry::open(&dir).unwrap();
+        registry.set_identities(Identities::default().with("grace", eve.public()));
+        let err = registry.deciders().unwrap_err();
+        assert!(
+            err.to_string().contains("0 valid signed approvals"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn approvals_count_only_for_the_report_they_approved() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("registry")).unwrap();
+        std::fs::write(
+            dir.join("registry/policy.json"),
+            r#"{"default": {"approvals": 2}}"#,
+        )
+        .unwrap();
+        let mut registry = Registry::open(&dir).unwrap();
+        let v1 = registry.register("claims", V1, by("ada")).unwrap();
+        registry.propose("claims", &v1, "ada").unwrap();
+        registry.prove("claims", &v1, "ada", clean(3)).unwrap();
+        registry.approve("claims", &v1, "grace", None).unwrap();
+        // A new report: grace's approval was of the old one.
+        let newer = ReplayEvidence {
+            report_sha256: "cd".repeat(32),
+            ..clean(4)
+        };
+        registry.prove("claims", &v1, "ada", newer).unwrap();
+        assert_eq!(
+            registry.approve("claims", &v1, "linus", None).unwrap(),
+            State::Proven
+        );
+        assert_eq!(
+            registry.approve("claims", &v1, "grace", None).unwrap(),
+            State::Approved
+        );
+        assert!(Registry::open(&dir).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

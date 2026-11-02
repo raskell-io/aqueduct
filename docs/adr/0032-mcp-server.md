@@ -28,9 +28,10 @@ pieces exist: the registry (ADR 0030), counterfactual replay (ADR 0028), per-ver
   - operations: `start_run` and `resolve_escalation`.
 
   Tools are annotated read-only or not, and `--read-only` serves only those that change nothing.
-- **No approval and no activation over MCP.** Those are a person's decisions, made with the CLI. Until
-  approvals are signed, a name given over MCP proves nothing about who decided, and the default policy's
-  four eyes would mean nothing if the proposing agent could approve under another name.
+- **No approval and no activation over MCP.** Those are a person's decisions, made with the CLI. A name given
+  over MCP proves nothing about who decided, and the default policy's four eyes would mean nothing if the
+  proposing agent could approve under another name. Signed approvals (ADR 0033) do not change this: a
+  server holding a person's key would let its agent sign in their name.
 - **One identity per server.** Every change is attributed to `--as` (default `agent/mcp`), as author and
   as `by`, never to a name in the request. Each agent gets its own server, or its own identity.
 - **Like the CLI, it works on a stopped engine's data directory.** `start_run` (also `aqueduct start`)
