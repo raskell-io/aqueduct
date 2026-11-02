@@ -886,16 +886,141 @@ def run(claim):
     let shown = cli(&["versions", "show", path, "claims", &id1[..10]]).unwrap();
     assert!(shown.contains("state     retired\n"), "{shown}");
     assert!(shown.contains("cases     37 studied\n"), "{shown}");
-    assert!(shown.contains("approved  by grace: first cut\n"), "{shown}");
+    assert!(
+        shown.contains("approved  by grace (unsigned): first cut\n"),
+        "{shown}"
+    );
     let log = cli(&["versions", "log", path]).unwrap();
     assert!(log.ends_with("14 events, chain verified\n"), "{log}");
     assert!(
-        log.contains("grace            approval: first cut\n"),
+        log.contains("grace            approval (unsigned): first cut\n"),
         "{log}"
     );
     assert!(
         log.contains("ada              proven 3 runs: 2 same, 1 different, 0 unresolved\n"),
         "{log}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn approvals_are_signed_with_the_approvers_keys() {
+    let dir = std::env::temp_dir().join(format!("aqueduct-cli-signed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("registry")).unwrap();
+    let path = dir.to_str().unwrap();
+    let in_dir = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+    std::fs::write(
+        in_dir("claims.star"),
+        "def run(claim):\n    return step(\"score\", claim)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("registry/policy.json"),
+        r#"{"default": {"require_signatures": true, "approvals": 2}}"#,
+    )
+    .unwrap();
+
+    // Two approvers make keys; their public keys go into identities.json.
+    let mut public = Vec::new();
+    for name in ["grace", "linus"] {
+        let out = cli(&[
+            "keys",
+            "generate",
+            &in_dir(&format!("{name}.key")),
+            "--name",
+            name,
+        ])
+        .unwrap();
+        assert!(out.contains("identities.json"), "{out}");
+        let key = cli(&["keys", "public", &in_dir(&format!("{name}.key"))]).unwrap();
+        public.push(format!("\"{name}\": [\"{}\"]", key.trim()));
+    }
+    std::fs::write(
+        dir.join("registry/identities.json"),
+        format!("{{{}}}", public.join(", ")),
+    )
+    .unwrap();
+
+    let registered = cli(&[
+        "versions",
+        "register",
+        path,
+        "claims",
+        &in_dir("claims.star"),
+        "--by",
+        "ada",
+    ])
+    .unwrap();
+    let id = registered.split_whitespace().nth(3).unwrap().to_owned();
+    for sub in ["propose", "prove"] {
+        cli(&["versions", sub, path, "claims", &id, "--by", "ada"]).unwrap();
+    }
+    let approve = |extra: &[&str]| {
+        let mut args = vec!["versions", "approve", path, "claims", &id];
+        args.extend_from_slice(extra);
+        cli(&args)
+    };
+    assert!(
+        approve(&["--by", "grace"])
+            .unwrap_err()
+            .contains("must be signed")
+    );
+    // Linus's key cannot sign for grace.
+    assert!(
+        approve(&["--by", "grace", "--key", &in_dir("linus.key")])
+            .unwrap_err()
+            .contains("not one of grace's keys")
+    );
+    let out = approve(&["--by", "grace", "--key", &in_dir("grace.key")]).unwrap();
+    assert!(out.contains("1 of 2 so far"), "{out}");
+
+    // Linus signs away from the registry: the statement out, a signature back.
+    let statement = cli(&[
+        "versions",
+        "statement",
+        path,
+        "claims",
+        &id,
+        "--by",
+        "linus",
+    ])
+    .unwrap();
+    assert!(
+        statement.starts_with("aqueduct approval v1\n"),
+        "{statement}"
+    );
+    std::fs::write(in_dir("statement.txt"), &statement).unwrap();
+    let signature = cli(&[
+        "keys",
+        "sign",
+        &in_dir("linus.key"),
+        &in_dir("statement.txt"),
+    ])
+    .unwrap();
+    let out = approve(&["--by", "linus", "--signature", signature.trim()]).unwrap();
+    assert!(out.contains("approved"), "{out}");
+
+    let shown = cli(&["versions", "show", path, "claims", &id]).unwrap();
+    assert_eq!(shown.matches("(signed with ed25519:").count(), 2, "{shown}");
+    let log = cli(&["versions", "log", path]).unwrap();
+    assert!(log.contains("approval (signed with ed25519:"), "{log}");
+
+    // Read with other identities, the approvals are no longer trusted.
+    std::fs::write(in_dir("others.json"), "{}").unwrap();
+    let shown = cli(&[
+        "versions",
+        "show",
+        path,
+        "claims",
+        &id,
+        "--identities",
+        &in_dir("others.json"),
+    ])
+    .unwrap();
+    assert!(
+        shown.contains("which is not one of grace's keys"),
+        "{shown}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

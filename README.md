@@ -160,6 +160,9 @@ What holds today, for the embedded engine, and how it is checked:
 - **A version lifecycle:** procedure versions are registered with their provenance, proven by replay
   against past runs, approved under a policy (four eyes by default), activated, drained and retired, in
   a hash-chained registry log (`aqueduct versions ...`; [ADR 0030](docs/adr/0030-version-registry.md)).
+- **Signed approvals:** an approval can be signed with the approver's Ed25519 key over the version's
+  source hash and the replay report approved, checked against who holds which keys; a policy can require
+  it, and deployment checks it again ([ADR 0033](docs/adr/0033-signed-approvals.md)).
 - **Per-version metrics:** runs, escalation and timeout rates, cost and replay divergence for every
   version (`aqueduct metrics`), and the version on every live run metric
   ([ADR 0031](docs/adr/0031-per-version-metrics.md)).
@@ -185,8 +188,7 @@ What holds today, for the embedded engine, and how it is checked:
 - **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the
   code ([history format](docs/history-format.md)).
 
-Planned: the same semantics on a single server and in a replicated cluster, and signed
-approvals. The full design and phased plan are in [BRIEF.md](BRIEF.md).
+Planned: the same semantics on a single server and in a replicated cluster. The full design and phased plan are in [BRIEF.md](BRIEF.md).
 
 ## Testing it yourself
 
@@ -215,6 +217,9 @@ cargo run -p aqueduct-cli -- counterfactual ./data claims-v3.star --workflow cla
                                                                       # how would a new version have decided past runs?
 cargo run -p aqueduct-cli -- metrics ./data claims                     # per version: runs, escalations, timeouts, cost, replay
 cargo run -p aqueduct-cli -- versions list ./data                      # procedure versions: state, approvals, replay, runs on them
+cargo run -p aqueduct-cli -- keys generate grace.key --name grace      # a signing key; its public key goes into registry/identities.json
+cargo run -p aqueduct-cli -- versions approve ./data claims 3f2a --by grace --key grace.key
+                                                                      # a signed approval
 cargo run -p aqueduct-cli -- mcp ./data --as agent/claims-explorer      # MCP on stdio, for an agent (claude mcp add aqueduct -- aqueduct mcp ...)
 cargo run -p aqueduct-cli -- drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
                                                                       # ask past agent calls again: same answers?
