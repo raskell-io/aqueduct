@@ -19,7 +19,7 @@ use aqueduct_engine::counterfactual::CounterfactualOptions;
 use aqueduct_procedure::Procedure;
 use aqueduct_registry::{Provenance, Registry};
 
-use crate::{Payload, prove_version, replay_workflow, start_run};
+use crate::{Payload, lint_report, prove_version, replay_workflow, start_run};
 
 /// Protocol versions this server speaks, newest first.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -56,7 +56,7 @@ fn object(properties: Value, required: &[&str]) -> Value {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "validate_procedure",
-        description: "Compile a procedure (Starlark defining run(input)) and return its version id, or why it does not compile.",
+        description: "Compile a procedure (Starlark defining run(input)) and return its version id and its lints (waits without a timeout, ignored results), or why it does not compile (recursion is refused).",
         schema: || {
             object(
                 json!({"source": string("The procedure's source.")}),
@@ -321,7 +321,11 @@ impl Server {
             "validate_procedure" => {
                 let procedure = Procedure::compile("procedure.star", text("source")?)
                     .map_err(|e| e.to_string())?;
-                Ok(format!("compiles: version {}\n", procedure.version()))
+                Ok(format!(
+                    "compiles: version {}\n{}",
+                    procedure.version(),
+                    lint_report(&procedure)
+                ))
             }
             "replay_draft" => {
                 let workflow = text("workflow")?;

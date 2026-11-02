@@ -316,14 +316,35 @@ fn runaway_procedures_are_parked() {
         state.error()
     );
 
-    // starlark-rust allows recursion; the call stack limit stops it.
-    let recursive = Procedure::compile(
-        "rec.star",
-        "def f(n):\n    return f(n + 1)\n\ndef run(x):\n    return f(x)\n",
+    // The watchdog: a wall-clock limit, whatever the statement budget.
+    let slow = Procedure::compile_with_limits(
+        "slow.star",
+        "def run(x):\n    n = 0\n    for i in range(100000000):\n        n += i\n    return n\n",
+        Limits {
+            max_statements: u64::MAX,
+            max_wall_time: Some(std::time::Duration::from_millis(20)),
+            ..Limits::default()
+        },
     )
     .unwrap();
-    let (state, _) = drive(&recursive, json!(0), |_, _| unreachable!());
+    let started = std::time::Instant::now();
+    let (state, _) = drive(&slow, json!(0), |_, _| unreachable!());
     assert_eq!(state.status(), Status::Parked);
+    assert!(
+        state.error().unwrap().contains("watchdog"),
+        "{:?}",
+        state.error()
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+    // Recursion never gets this far: it does not compile (tests/checks.rs).
+    assert!(
+        Procedure::compile(
+            "rec.star",
+            "def f(n):\n    return f(n + 1)\n\ndef run(x):\n    return f(x)\n",
+        )
+        .is_err()
+    );
 }
 
 #[test]

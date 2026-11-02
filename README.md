@@ -125,11 +125,13 @@ def run(claim):
         step("notify.customer", {"template": "missing-photos", "to": claim["customer"]})
         photos = wait(signal("photos_received"), timeout = days(14))
         if photos == None:
-            escalate("no-photos", claim)
+            return escalate("no-photos", claim)
     return step("claims.settle", claim)
 ```
 
 Register it with `.workflow("claims", Arc::new(aqueduct::Procedure::compile("claims.star", source)?))`.
+`aqueduct check claims.star` reports its lints (a wait without a timeout, a result ignored); recursion
+does not compile, so every activation ends ([ADR 0037](docs/adr/0037-procedure-checks.md)).
 `escalate` hands the claim to a person and waits, durably, for their decision; list open escalations
 with `engine.escalations()` or `aqueduct escalations`, and resolve them with `resolve_escalation`
 ([ADR 0020](docs/adr/0020-escalations.md)). [`ingest.rs`](crates/aqueduct/examples/ingest.rs) is the
