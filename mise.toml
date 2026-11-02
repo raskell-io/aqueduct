@@ -26,7 +26,7 @@ run = "cargo check --workspace --all-targets"
 
 [tasks.doc]
 description = "Build the API documentation (warnings are errors)"
-run = "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps"
+run = "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --lib"
 
 # =============================================================================
 # Development
