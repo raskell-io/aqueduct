@@ -212,7 +212,21 @@ What holds today, for the embedded engine, and how it is checked:
 - **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the
   code ([history format](docs/history-format.md)).
 
-Planned: the same semantics on a single server and in a replicated cluster. The full design and phased plan are in [BRIEF.md](BRIEF.md).
+**A server (phase 3, in progress):** `aqueduct server <dir>` serves a data directory's approved
+procedures over gRPC and HTTP/JSON on `127.0.0.1:7470` ([protocol v1, draft](docs/protocol.md);
+[ADR 0038](docs/adr/0038-server-and-protocol.md)):
+
+```sh
+aqueduct server ./data &
+curl -s localhost:7470/v1/runs -d '{"key": "claim-7", "workflow": "claims", "input": {"amount": 400}}'
+curl -s 'localhost:7470/v1/runs/claim-7/result?timeout_ms=10000'
+```
+
+It has no authentication yet, so it listens on loopback unless told otherwise. Step workers in other
+processes come next; until then a procedure's steps run only in a program that embeds the server
+(`aqueduct_server::serve`) and registers them.
+
+Planned: the same semantics in a replicated cluster. The full design and phased plan are in [BRIEF.md](BRIEF.md).
 
 ## Testing it yourself
 

@@ -45,6 +45,11 @@ commands:
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
+  server <dir> [--listen <address>] [--listen-anywhere]
+                                      serve the directory's approved procedures over gRPC and
+                                      HTTP/JSON (protocol v1, draft; ADR 0038) on 127.0.0.1:7470;
+                                      until there is authentication, an address other than loopback
+                                      needs --listen-anywhere. Ctrl-C or SIGTERM stops it
   mcp <dir> [--as <identity>] [--read-only]
                                       serve the Model Context Protocol on stdio, for agents: propose,
                                       validate and replay versions, start and inspect runs, resolve
@@ -169,6 +174,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
             Ok(String::new())
         }
         Some("start") => start(Path::new(arg(1, "data directory")?), &args[2..]),
+        Some("server") => server(Path::new(arg(1, "data directory")?), &args[2..]),
         Some("metrics") => metrics(
             Path::new(arg(1, "data directory")?),
             args.get(2).map(String::as_str),
@@ -287,6 +293,81 @@ fn signal(
         .unwrap_or_else(|| "finished".to_owned());
     let key = aqueduct_core::split_run_id(key).0;
     Ok(format!("signal {name} sent to {key} ({state})\n"))
+}
+
+/// Where `aqueduct server` listens: `--listen`, or loopback on the default port. Anything but loopback
+/// needs `--listen-anywhere` until the server has authentication (ADR 0038).
+pub(crate) fn listen_address(args: &[String]) -> Result<std::net::SocketAddr, String> {
+    let mut address = std::net::SocketAddr::from(([127, 0, 0, 1], aqueduct_server::DEFAULT_PORT));
+    let mut anywhere = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--listen" => {
+                let text = rest.next().ok_or("--listen needs an address")?;
+                address = text.parse().map_err(|_| {
+                    format!("--listen needs an address like 127.0.0.1:7470, not `{text}`")
+                })?;
+            }
+            "--listen-anywhere" => anywhere = true,
+            other => return Err(format!("unknown option `{other}`")),
+        }
+    }
+    if !aqueduct_server::is_loopback(&address) && !anywhere {
+        return Err(format!(
+            "{address} is not a loopback address, and the server has no authentication yet: anyone who can reach it can start, signal and cancel runs. Pass --listen-anywhere to serve it anyway"
+        ));
+    }
+    Ok(address)
+}
+
+/// Serves a data directory until Ctrl-C.
+fn server(dir: &Path, args: &[String]) -> Result<String, String> {
+    let address = listen_address(args)?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let registry = Registry::open(dir).map_err(|e| e.to_string())?;
+    let engine = registry
+        .deploy(aqueduct_engine::embedded::Engine::builder(dir))
+        .map_err(|e| e.to_string())?
+        .open()
+        .map_err(|e| e.to_string())?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|e| format!("cannot listen on {address}: {e}"))?;
+        eprintln!(
+            "serving {} on http://{} (gRPC and HTTP/JSON); Ctrl-C or SIGTERM stops",
+            dir.display(),
+            listener.local_addr().map_err(|e| e.to_string())?
+        );
+        // Ctrl-C, or SIGTERM (how service managers and containers stop a process).
+        let stop = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                match signal(SignalKind::terminate()) {
+                    Ok(mut terminate) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {}
+                            _ = terminate.recv() => {}
+                        }
+                    }
+                    Err(_) => {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        };
+        aqueduct_server::serve(std::sync::Arc::new(engine), listener, stop)
+            .await
+            .map_err(|e| e.to_string())
+    })?;
+    Ok("stopped\n".to_owned())
 }
 
 /// A procedure's lints, one warning per line (empty if it has none).

@@ -29,6 +29,11 @@ pub trait StateStore {
         Ok(self.load()?.runs.remove(key))
     }
 
+    /// The run ids of every run saved in the last checkpoint, in order.
+    fn run_ids(&mut self) -> Result<Vec<String>, StorageError> {
+        Ok(self.load()?.runs.into_keys().collect())
+    }
+
     /// The generations of a run key saved in the last checkpoint: its run ids are the key itself
     /// (generation 0) and `<key>\0<generation>` (see `aqueduct_core::run_id`).
     fn generations(&mut self, key: &str) -> Result<Vec<u32>, StorageError> {
@@ -156,6 +161,18 @@ impl StateStore for RedbStateStore {
         txn.commit()
             .map_err(|e| StorageError::SyncFailed(e.to_string()))?;
         Ok(())
+    }
+
+    fn run_ids(&mut self) -> Result<Vec<String>, StorageError> {
+        use redb::{ReadableDatabase, ReadableTable};
+        let txn = self.db.begin_read().map_err(io)?;
+        let table = txn.open_table(RUNS).map_err(io)?;
+        let mut ids = Vec::new();
+        for row in table.iter().map_err(io)? {
+            let (id, _) = row.map_err(io)?;
+            ids.push(id.value().to_owned());
+        }
+        Ok(ids)
     }
 
     fn generations(&mut self, key: &str) -> Result<Vec<u32>, StorageError> {

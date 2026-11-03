@@ -23,6 +23,7 @@ aqueduct-sdk = { path = "crates/aqueduct-sdk" }
 aqueduct-ai = { path = "crates/aqueduct-ai" }
 aqueduct-cli = { path = "crates/aqueduct-cli" }
 aqueduct-protocol = { path = "crates/aqueduct-protocol" }
+aqueduct-server = { path = "crates/aqueduct-server" }
 aqueduct-registry = { path = "crates/aqueduct-registry" }
 crc32fast = "1"
 proptest = "1"
