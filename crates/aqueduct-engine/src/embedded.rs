@@ -103,6 +103,21 @@ pub struct Escalation {
     pub payload: Payload,
 }
 
+/// A run, as [`Engine::runs`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSummary {
+    /// The run id: the key for its first run, `<key>\0<generation>` after that.
+    pub run_id: String,
+    /// The workflow it runs.
+    pub workflow: String,
+    /// Its status.
+    pub status: Status,
+    /// The version it is pinned to, if any.
+    pub version: Option<String>,
+    /// Its journal's length, in entries.
+    pub entries: usize,
+}
+
 /// A snapshot of the engine's size, for operations and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineStats {
@@ -353,6 +368,7 @@ impl Builder {
             signals: BTreeMap::new(),
             updates: Vec::new(),
             answers: Vec::new(),
+            deferred: Vec::new(),
         };
         let redispatch = self.redispatch;
         let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
@@ -477,6 +493,24 @@ impl Engine {
             name: name.to_owned(),
             reply,
         })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// A key's latest run, as far as it is durable: its run id, and its state (status, input, output
+    /// and commands).
+    pub fn describe(&self, key: &str) -> Result<(String, RunState), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Describe {
+            key: key.to_owned(),
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// Every run, in run id order: those running and those that have ended.
+    pub fn runs(&self) -> Result<Vec<RunSummary>, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Runs { reply })?;
         answer.recv().map_err(|_| self.stopped())?
     }
 
@@ -626,6 +660,13 @@ enum Request {
         name: String,
         reply: Sender<Result<Payload, EngineError>>,
     },
+    Describe {
+        key: String,
+        reply: Sender<Result<(String, RunState), EngineError>>,
+    },
+    Runs {
+        reply: Sender<Result<Vec<RunSummary>, EngineError>>,
+    },
     Resolve {
         key: String,
         cmd: CommandIndex,
@@ -677,6 +718,8 @@ struct Processor {
     updates: Vec<(String, CommandIndex, AnswerSender)>,
     /// Answers to send after the next flush, once what they reflect is durable.
     answers: Vec<(AnswerSender, Result<Payload, EngineError>)>,
+    /// Other replies to send after the next flush, for the same reason.
+    deferred: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 /// Where the answer to an update or a query goes.
@@ -871,6 +914,39 @@ impl Processor {
                 };
                 self.answers.push((reply, answer));
             }
+            Request::Describe { key, reply } => {
+                let answer = match self.partition.latest(&key).map_err(|e| e.to_string())? {
+                    Some(id) => match self.partition.lookup_run(&id).map_err(|e| e.to_string())? {
+                        Some(state) => Ok((id, state)),
+                        None => Err(EngineError::UnknownRun(key)),
+                    },
+                    None => Err(EngineError::UnknownRun(key)),
+                };
+                self.deferred.push(Box::new(move || {
+                    let _ = reply.send(answer);
+                }));
+            }
+            Request::Runs { reply } => {
+                let mut runs = Vec::new();
+                for id in self.partition.run_ids().map_err(|e| e.to_string())? {
+                    let state = match self.partition.run(&id) {
+                        Some(run) => Some(run.state().clone()),
+                        None => self.partition.lookup_run(&id).map_err(|e| e.to_string())?,
+                    };
+                    if let Some(state) = state {
+                        runs.push(RunSummary {
+                            run_id: id,
+                            workflow: state.workflow().to_owned(),
+                            status: state.status(),
+                            version: state.version().map(str::to_owned),
+                            entries: state.len(),
+                        });
+                    }
+                }
+                self.deferred.push(Box::new(move || {
+                    let _ = reply.send(Ok(runs));
+                }));
+            }
             Request::StepResult { key, cmd, outcome } => {
                 self.partition
                     .step_result(&key, cmd, outcome)
@@ -917,6 +993,9 @@ impl Processor {
     fn answer_updates(&mut self) -> Result<(), PartitionError> {
         for (reply, answer) in self.answers.drain(..) {
             let _ = reply.send(answer);
+        }
+        for reply in self.deferred.drain(..) {
+            reply();
         }
         let mut waiting = Vec::new();
         for (run, cmd, reply) in std::mem::take(&mut self.updates) {

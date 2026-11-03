@@ -1214,6 +1214,14 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         self.evict();
     }
 
+    /// The run ids of every run: those in memory and those only in the state store (finished runs
+    /// unloaded after a checkpoint), in order.
+    pub fn run_ids(&mut self) -> Result<Vec<String>, PartitionError> {
+        let mut ids: BTreeSet<String> = self.runs.keys().cloned().collect();
+        ids.extend(self.state.run_ids()?);
+        Ok(ids.into_iter().collect())
+    }
+
     /// The state of a key's latest run, from memory or, for an unloaded finished run, from the state
     /// store.
     pub fn lookup(&mut self, key: &str) -> Result<Option<RunState>, PartitionError> {

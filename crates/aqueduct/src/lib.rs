@@ -54,7 +54,7 @@ pub mod registry {
 pub mod embedded {
     pub use aqueduct_core::AgentResponse;
     pub use aqueduct_engine::embedded::{
-        Attempt, Builder, Engine, EngineError, EngineStats, Escalation, RunResult,
+        Attempt, Builder, Engine, EngineError, EngineStats, Escalation, RunResult, RunSummary,
     };
     pub use aqueduct_engine::{
         AgentAttempt, AgentCall, AgentExecutor, Durability, Observer, StepEnd,
