@@ -34,6 +34,8 @@ commands:
   journal <dir> <key>                 a run's journal, one entry per line
   verify <dir>                        verify every run's hash chain and print its head
   export <dir> <key>                  a run's journal as JSON Lines (one object per entry)
+  check <procedure.star>              compile a procedure and report its lints: waits without a
+                                      timeout, ignored results; recursion does not compile (ADR 0037)
   replay <dir> <key> <procedure.star> replay a run against a procedure and report divergence
   counterfactual <dir> <procedure.star> (<key>... | --workflow <name>) [--stubs <file.json>]
                                       replay past runs against a new procedure version, answering it
@@ -133,6 +135,20 @@ pub fn run(args: &[String]) -> Result<String, String> {
             Path::new(arg(2, "procedure file")?),
             &args[3..],
         ),
+        Some("check") => {
+            let file = Path::new(arg(1, "procedure file")?);
+            let source =
+                std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+            let name = file.file_name().map_or("procedure.star".into(), |n| {
+                n.to_string_lossy().into_owned()
+            });
+            let procedure = Procedure::compile(&name, &source).map_err(|e| e.to_string())?;
+            Ok(format!(
+                "{name} compiles: version {}\n{}",
+                procedure.version(),
+                lint_report(&procedure)
+            ))
+        }
         Some("versions") => versions(&args[1..]),
         Some("keys") => keys(&args[1..]),
         Some("mcp") => {
@@ -271,6 +287,15 @@ fn signal(
         .unwrap_or_else(|| "finished".to_owned());
     let key = aqueduct_core::split_run_id(key).0;
     Ok(format!("signal {name} sent to {key} ({state})\n"))
+}
+
+/// A procedure's lints, one warning per line (empty if it has none).
+pub(crate) fn lint_report(procedure: &Procedure) -> String {
+    procedure
+        .lints()
+        .iter()
+        .map(|lint| format!("warning: {lint}\n"))
+        .collect()
 }
 
 /// Loads a data directory with the registry's procedures, which answer queries and updates.
@@ -809,7 +834,12 @@ fn versions(args: &[String]) -> Result<String, String> {
             let id = registry
                 .register(workflow, &source, provenance)
                 .map_err(err)?;
-            Ok(format!("registered {workflow} version {id} (draft)\n"))
+            let lints = Procedure::compile(&format!("{workflow}.star"), &source)
+                .map(|procedure| lint_report(&procedure))
+                .unwrap_or_default();
+            Ok(format!(
+                "registered {workflow} version {id} (draft)\n{lints}"
+            ))
         }
         "propose" => {
             let (workflow, id) = (at(1, "workflow")?, at(2, "version")?);

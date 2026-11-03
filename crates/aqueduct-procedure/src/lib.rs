@@ -40,6 +40,11 @@
 //! script is suspended. Because the interpreter has no clock, randomness, file system, network or
 //! `load`, the same journal always produces the same commands.
 //!
+//! A procedure is checked when it compiles ([`check`], ADR 0037): recursion is refused, so every
+//! activation ends, and lints (waits without a timeout, ignored results) are kept in
+//! [`Procedure::lints`]. Its top level is evaluated once and frozen; activations call the frozen `run`
+//! under a statement budget, a heap limit, a call stack limit and a wall-clock watchdog.
+//!
 //! ```
 //! use aqueduct_core::{Command, Payload, RunState, Decider, start};
 //! use aqueduct_procedure::Procedure;
@@ -61,12 +66,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod check;
+
 use std::cell::RefCell;
 
 use aqueduct_core::{Command, Decider, Payload, RunView, StepOutcome};
 use starlark::PrintHandler;
 use starlark::codemap::FileSpanRef;
-use starlark::environment::{Globals, GlobalsBuilder, Module};
+use starlark::environment::{FrozenModule, GlobalsBuilder, Module};
 use starlark::eval::{BeforeStmtFunc, BeforeStmtFuncDyn, Evaluator};
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
@@ -85,6 +92,10 @@ pub struct Limits {
     pub max_heap_bytes: usize,
     /// Call stack depth.
     pub max_callstack: usize,
+    /// Wall-clock time per activation (the watchdog), if limited. Exceeding it parks the run; the
+    /// parking is journaled, so replay stays deterministic. `None` in simulations, where only the
+    /// deterministic limits may apply.
+    pub max_wall_time: Option<std::time::Duration>,
 }
 
 impl Default for Limits {
@@ -93,6 +104,7 @@ impl Default for Limits {
             max_statements: 100_000,
             max_heap_bytes: 64 << 20,
             max_callstack: 50,
+            max_wall_time: Some(std::time::Duration::from_secs(5)),
         }
     }
 }
@@ -117,11 +129,17 @@ pub fn version_of(source: &str) -> String {
 }
 
 /// A compiled procedure: a decider backed by a hermetic Starlark interpreter.
+///
+/// It is parsed and its top level evaluated once, when it is compiled; the module is then frozen, and
+/// every activation calls its frozen `run` (ADR 0037). Globals are immutable inside `run`.
 pub struct Procedure {
     name: String,
     source: String,
-    globals: Globals,
     limits: Limits,
+    /// `run`, in the frozen module (which it keeps alive).
+    run: starlark::values::OwnedFrozenValue,
+    /// What static checks found that does not stop the procedure from compiling.
+    lints: Vec<check::Lint>,
 }
 
 impl std::fmt::Debug for Procedure {
@@ -156,38 +174,48 @@ impl Procedure {
         source: &str,
         limits: Limits,
     ) -> Result<Procedure, ProcedureError> {
-        let procedure = Procedure {
-            name: name.to_owned(),
-            source: source.to_owned(),
-            globals: GlobalsBuilder::standard().with(aqueduct_functions).build(),
-            limits,
-        };
         let error = |message: String| ProcedureError {
             name: name.to_owned(),
             message,
         };
-        let ast = procedure.parse().map_err(error)?;
+        let globals = GlobalsBuilder::standard().with(aqueduct_functions).build();
+        let ast = parse(name, source).map_err(error)?;
+        let lints = check::check(&ast, &globals).map_err(error)?;
         let installed = Installed::new(Activation::default());
-        let checked = Module::with_temp_heap(|module| -> Result<(), String> {
-            let mut eval = procedure.evaluator(&module)?;
-            eval.eval_module(ast, &procedure.globals)
-                .map_err(|e| e.to_string())?;
+        let frozen = Module::with_temp_heap(|module| -> Result<FrozenModule, String> {
+            let mut eval = evaluator(&module, &limits)?;
+            eval.eval_module(ast, &globals).map_err(|e| e.to_string())?;
+            drop(eval);
             let run = module
                 .get("run")
                 .ok_or("the procedure does not define `run(input)`")?;
             if run.get_type() != "function" {
                 return Err("`run` is not a function".into());
             }
-            Ok(())
+            module.freeze().map_err(|e| format!("{e:?}"))
         });
         let activation = installed.finish();
-        checked.map_err(error)?;
+        let frozen = frozen.map_err(error)?;
         if !activation.commands.is_empty() {
             return Err(error(
                 "engine functions may only be called inside `run`".into(),
             ));
         }
-        Ok(procedure)
+        let run = frozen.get("run").map_err(|e| error(e.to_string()))?;
+        Ok(Procedure {
+            name: name.to_owned(),
+            source: source.to_owned(),
+            limits,
+            run,
+            lints,
+        })
+    }
+
+    /// What the static checks found that does not stop the procedure from compiling: waits without a
+    /// timeout, ignored results, updates never answered (ADR 0037). Each can be silenced on its line
+    /// with `# starlark-lint-disable <name>`.
+    pub fn lints(&self) -> &[check::Lint] {
+        &self.lints
     }
 
     /// The procedure's file name.
@@ -195,41 +223,21 @@ impl Procedure {
         &self.name
     }
 
-    fn parse(&self) -> Result<AstModule, String> {
-        let dialect = Dialect {
-            enable_load: false,
-            enable_f_strings: true,
-            ..Dialect::Standard
-        };
-        AstModule::parse(&self.name, self.source.clone(), &dialect).map_err(|e| e.to_string())
-    }
-
-    fn evaluator<'v, 'a>(&self, module: &'a Module<'v>) -> Result<Evaluator<'v, 'a, 'a>, String> {
-        let mut eval = Evaluator::new(module);
-        eval.set_print_handler(&SilentPrint);
-        eval.set_max_callstack_size(self.limits.max_callstack)
-            .map_err(|e| e.to_string())?;
-        eval.set_max_heap_size(self.limits.max_heap_bytes)
-            .map_err(|e| e.to_string())?;
-        // The statement hook is the only way to bound execution in starlark-rust 0.14; it is marked
-        // as debugger API (ADR 0008, consequences).
-        eval.before_stmt_for_dap(BeforeStmtFunc::from_dyn(Box::new(Budget {
-            remaining: self.limits.max_statements,
-        })));
-        Ok(eval)
-    }
-
     /// Runs `run(input)` once against the installed activation.
     fn activate(&self, input: &Payload) -> Result<Payload, ScriptError> {
         let input: serde_json::Value = serde_json::from_slice(input.as_bytes())
             .map_err(|e| ScriptError::Other(format!("the run's input is not JSON: {e}")))?;
-        let ast = self.parse().map_err(ScriptError::Other)?;
         Module::with_temp_heap(|module| {
-            let mut eval = self.evaluator(&module).map_err(ScriptError::Other)?;
-            eval.eval_module(ast, &self.globals).map_err(classify)?;
-            let run = module
-                .get("run")
-                .ok_or_else(|| ScriptError::Other("`run` disappeared".into()))?;
+            let mut eval = evaluator(&module, &self.limits).map_err(ScriptError::Other)?;
+            // The frozen module outlives the activation (the procedure holds it); the reference makes
+            // that explicit to the heap.
+            module.frozen_heap().add_reference(self.run.owner());
+            let run = self
+                .run
+                .value()
+                .unpack_frozen()
+                .map(|run| module.heap().alloc(run))
+                .ok_or_else(|| ScriptError::Other("`run` is not frozen".into()))?;
             let input = module.heap().alloc(input);
             with_activation(|act| {
                 act.in_run = true;
@@ -296,6 +304,37 @@ impl Procedure {
         commands.extend(terminal);
         (commands, activation.published)
     }
+}
+
+fn parse(name: &str, source: &str) -> Result<AstModule, String> {
+    let dialect = Dialect {
+        enable_load: false,
+        enable_f_strings: true,
+        ..Dialect::Standard
+    };
+    AstModule::parse(name, source.to_owned(), &dialect).map_err(|e| e.to_string())
+}
+
+fn evaluator<'v, 'a>(
+    module: &'a Module<'v>,
+    limits: &Limits,
+) -> Result<Evaluator<'v, 'a, 'a>, String> {
+    let mut eval = Evaluator::new(module);
+    eval.set_print_handler(&SilentPrint);
+    eval.set_max_callstack_size(limits.max_callstack)
+        .map_err(|e| e.to_string())?;
+    eval.set_max_heap_size(limits.max_heap_bytes)
+        .map_err(|e| e.to_string())?;
+    // The statement hook is the only way to bound execution in starlark-rust 0.14; it is marked as
+    // debugger API (ADR 0008, consequences). Recursion is rejected before a procedure compiles
+    // (ADR 0037), so the budget is a second line, not the only one.
+    eval.before_stmt_for_dap(BeforeStmtFunc::from_dyn(Box::new(Budget {
+        remaining: limits.max_statements,
+        deadline: limits
+            .max_wall_time
+            .map(|limit| std::time::Instant::now() + limit),
+    })));
+    Ok(eval)
 }
 
 /// Why `run` stopped, when it stopped because of an engine function.
@@ -761,9 +800,11 @@ impl PrintHandler for SilentPrint {
     }
 }
 
-/// Stops evaluation after a fixed number of statements.
+/// Stops evaluation after a fixed number of statements, or once its wall-clock deadline has passed (the
+/// watchdog).
 struct Budget {
     remaining: u64,
+    deadline: Option<std::time::Instant>,
 }
 
 impl<'e> BeforeStmtFuncDyn<'e> for Budget {
@@ -779,6 +820,15 @@ impl<'e> BeforeStmtFuncDyn<'e> for Budget {
             )));
         }
         self.remaining -= 1;
+        // The clock is read every 1,024 statements: often enough, and cheap.
+        if self.remaining.is_multiple_of(1_024)
+            && let Some(deadline) = self.deadline
+            && std::time::Instant::now() >= deadline
+        {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "the activation exceeded its wall-clock limit (the watchdog)"
+            )));
+        }
         Ok(())
     }
 }

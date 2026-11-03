@@ -57,7 +57,8 @@ Options considered:
 
 - **Termination is not guaranteed by the language in starlark-rust.** It allows recursion, unlike the
   Starlark specification. The statement budget relies on `Evaluator::before_stmt_for_dap`, which is marked
-  as debugger API, not public API. Before phase 2 we either get a supported fuel API upstream, or reject
+  as debugger API, not public API. (Phase 2 rejects recursion on the syntax tree, adds the watchdog and
+  caches the frozen module: ADR 0037.) Before phase 2 we either get a supported fuel API upstream, or reject
   recursion with our own check on the syntax tree. The budget also does not count work inside a single
   built-in call (for example `sum(range(10**9))`); the heap limit bounds memory but not time, so production
   also needs a wall-clock watchdog whose expiry parks the run. The parking is journaled, so replay stays
