@@ -255,6 +255,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -279,6 +280,22 @@ dependencies = [
  "proptest",
  "redb",
  "thiserror",
+]
+
+[[package]]
+name = "aqueduct-worker"
+version = "0.0.0"
+dependencies = [
+ "aqueduct-core",
+ "aqueduct-engine",
+ "aqueduct-procedure",
+ "aqueduct-protocol",
+ "aqueduct-server",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

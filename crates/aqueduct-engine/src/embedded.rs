@@ -202,9 +202,19 @@ pub struct Builder {
     observer: Option<Arc<dyn Observer>>,
     agents: Option<Arc<dyn AgentExecutor>>,
     activations: Vec<(String, String)>,
+    remote: Option<Duration>,
 }
 
 impl Builder {
+    /// Hands every step without a function of its own to remote step workers (ADR 0038), through the
+    /// engine's [`StepQueue`](crate::queue::StepQueue), with leases of `lease`. A step that no worker
+    /// implements waits until one connects. Without this, such a step is retried as a deployment
+    /// error.
+    pub fn remote_steps(mut self, lease: Duration) -> Self {
+        self.remote = Some(lease);
+        self
+    }
+
     /// Sets the executor of agent calls (`aqueduct-ai` provides them for model providers). Without one,
     /// agent calls are retried until one is registered.
     pub fn agent_executor(mut self, executor: Arc<dyn AgentExecutor>) -> Self {
@@ -338,6 +348,10 @@ impl Builder {
         let (requests, inbox) = mpsc::channel::<Request>();
         let (jobs, job_inbox) = mpsc::channel::<Job>();
         let job_inbox = Arc::new(Mutex::new(job_inbox));
+        let local: std::collections::BTreeSet<String> = self.steps.keys().cloned().collect();
+        let queue = self
+            .remote
+            .map(|lease| Arc::new(crate::queue::StepQueue::new(lease)));
         let steps = Arc::new(self.steps);
         let workers = (0..self.workers)
             .map(|_| {
@@ -369,6 +383,7 @@ impl Builder {
             updates: Vec::new(),
             answers: Vec::new(),
             deferred: Vec::new(),
+            remote: queue.clone().map(|queue| (queue, local)),
         };
         let redispatch = self.redispatch;
         let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
@@ -376,6 +391,7 @@ impl Builder {
             requests,
             thread: Some(thread),
             workers,
+            queue,
         })
     }
 }
@@ -385,9 +401,41 @@ pub struct Engine {
     requests: Sender<Request>,
     thread: Option<JoinHandle<Result<(), String>>>,
     workers: Vec<JoinHandle<()>>,
+    queue: Option<Arc<crate::queue::StepQueue>>,
 }
 
 impl Engine {
+    /// The queue of steps for remote workers, if the engine has remote steps
+    /// ([`Builder::remote_steps`]).
+    pub fn step_queue(&self) -> Option<&Arc<crate::queue::StepQueue>> {
+        self.queue.as_ref()
+    }
+
+    /// Records the result of an attempt of a step that a remote worker executed. Like a local step's
+    /// result, it is recorded at most once: a late or repeated one is dropped. Results are not
+    /// acknowledged; one that is lost is made up for by the step being offered again.
+    pub fn step_result(
+        &self,
+        run: &str,
+        cmd: CommandIndex,
+        attempt: Attempt,
+    ) -> Result<(), EngineError> {
+        let (key, request) = (run.to_owned(), attempt);
+        self.send(match request {
+            Attempt::Completed(result) => Request::StepResult {
+                key,
+                cmd,
+                outcome: StepOutcome::Completed(result),
+            },
+            Attempt::Fail(error) => Request::StepResult {
+                key,
+                cmd,
+                outcome: StepOutcome::Failed(error),
+            },
+            Attempt::Retry(error) => Request::AttemptFailed { key, cmd, error },
+        })
+    }
+
     /// Starts configuring an engine whose data lives in `dir`.
     pub fn builder(dir: impl Into<PathBuf>) -> Builder {
         Builder {
@@ -404,6 +452,7 @@ impl Engine {
             observer: None,
             agents: None,
             activations: Vec::new(),
+            remote: None,
         }
     }
 
@@ -720,6 +769,11 @@ struct Processor {
     answers: Vec<(AnswerSender, Result<Payload, EngineError>)>,
     /// Other replies to send after the next flush, for the same reason.
     deferred: Vec<Box<dyn FnOnce() + Send>>,
+    /// With remote steps: the queue, and the steps that have a function here.
+    remote: Option<(
+        Arc<crate::queue::StepQueue>,
+        std::collections::BTreeSet<String>,
+    )>,
 }
 
 /// Where the answer to an update or a query goes.
@@ -1024,6 +1078,20 @@ impl Processor {
                 Outbound::Started { key } => {
                     for reply in self.starts.remove(&key).unwrap_or_default() {
                         let _ = reply.send(Ok(()));
+                    }
+                }
+                Outbound::Dispatch {
+                    key,
+                    cmd,
+                    name,
+                    input,
+                } if self
+                    .remote
+                    .as_ref()
+                    .is_some_and(|(_, local)| !local.contains(&name)) =>
+                {
+                    if let Some((queue, _)) = &self.remote {
+                        queue.offer(&key, cmd, &name, input, queue.now_ms());
                     }
                 }
                 Outbound::Dispatch {
