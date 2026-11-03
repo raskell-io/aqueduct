@@ -231,6 +231,8 @@ pub struct Builder {
     remote: Option<Duration>,
     /// Whether some workflow is decided remotely, and the leases of its activations.
     remote_workflows: Option<Duration>,
+    /// Remote steps routed to named task queues, by step name.
+    routes: BTreeMap<String, String>,
 }
 
 impl Builder {
@@ -240,6 +242,14 @@ impl Builder {
     /// error.
     pub fn remote_steps(mut self, lease: Duration) -> Self {
         self.remote = Some(lease);
+        self
+    }
+
+    /// Routes remote step `step` to the named task queue `queue` (ADR 0040): it goes to workers that
+    /// serve that queue, and push endpoints configured for it. Without a route, a step waits in the
+    /// queue of its own name.
+    pub fn step_route(mut self, step: &str, queue: &str) -> Self {
+        self.routes.insert(step.to_owned(), queue.to_owned());
         self
     }
 
@@ -407,9 +417,10 @@ impl Builder {
         let (jobs, job_inbox) = mpsc::channel::<Job>();
         let job_inbox = Arc::new(Mutex::new(job_inbox));
         let local: std::collections::BTreeSet<String> = self.steps.keys().cloned().collect();
+        let routes = std::mem::take(&mut self.routes);
         let queue = self
             .remote
-            .map(|lease| Arc::new(crate::queue::StepQueue::new(lease)));
+            .map(|lease| Arc::new(crate::queue::StepQueue::with_routes(lease, routes)));
         let activation_queue = self
             .remote_workflows
             .map(|lease| Arc::new(crate::activations::ActivationQueue::new(lease)));
@@ -541,6 +552,7 @@ impl Engine {
             activations: Vec::new(),
             remote: None,
             remote_workflows: None,
+            routes: BTreeMap::new(),
         }
     }
 

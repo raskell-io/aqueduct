@@ -22,6 +22,11 @@ await worker.run();
   them from 1.
 - At most `capacity` steps run at once; `worker.stop()` makes `run()` resolve.
 
+**As a push endpoint** (for serverless platforms; ADR 0040), the same steps answer the server's
+requests instead of polling: `worker.handlePush(body)` turns a request body into the status and answer to send back, for
+use in a function handler, and `worker.servePush(port)` serves it over HTTP. Configure the server to push the steps'
+queue to it.
+
 The source is written with erasable syntax only (`tsconfig.json` checks it with `erasableSyntaxOnly`), so
 there is no build step. The worker uses the step-worker protocol's HTTP long polling
 ([docs/protocol.md](../../docs/protocol.md), section 3). It passes the

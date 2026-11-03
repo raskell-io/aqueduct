@@ -5,8 +5,8 @@
 
 import { Failure, Retry, Worker } from "./src/index.ts";
 
-const url = process.env.AQUEDUCT_URL;
-if (url === undefined) throw new Error("AQUEDUCT_URL is not set");
+const url = process.env.AQUEDUCT_URL ?? "";
+const pushPort = process.env.AQUEDUCT_PUSH_PORT;
 
 const worker = new Worker({ name: "conformance-typescript", url, capacity: 8, pollMs: 1_000 });
 
@@ -37,5 +37,10 @@ worker
     return ms;
   });
 
-process.on("SIGTERM", () => worker.stop());
-await worker.run();
+if (pushPort !== undefined) {
+  // A push endpoint: the server posts each invocation.
+  await worker.servePush(Number(pushPort));
+} else {
+  process.on("SIGTERM", () => worker.stop());
+  await worker.run();
+}

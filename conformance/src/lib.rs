@@ -27,6 +27,10 @@ pub enum Transport {
     RemoteWorkflows,
     /// Implemented by a worker started with this shell command, with `AQUEDUCT_URL` set.
     Command(String),
+    /// Implemented by a push endpoint (ADR 0040) started with this shell command, which listens on
+    /// `127.0.0.1:$AQUEDUCT_PUSH_PORT`; the steps are routed to the named queue `conformance`, which is
+    /// pushed to it.
+    Push(String),
 }
 
 impl std::fmt::Display for Transport {
@@ -38,6 +42,7 @@ impl std::fmt::Display for Transport {
                 f.write_str("aqueduct-worker over gRPC, workflows decided remotely")
             }
             Transport::Command(command) => write!(f, "`{command}`"),
+            Transport::Push(command) => write!(f, "`{command}` as a push endpoint"),
         }
     }
 }
@@ -160,7 +165,36 @@ fn procedure(scenario: &Scenario) -> Result<Procedure, String> {
         .map_err(|e| e.to_string())
 }
 
-fn engine(dir: &std::path::Path, transport: &Transport) -> Result<Engine, String> {
+/// The named queue the steps are routed to over gRPC and to push endpoints.
+const QUEUE: &str = "conformance";
+
+/// The server's configuration for a transport: a named queue for the steps, and for a push endpoint,
+/// the endpoint.
+fn config(transport: &Transport, push_port: u16) -> aqueduct_server::Config {
+    let mut config = aqueduct_server::Config::default();
+    if matches!(transport, Transport::RustGrpc | Transport::Push(_)) {
+        config.queues.insert(
+            QUEUE.to_owned(),
+            STEPS.iter().map(|s| (*s).to_owned()).collect(),
+        );
+    }
+    if let Transport::Push(_) = transport {
+        config.push.push(aqueduct_server::PushEndpoint {
+            queue: QUEUE.to_owned(),
+            url: format!("http://127.0.0.1:{push_port}/"),
+            concurrency: 8,
+            timeout_ms: 10_000,
+            headers: std::collections::BTreeMap::new(),
+        });
+    }
+    config
+}
+
+fn engine(
+    dir: &std::path::Path,
+    transport: &Transport,
+    config: &aqueduct_server::Config,
+) -> Result<Engine, String> {
     let mut builder: Builder = Engine::builder(dir).default_retry_policy(RetryPolicy {
         max_attempts: 10,
         initial_backoff_ms: 10,
@@ -187,7 +221,7 @@ fn engine(dir: &std::path::Path, transport: &Transport) -> Result<Engine, String
                 )
             })
         }),
-        _ => builder.remote_steps(Duration::from_secs(10)),
+        _ => config.apply(builder.remote_steps(Duration::from_secs(10)))?,
     };
     builder.open().map_err(|e| e.to_string())
 }
@@ -201,7 +235,13 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
         RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    let engine = Arc::new(engine(&dir, transport)?);
+    // A free port for a push endpoint.
+    let push_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map_err(|e| e.to_string())?
+        .port();
+    let config = config(transport, push_port);
+    let engine = Arc::new(engine(&dir, transport, &config)?);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| e.to_string())?;
@@ -209,11 +249,12 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
         "http://{}",
         listener.local_addr().map_err(|e| e.to_string())?
     );
-    let server = tokio::spawn(aqueduct_server::serve(
-        Arc::clone(&engine),
-        listener,
-        std::future::pending(),
-    ));
+    let server = {
+        let (engine, config) = (Arc::clone(&engine), config.clone());
+        tokio::spawn(async move {
+            aqueduct_server::serve_with(engine, listener, &config, std::future::pending()).await
+        })
+    };
 
     // The worker under test.
     let mut child = None;
@@ -222,7 +263,9 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
         Transport::InProcess => {}
         Transport::RustGrpc | Transport::RemoteWorkflows => {
             let mut built = STEPS.iter().fold(
-                aqueduct_worker::Worker::new("conformance").capacity(8),
+                aqueduct_worker::Worker::new("conformance")
+                    .capacity(8)
+                    .queue(QUEUE),
                 |worker, name| {
                     worker.step(name, |i| {
                         match step(
@@ -250,16 +293,35 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
             let url = url.clone();
             worker = Some(tokio::spawn(async move { built.run(&url).await }));
         }
-        Transport::Command(command) => {
+        Transport::Command(command) | Transport::Push(command) => {
+            let mut process = tokio::process::Command::new("sh");
+            process.arg("-c").arg(command).env("AQUEDUCT_URL", &url);
+            // Only a push endpoint is told its port: a worker that has one serves pushes.
+            if let Transport::Push(_) = transport {
+                process.env("AQUEDUCT_PUSH_PORT", push_port.to_string());
+            } else {
+                process.env_remove("AQUEDUCT_PUSH_PORT");
+            }
             child = Some(
-                tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .env("AQUEDUCT_URL", &url)
+                process
                     .kill_on_drop(true)
                     .spawn()
                     .map_err(|e| format!("cannot start `{command}`: {e}"))?,
             );
+            if let Transport::Push(_) = transport {
+                // The endpoint must listen before steps are pushed to it.
+                let ready = async {
+                    while tokio::net::TcpStream::connect(("127.0.0.1", push_port))
+                        .await
+                        .is_err()
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(20), ready)
+                    .await
+                    .map_err(|_| format!("`{command}` did not listen on {push_port}"))?;
+            }
         }
     }
 

@@ -40,6 +40,8 @@ pub struct Invocation {
 #[derive(Debug)]
 struct Entry {
     step: String,
+    /// The queue it waits in: the step's route, by default its own name.
+    queue: String,
     input: Payload,
     /// Attempts offered so far.
     attempts: u32,
@@ -69,17 +71,31 @@ pub struct StepQueue {
     ready: Condvar,
     lease_ms: u64,
     clock: Instant,
+    /// Steps routed to named task queues (ADR 0040), by step name.
+    routes: BTreeMap<String, String>,
 }
 
 impl StepQueue {
-    /// A queue whose leases last `lease`.
+    /// A queue whose leases last `lease`, where every step waits in the queue of its own name.
     pub fn new(lease: Duration) -> StepQueue {
+        StepQueue::with_routes(lease, BTreeMap::new())
+    }
+
+    /// A queue whose leases last `lease`, with steps routed to named task queues: `routes` maps step
+    /// names to queue names; a step without a route waits in the queue of its own name.
+    pub fn with_routes(lease: Duration, routes: BTreeMap<String, String>) -> StepQueue {
         StepQueue {
             inner: Mutex::new(Inner::default()),
             ready: Condvar::new(),
             lease_ms: u64::try_from(lease.as_millis()).unwrap_or(u64::MAX).max(1),
             clock: Instant::now(),
+            routes,
         }
+    }
+
+    /// The queue a step waits in.
+    pub fn queue_of<'a>(&'a self, step: &'a str) -> &'a str {
+        self.routes.get(step).map_or(step, String::as_str)
     }
 
     /// The queue's own clock, for callers without a simulated one: milliseconds since it was created.
@@ -114,8 +130,10 @@ impl StepQueue {
                 Some(_) => {}
             }
         }
+        let queue = self.queue_of(step).to_owned();
         let entry = inner.entries.entry(target.clone()).or_insert(Entry {
             step: step.to_owned(),
+            queue,
             input,
             attempts: 0,
             lease: None,
@@ -128,9 +146,16 @@ impl StepQueue {
         self.ready.notify_all();
     }
 
-    /// Takes up to `max` waiting invocations of the named steps for `worker`, leasing each until
-    /// `now_ms` plus the lease. Leases that have run out are offered again first.
-    pub fn take(&self, worker: &str, steps: &[String], max: usize, now_ms: u64) -> Vec<Invocation> {
+    /// Takes up to `max` waiting invocations from the named queues (a step's queue is its route, by
+    /// default its own name) for `worker`, leasing each until `now_ms` plus the lease. Leases that have
+    /// run out are offered again first.
+    pub fn take(
+        &self,
+        worker: &str,
+        queues: &[String],
+        max: usize,
+        now_ms: u64,
+    ) -> Vec<Invocation> {
         let mut inner = self.lock();
         Self::expire_locked(&mut inner, now_ms);
         let mut taken = Vec::new();
@@ -140,7 +165,7 @@ impl StepQueue {
                 && inner
                     .entries
                     .get(&target)
-                    .is_some_and(|e| e.lease.is_none() && steps.contains(&e.step));
+                    .is_some_and(|e| e.lease.is_none() && queues.contains(&e.queue));
             if !wanted {
                 if inner
                     .entries
@@ -180,13 +205,13 @@ impl StepQueue {
     pub fn wait_take(
         &self,
         worker: &str,
-        steps: &[String],
+        queues: &[String],
         max: usize,
         wait: Duration,
     ) -> Vec<Invocation> {
         let deadline = Instant::now() + wait;
         loop {
-            let taken = self.take(worker, steps, max, self.now_ms());
+            let taken = self.take(worker, queues, max, self.now_ms());
             let left = deadline.saturating_duration_since(Instant::now());
             if !taken.is_empty() || left.is_zero() || max == 0 {
                 return taken;
@@ -316,6 +341,21 @@ mod tests {
         q.release("gone");
         let again = q.take("other", &names(&["charge"]), 1, 1);
         assert_eq!(again[0].attempt, 2);
+    }
+
+    #[test]
+    fn steps_routed_to_a_named_queue_go_to_its_workers() {
+        let routes = [("charge".to_owned(), "billing".to_owned())].into();
+        let q = StepQueue::with_routes(Duration::from_millis(100), routes);
+        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 1, 0);
+        q.offer("r", CommandIndex(1), "ship", Payload::new(*b"2"), 1, 0);
+        // A worker that names the step but not its queue does not get it.
+        assert!(q.take("w", &names(&["charge"]), 10, 0).is_empty());
+        let billing = q.take("w", &names(&["billing"]), 10, 0);
+        assert_eq!(billing.len(), 1);
+        assert_eq!(billing[0].step, "charge");
+        // Unrouted steps keep the queue of their own name.
+        assert_eq!(q.take("w", &names(&["ship"]), 10, 0).len(), 1);
     }
 
     #[test]

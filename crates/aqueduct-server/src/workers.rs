@@ -36,7 +36,12 @@ impl Api {
 }
 
 /// Records a worker's result, if the queue still waits for it.
-fn record(engine: &Engine, queue: &StepQueue, id: &str, attempt: Attempt) -> Result<(), Failure> {
+pub(crate) fn record(
+    engine: &Engine,
+    queue: &StepQueue,
+    id: &str,
+    attempt: Attempt,
+) -> Result<(), Failure> {
     if let Some((run, cmd)) = queue.complete(id) {
         engine.step_result(&run, cmd, attempt)?;
     }
@@ -95,7 +100,10 @@ impl v1::workers_server::Workers for Api {
             hello.worker,
             SESSIONS.fetch_add(1, Ordering::Relaxed)
         );
-        let steps = Arc::new(hello.steps);
+        // The queues it takes from: those of its step names, and the named ones.
+        let mut queues = hello.steps;
+        queues.extend(hello.queues);
+        let steps = Arc::new(queues);
         let credit = Arc::new(AtomicU32::new(hello.capacity.max(1)));
         let closed = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(Notify::new());
@@ -190,7 +198,11 @@ async fn serve_invocations(
 #[derive(Deserialize)]
 struct Poll {
     worker: String,
+    #[serde(default)]
     steps: Vec<String>,
+    /// Named task queues, besides the queues of its step names.
+    #[serde(default)]
+    queues: Vec<String>,
     #[serde(default = "one")]
     max: usize,
     #[serde(default)]
@@ -204,11 +216,12 @@ fn one() -> usize {
 async fn http_poll(State(api): State<Api>, Body(poll): Body<Poll>) -> Result<Json<Value>, Failure> {
     let queue = api.queue()?;
     let wait = Duration::from_millis(poll.wait_ms).min(MAX_POLL_WAIT);
-    let taken = tokio::task::spawn_blocking(move || {
-        queue.wait_take(&poll.worker, &poll.steps, poll.max, wait)
-    })
-    .await
-    .unwrap_or_default();
+    let mut queues = poll.steps;
+    queues.extend(poll.queues);
+    let taken =
+        tokio::task::spawn_blocking(move || queue.wait_take(&poll.worker, &queues, poll.max, wait))
+            .await
+            .unwrap_or_default();
     let invocations: Vec<Value> = taken
         .into_iter()
         .map(|i| {

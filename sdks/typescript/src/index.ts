@@ -16,6 +16,10 @@
  * await worker.run();
  * ```
  *
+ * The same steps can be served as a **push endpoint** instead (ADR 0040): the server posts each
+ * invocation to it, which suits serverless platforms. `worker.handlePush(body)` turns a request body
+ * into the answer; `worker.servePush(port)` serves it with `node:http`.
+ *
  * A step may run more than once (a lease runs out, a result is lost), so it should be idempotent:
  * `invocation.idempotencyKey` is the same for every attempt of a step. Throwing `Failure` fails the
  * step for good; throwing `Retry`, or anything else, makes the server retry it by its retry policy.
@@ -102,6 +106,36 @@ export class Worker {
   /** Serves the steps until `stop` is called: `capacity` loops, each taking one step at a time. */
   async run(): Promise<void> {
     await Promise.all(Array.from({ length: this.capacity }, () => this.#loop()));
+  }
+
+  /** Answers one pushed invocation (a request body): the HTTP status and the answer's body. */
+  async handlePush(body: string): Promise<{ status: number; body: string }> {
+    let raw: RawInvocation;
+    try {
+      raw = JSON.parse(body);
+      if (typeof raw.invocation_id !== "string" || typeof raw.step !== "string") {
+        throw new Error("missing invocation_id or step");
+      }
+    } catch (error) {
+      return { status: 400, body: JSON.stringify({ error: `not an invocation: ${error}` }) };
+    }
+    return { status: 200, body: JSON.stringify(await this.#execute(raw)) };
+  }
+
+  /** Serves the steps as a push endpoint on `host:port` (every path); resolves when it is listening. */
+  async servePush(port: number, host = "127.0.0.1"): Promise<import("node:http").Server> {
+    const http = await import("node:http");
+    const server = http.createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", async () => {
+        const answer = await this.handlePush(Buffer.concat(chunks).toString("utf8"));
+        response.writeHead(answer.status, { "content-type": "application/json" });
+        response.end(answer.body);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(port, host, resolve));
+    return server;
   }
 
   async #post(path: string, body: unknown): Promise<any> {

@@ -45,11 +45,13 @@ commands:
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
-  server <dir> [--listen <address>] [--listen-anywhere]
+  server <dir> [--listen <address>] [--listen-anywhere] [--config <file.json>]
                                       serve the directory's approved procedures over gRPC and
                                       HTTP/JSON (protocol v1, draft; ADR 0038) on 127.0.0.1:7470;
                                       until there is authentication, an address other than loopback
-                                      needs --listen-anywhere. Ctrl-C or SIGTERM stops it
+                                      needs --listen-anywhere. Steps run on workers; the config
+                                      routes them to named queues and push endpoints (ADR 0040).
+                                      Ctrl-C or SIGTERM stops it
   mcp <dir> [--as <identity>] [--read-only]
                                       serve the Model Context Protocol on stdio, for agents: propose,
                                       validate and replay versions, start and inspect runs, resolve
@@ -295,14 +297,22 @@ fn signal(
     Ok(format!("signal {name} sent to {key} ({state})\n"))
 }
 
-/// Where `aqueduct server` listens: `--listen`, or loopback on the default port. Anything but loopback
-/// needs `--listen-anywhere` until the server has authentication (ADR 0038).
-pub(crate) fn listen_address(args: &[String]) -> Result<std::net::SocketAddr, String> {
+/// `aqueduct server`'s options: where it listens (`--listen`, or loopback on the default port; anything
+/// but loopback needs `--listen-anywhere` until the server has authentication, ADR 0038), and its
+/// configuration (`--config`, ADR 0040).
+fn server_options(
+    args: &[String],
+) -> Result<(std::net::SocketAddr, aqueduct_server::Config), String> {
     let mut address = std::net::SocketAddr::from(([127, 0, 0, 1], aqueduct_server::DEFAULT_PORT));
     let mut anywhere = false;
+    let mut config = aqueduct_server::Config::default();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
+            "--config" => {
+                let path = rest.next().ok_or("--config needs a file")?;
+                config = aqueduct_server::Config::read(Path::new(path))?;
+            }
             "--listen" => {
                 let text = rest.next().ok_or("--listen needs an address")?;
                 address = text.parse().map_err(|_| {
@@ -318,20 +328,19 @@ pub(crate) fn listen_address(args: &[String]) -> Result<std::net::SocketAddr, St
             "{address} is not a loopback address, and the server has no authentication yet: anyone who can reach it can start, signal and cancel runs. Pass --listen-anywhere to serve it anyway"
         ));
     }
-    Ok(address)
+    Ok((address, config))
 }
 
 /// Serves a data directory until Ctrl-C.
 fn server(dir: &Path, args: &[String]) -> Result<String, String> {
-    let address = listen_address(args)?;
+    let (address, config) = server_options(args)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let registry = Registry::open(dir).map_err(|e| e.to_string())?;
+    // Steps run on step workers and push endpoints (ADR 0038, ADR 0040).
+    let builder = aqueduct_engine::embedded::Engine::builder(dir)
+        .remote_steps(std::time::Duration::from_secs(30));
     let engine = registry
-        // Steps run on step workers, which connect to the server (ADR 0038).
-        .deploy(
-            aqueduct_engine::embedded::Engine::builder(dir)
-                .remote_steps(std::time::Duration::from_secs(30)),
-        )
+        .deploy(config.apply(builder)?)
         .map_err(|e| e.to_string())?
         .open()
         .map_err(|e| e.to_string())?;
@@ -367,7 +376,7 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
                 let _ = tokio::signal::ctrl_c().await;
             }
         };
-        aqueduct_server::serve(std::sync::Arc::new(engine), listener, stop)
+        aqueduct_server::serve_with(std::sync::Arc::new(engine), listener, &config, stop)
             .await
             .map_err(|e| e.to_string())
     })?;

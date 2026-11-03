@@ -61,12 +61,14 @@ description = "Documentation tests"
 run = "cargo test --workspace --doc"
 
 [tasks.conformance]
-description = "The step-worker conformance suite: in process, the Rust worker over gRPC, Python and TypeScript"
+description = "The worker conformance suite: in process, the Rust worker over gRPC, Python and TypeScript, polling and as push endpoints"
 run = """
 cargo build -p aqueduct-conformance
 cargo test -p aqueduct-conformance
 ./target/debug/aqueduct-conformance --worker "python3 sdks/python/conformance_worker.py"
 ./target/debug/aqueduct-conformance --worker "node sdks/typescript/conformance_worker.ts"
+./target/debug/aqueduct-conformance --push "python3 sdks/python/conformance_worker.py"
+./target/debug/aqueduct-conformance --push "node sdks/typescript/conformance_worker.ts"
 """
 
 [tasks.examples]

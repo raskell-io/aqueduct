@@ -94,6 +94,7 @@ pub struct Worker {
     capacity: u32,
     steps: BTreeMap<String, StepFn>,
     workflows: BTreeMap<String, WorkflowLogic>,
+    queues: Vec<String>,
 }
 
 impl Worker {
@@ -104,6 +105,7 @@ impl Worker {
             capacity: 4,
             steps: BTreeMap::new(),
             workflows: BTreeMap::new(),
+            queues: Vec::new(),
         }
     }
 
@@ -121,6 +123,13 @@ impl Worker {
         step: impl Fn(&Invocation) -> Outcome + Send + Sync + 'static,
     ) -> Worker {
         self.steps.insert(name.to_owned(), Arc::new(step));
+        self
+    }
+
+    /// Takes steps from the named task queue `queue` too (ADR 0040), besides the queues of its step
+    /// names. The server routes steps to queues; this worker must implement the steps routed there.
+    pub fn queue(mut self, queue: &str) -> Worker {
+        self.queues.push(queue.to_owned());
         self
     }
 
@@ -147,7 +156,7 @@ impl Worker {
             if self.steps.is_empty() {
                 return std::future::pending().await;
             }
-            serve_steps(url, &self.name, self.capacity, &self.steps).await
+            serve_steps(url, &self.name, self.capacity, &self.steps, &self.queues).await
         };
         let workflows = async {
             if self.workflows.is_empty() {
@@ -177,6 +186,7 @@ async fn serve_steps(
     name: &str,
     capacity: u32,
     steps: &BTreeMap<String, StepFn>,
+    queues: &[String],
 ) -> Result<(), WorkerError> {
     let mut client = WorkersClient::connect(url.to_owned())
         .await
@@ -187,6 +197,7 @@ async fn serve_steps(
             worker: name.to_owned(),
             steps: steps.keys().cloned().collect(),
             capacity,
+            queues: queues.to_vec(),
         })),
     };
     out.send(hello)
