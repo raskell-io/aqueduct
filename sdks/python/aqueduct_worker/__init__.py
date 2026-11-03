@@ -64,8 +64,16 @@ Step = Callable[[Any, Invocation], Any]
 class Worker:
     """A step worker: a set of steps by name, run against a server."""
 
-    def __init__(self, name: str, url: str, capacity: int = 4, poll_ms: int = 10_000):
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        capacity: int = 4,
+        poll_ms: int = 10_000,
+        token: Optional[str] = None,
+    ):
         self.name = name
+        self.token = token
         self.url = url.rstrip("/")
         self.capacity = max(1, capacity)
         self.poll_ms = poll_ms
@@ -135,10 +143,13 @@ class Worker:
             server.server_close()
 
     def _post(self, path: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        headers = {"content-type": "application/json"}
+        if self.token is not None:
+            headers["authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(
             self.url + path,
             data=json.dumps(body).encode(),
-            headers={"content-type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:

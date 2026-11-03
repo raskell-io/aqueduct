@@ -13,7 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aqueduct_worker import Failure, Retry, Worker  # noqa: E402
 
 worker = Worker(
-    "conformance-python", url=os.environ.get("AQUEDUCT_URL", ""), capacity=8, poll_ms=1_000
+    "conformance-python",
+    url=os.environ.get("AQUEDUCT_URL", ""),
+    capacity=8,
+    poll_ms=1_000,
+    token=os.environ.get("AQUEDUCT_TOKEN"),
 )
 
 

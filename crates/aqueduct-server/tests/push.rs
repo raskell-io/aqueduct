@@ -88,7 +88,14 @@ async fn steps_are_pushed_and_failed_requests_retried() {
     {
         let (engine, config) = (Arc::clone(&engine), config.clone());
         tokio::spawn(async move {
-            aqueduct_server::serve_with(engine, listener, &config, std::future::pending()).await
+            aqueduct_server::serve_with(
+                engine,
+                listener,
+                &config,
+                aqueduct_server::Security::none(),
+                std::future::pending(),
+            )
+            .await
         });
     }
 

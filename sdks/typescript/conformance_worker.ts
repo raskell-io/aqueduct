@@ -8,7 +8,13 @@ import { Failure, Retry, Worker } from "./src/index.ts";
 const url = process.env.AQUEDUCT_URL ?? "";
 const pushPort = process.env.AQUEDUCT_PUSH_PORT;
 
-const worker = new Worker({ name: "conformance-typescript", url, capacity: 8, pollMs: 1_000 });
+const worker = new Worker({
+  name: "conformance-typescript",
+  url,
+  capacity: 8,
+  pollMs: 1_000,
+  token: process.env.AQUEDUCT_TOKEN,
+});
 
 worker
   .step("conformance.echo", (value) => value)
