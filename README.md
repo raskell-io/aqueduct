@@ -225,8 +225,9 @@ curl -s 'localhost:7470/v1/runs/claim-7/result?timeout_ms=10000'
 **Tokens** turn authentication on: `aqueduct tokens create ./data --name billing-worker --permissions
 work` prints a secret once and stores only its hash; every route then needs its permission, and a
 hash-chained audit log records who did what, and every refused request (`aqueduct audit ./data`;
-[ADR 0041](docs/adr/0041-authentication.md)). The server has no TLS yet, so it still listens on loopback
-unless told otherwise. A procedure's steps run
+[ADR 0041](docs/adr/0041-authentication.md)). With `--tls-cert` and `--tls-key` it serves over TLS; it
+listens beyond loopback only with tokens and a certificate
+([ADR 0042](docs/adr/0042-server-tls.md)). A procedure's steps run
 on **step workers**: processes in any language that connect to the server, say which steps they
 implement, and run what they are sent, over a gRPC stream or HTTP long polling. A worker holds each
 step under a lease; if it crashes or its result is lost, the step goes to another worker, and the run

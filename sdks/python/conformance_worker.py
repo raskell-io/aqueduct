@@ -18,6 +18,7 @@ worker = Worker(
     capacity=8,
     poll_ms=1_000,
     token=os.environ.get("AQUEDUCT_TOKEN"),
+    ca_file=os.environ.get("AQUEDUCT_CA_FILE"),
 )
 
 

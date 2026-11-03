@@ -20,13 +20,14 @@ aqueduct-protocol.workspace = true
 getrandom = "0.3"
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12", "logging"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "query", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-stream = { version = "0.1", default-features = false }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "channel"] }
 

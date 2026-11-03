@@ -96,6 +96,7 @@ pub struct Worker {
     workflows: BTreeMap<String, WorkflowLogic>,
     queues: Vec<String>,
     token: Option<String>,
+    ca: Option<String>,
 }
 
 impl Worker {
@@ -108,6 +109,7 @@ impl Worker {
             workflows: BTreeMap::new(),
             queues: Vec::new(),
             token: None,
+            ca: None,
         }
     }
 
@@ -131,6 +133,13 @@ impl Worker {
     /// Authenticates with a token that has the `work` permission (ADR 0041).
     pub fn token(mut self, token: &str) -> Worker {
         self.token = Some(token.to_owned());
+        self
+    }
+
+    /// Trusts this certificate authority (PEM) for an `https://` server, besides the operating system's
+    /// roots: for a private CA or a self-signed certificate.
+    pub fn ca_certificate(mut self, pem: &str) -> Worker {
+        self.ca = Some(pem.to_owned());
         self
     }
 
@@ -171,6 +180,7 @@ impl Worker {
                 &self.steps,
                 &self.queues,
                 self.token.as_deref(),
+                self.ca.as_deref(),
             )
             .await
         };
@@ -184,6 +194,7 @@ impl Worker {
                 self.capacity,
                 &self.workflows,
                 self.token.as_deref(),
+                self.ca.as_deref(),
             )
             .await
         };
@@ -195,17 +206,21 @@ impl Worker {
     }
 }
 
-/// Connects to the server.
-async fn connect(url: &str) -> Result<tonic::transport::Channel, WorkerError> {
+/// Connects to the server, over TLS for an `https://` address.
+async fn connect(url: &str, ca: Option<&str>) -> Result<tonic::transport::Channel, WorkerError> {
     let error = |e: tonic::transport::Error| WorkerError::Connect {
         url: url.to_owned(),
         error: e.to_string(),
     };
-    tonic::transport::Endpoint::from_shared(url.to_owned())
-        .map_err(error)?
-        .connect()
-        .await
-        .map_err(error)
+    let mut endpoint = tonic::transport::Endpoint::from_shared(url.to_owned()).map_err(error)?;
+    if url.starts_with("https://") {
+        let mut tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
+        if let Some(ca) = ca {
+            tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(ca));
+        }
+        endpoint = endpoint.tls_config(tls).map_err(error)?;
+    }
+    endpoint.connect().await.map_err(error)
 }
 
 /// Adds the token to every request, if there is one.
@@ -241,8 +256,9 @@ async fn serve_steps(
     steps: &BTreeMap<String, StepFn>,
     queues: &[String],
     token: Option<&str>,
+    ca: Option<&str>,
 ) -> Result<(), WorkerError> {
-    let mut client = WorkersClient::with_interceptor(connect(url).await?, with_token(token)?);
+    let mut client = WorkersClient::with_interceptor(connect(url, ca).await?, with_token(token)?);
     let (out, outbound) = mpsc::channel(64);
     let hello = v1::WorkerMessage {
         message: Some(v1::worker_message::Message::Hello(v1::Hello {
@@ -324,8 +340,9 @@ async fn serve_workflows(
     capacity: u32,
     workflows: &BTreeMap<String, WorkflowLogic>,
     token: Option<&str>,
+    ca: Option<&str>,
 ) -> Result<(), WorkerError> {
-    let mut client = WorkflowsClient::with_interceptor(connect(url).await?, with_token(token)?);
+    let mut client = WorkflowsClient::with_interceptor(connect(url, ca).await?, with_token(token)?);
     let (out, outbound) = mpsc::channel(64);
     let hello = v1::WorkflowWorkerMessage {
         message: Some(v1::workflow_worker_message::Message::Hello(

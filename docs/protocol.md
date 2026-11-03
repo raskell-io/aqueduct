@@ -133,7 +133,7 @@ journal as it does for local logic.
 ## 5. Not in this draft yet
 - **Push endpoints:** the server calls an HTTP endpoint per invocation, for serverless platforms.
 - **Named task queues** and deployments across workers.
-- **TLS on the server, OIDC/JWT and namespaces.** Until the server has TLS, it binds to loopback by
-  default.
+- **OIDC/JWT, mTLS and namespaces.** The server has TLS (ADR 0042), and binds to loopback by default;
+  beyond loopback it needs tokens and a certificate.
 - **Version management** over the network (register, propose, prove, approve): for now through
   `aqueduct versions` on the server's data directory, and the MCP server.

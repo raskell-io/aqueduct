@@ -27,6 +27,7 @@ step for good; raising ``Retry``, or any other exception, makes the server retry
 
 import json
 import http.server
+import ssl
 import threading
 import time
 import traceback
@@ -71,9 +72,12 @@ class Worker:
         capacity: int = 4,
         poll_ms: int = 10_000,
         token: Optional[str] = None,
+        ca_file: Optional[str] = None,
     ):
         self.name = name
         self.token = token
+        # For an https:// server: a private CA or self-signed certificate to trust, besides the system's.
+        self._tls = ssl.create_default_context(cafile=ca_file) if ca_file else None
         self.url = url.rstrip("/")
         self.capacity = max(1, capacity)
         self.poll_ms = poll_ms
@@ -152,7 +156,7 @@ class Worker:
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=self._tls) as response:
             return json.loads(response.read() or b"{}")
 
     def _loop(self) -> None:

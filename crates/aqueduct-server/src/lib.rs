@@ -19,12 +19,14 @@
 pub mod audit;
 pub mod auth;
 mod push;
+mod tls;
 mod workers;
 mod workflows;
 
 pub use audit::Audit;
 pub use auth::{Authenticator, Permission, Principal, Refusal};
 pub use push::{Config, PushEndpoint};
+pub use tls::Tls;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -83,6 +85,19 @@ pub async fn serve_with(
     axum::serve(listener, router_secured(engine, security))
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// [`serve_with`], over TLS (ADR 0042).
+pub async fn serve_tls(
+    engine: Arc<Engine>,
+    listener: tokio::net::TcpListener,
+    config: &Config,
+    security: Security,
+    tls: Tls,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    push::start(&engine, config).map_err(std::io::Error::other)?;
+    tls::serve(router_secured(engine, security), listener, tls, shutdown).await
 }
 
 /// The routes, gRPC and HTTP/JSON, for serving with axum or another tower server.
@@ -229,11 +244,20 @@ async fn authorize(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("application/grpc"));
-    let (kind, message) = match refusal {
-        Refusal::Unauthenticated(message) => (Kind::Unauthenticated, message),
-        Refusal::Forbidden(message) => (Kind::Forbidden, message),
+    // No handler runs, so no principal is set: the log is told who was refused. A caller without a
+    // valid token is `unauthenticated`, whatever it claimed.
+    let (kind, who, message) = match refusal {
+        Refusal::Unauthenticated(message) => {
+            (Kind::Unauthenticated, "unauthenticated".to_owned(), message)
+        }
+        Refusal::Forbidden(who, message) => (Kind::Forbidden, who, message),
     };
-    api.audit(action, path, format!("refused: {message}")).await;
+    PRINCIPAL
+        .scope(
+            Principal::Token(who),
+            api.audit(action, path, format!("refused: {message}")),
+        )
+        .await;
     let failure = Failure { kind, message };
     if grpc {
         return tonic::Status::from(failure).into_http();
