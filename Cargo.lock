@@ -223,6 +223,7 @@ dependencies = [
 name = "aqueduct-protocol"
 version = "0.0.0"
 dependencies = [
+ "aqueduct-core",
  "prost",
  "protox",
  "tonic",
@@ -299,10 +300,12 @@ dependencies = [
 name = "aqueduct-worker"
 version = "0.0.0"
 dependencies = [
+ "aqueduct-codec",
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
  "aqueduct-protocol",
+ "aqueduct-sdk",
  "aqueduct-server",
  "serde_json",
  "thiserror",

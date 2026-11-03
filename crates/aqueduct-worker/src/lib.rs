@@ -1,10 +1,14 @@
-//! A step worker for Aqueduct (ADR 0038): implement steps by name in Rust, and serve them to a server
-//! over the step-worker protocol (`worker.proto`, draft).
+//! A worker for Aqueduct: implement steps, and run code workflows, in a process of your own, served to a
+//! server over the worker protocols (`worker.proto`, ADR 0038; `workflow.proto`, ADR 0039; drafts).
 //!
-//! The worker says which steps it implements and how many it runs at once, then runs what the server
-//! sends it, each on a blocking thread, and sends back the outcome. A step may run more than once (a
-//! lease runs out, a connection drops), so it should be idempotent: [`Invocation::idempotency_key`] is
-//! the same for every attempt of a step.
+//! **Steps.** The worker says which steps it implements and how many it runs at once, then runs what the
+//! server sends it, each on a blocking thread, and sends back the outcome. A step may run more than once
+//! (a lease runs out, a connection drops), so it should be idempotent: [`Invocation::idempotency_key`]
+//! is the same for every attempt of a step.
+//!
+//! **Workflows.** A code workflow (any [`Decider`], such as one made with `aqueduct_sdk::workflow`) runs
+//! here instead of in the server: the server sends the run's history, the worker verifies its hash chain,
+//! replays it through the workflow and sends back the commands the workflow issued.
 //!
 //! ```no_run
 //! use aqueduct_worker::{Outcome, Worker};
@@ -28,8 +32,10 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use aqueduct_core::{Decider, Env, RunState};
 use aqueduct_protocol::v1;
 use aqueduct_protocol::v1::workers_client::WorkersClient;
+use aqueduct_protocol::v1::workflows_client::WorkflowsClient;
 use tokio::sync::mpsc;
 
 /// What one attempt of a step came to.
@@ -63,6 +69,9 @@ pub struct Invocation {
 /// A step's implementation.
 pub type StepFn = Arc<dyn Fn(&Invocation) -> Outcome + Send + Sync>;
 
+/// A workflow's logic.
+pub type WorkflowLogic = Arc<dyn Decider + Send + Sync>;
+
 /// Why a worker stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
@@ -79,24 +88,26 @@ pub enum WorkerError {
     Session(String),
 }
 
-/// A step worker: a set of steps by name, run against a server.
+/// A worker: steps and workflows by name, served to a server.
 pub struct Worker {
     name: String,
     capacity: u32,
     steps: BTreeMap<String, StepFn>,
+    workflows: BTreeMap<String, WorkflowLogic>,
 }
 
 impl Worker {
-    /// A worker called `name` (for logs and the console), running 4 steps at once.
+    /// A worker called `name` (for logs and the console), running 4 steps (and 4 activations) at once.
     pub fn new(name: &str) -> Worker {
         Worker {
             name: name.to_owned(),
             capacity: 4,
             steps: BTreeMap::new(),
+            workflows: BTreeMap::new(),
         }
     }
 
-    /// How many steps it runs at once.
+    /// How many steps it runs at once, and how many activations.
     pub fn capacity(mut self, capacity: u32) -> Worker {
         self.capacity = capacity.max(1);
         self
@@ -113,96 +124,121 @@ impl Worker {
         self
     }
 
-    /// Serves the steps to the server at `url` until the session ends.
+    /// Runs workflow `name`'s logic here: the server must have it registered as a remote workflow
+    /// (`Builder::remote_workflow`). Each activation is decided on a blocking thread.
+    pub fn workflow(mut self, name: &str, logic: WorkflowLogic) -> Worker {
+        self.workflows.insert(name.to_owned(), logic);
+        self
+    }
+
+    /// Serves the steps and workflows to the server at `url` until a session ends.
     pub async fn run(self, url: &str) -> Result<(), WorkerError> {
         self.run_until(url, std::future::pending()).await
     }
 
-    /// Serves the steps until the session ends or `stop` completes. Steps in flight when it stops are
-    /// not answered; the server offers them again once their leases run out.
+    /// Serves until a session ends or `stop` completes. What is in flight when it stops is not
+    /// answered; the server offers it again once its lease runs out.
     pub async fn run_until(
         self,
         url: &str,
         stop: impl Future<Output = ()> + Send,
     ) -> Result<(), WorkerError> {
-        let mut client =
-            WorkersClient::connect(url.to_owned())
-                .await
-                .map_err(|e| WorkerError::Connect {
-                    url: url.to_owned(),
-                    error: e.to_string(),
-                })?;
-        let (out, outbound) = mpsc::channel(64);
-        let hello = v1::WorkerMessage {
-            message: Some(v1::worker_message::Message::Hello(v1::Hello {
-                worker: self.name.clone(),
-                steps: self.steps.keys().cloned().collect(),
-                capacity: self.capacity,
-            })),
-        };
-        out.send(hello)
-            .await
-            .map_err(|e| WorkerError::Session(e.to_string()))?;
-        let mut inbound = client
-            .work(tokio_stream::wrappers::ReceiverStream::new(outbound))
-            .await
-            .map_err(|e| WorkerError::Session(e.message().to_owned()))?
-            .into_inner();
-        let steps = Arc::new(self.steps);
-        // The steps in flight: aborted when the worker stops, so that nothing keeps its stream open.
-        let mut running = tokio::task::JoinSet::new();
-        let session = async {
-            loop {
-                let message = inbound
-                    .message()
-                    .await
-                    .map_err(|e| WorkerError::Session(e.message().to_owned()))?;
-                let Some(v1::ServerMessage {
-                    message: Some(v1::server_message::Message::Invocation(invocation)),
-                }) = message
-                else {
-                    if message.is_none() {
-                        return Ok(());
-                    }
-                    continue;
-                };
-                while running.try_join_next().is_some() {}
-                let (steps, out) = (Arc::clone(&steps), out.clone());
-                running.spawn(async move {
-                    let id = invocation.invocation_id.clone();
-                    let invocation = Invocation {
-                        run_id: invocation.run_id,
-                        command: invocation.command,
-                        step: invocation.step,
-                        input: invocation.input,
-                        idempotency_key: invocation.idempotency_key,
-                        attempt: invocation.attempt,
-                    };
-                    let outcome = tokio::task::spawn_blocking(move || execute(&steps, &invocation))
-                        .await
-                        .unwrap_or_else(|e| Outcome::Retry(e.to_string()));
-                    let outcome = match outcome {
-                        Outcome::Completed(result) => v1::step_result::Outcome::Completed(result),
-                        Outcome::Failed(error) => v1::step_result::Outcome::Failed(error),
-                        Outcome::Retry(error) => v1::step_result::Outcome::Retry(error),
-                    };
-                    let _ = out
-                        .send(v1::WorkerMessage {
-                            message: Some(v1::worker_message::Message::Result(v1::StepResult {
-                                invocation_id: id,
-                                outcome: Some(outcome),
-                            })),
-                        })
-                        .await;
-                });
+        let steps = async {
+            if self.steps.is_empty() {
+                return std::future::pending().await;
             }
+            serve_steps(url, &self.name, self.capacity, &self.steps).await
         };
-        let result = tokio::select! {
-            result = session => result,
+        let workflows = async {
+            if self.workflows.is_empty() {
+                return std::future::pending().await;
+            }
+            serve_workflows(url, &self.name, self.capacity, &self.workflows).await
+        };
+        tokio::select! {
+            result = steps => result,
+            result = workflows => result,
             () = stop => Ok(()),
+        }
+    }
+}
+
+fn connect_error(url: &str) -> impl Fn(tonic::transport::Error) -> WorkerError + '_ {
+    move |e| WorkerError::Connect {
+        url: url.to_owned(),
+        error: e.to_string(),
+    }
+}
+
+/// A session of the step-worker protocol. Dropping it aborts the steps in flight (their tasks hold the
+/// stream open otherwise).
+async fn serve_steps(
+    url: &str,
+    name: &str,
+    capacity: u32,
+    steps: &BTreeMap<String, StepFn>,
+) -> Result<(), WorkerError> {
+    let mut client = WorkersClient::connect(url.to_owned())
+        .await
+        .map_err(connect_error(url))?;
+    let (out, outbound) = mpsc::channel(64);
+    let hello = v1::WorkerMessage {
+        message: Some(v1::worker_message::Message::Hello(v1::Hello {
+            worker: name.to_owned(),
+            steps: steps.keys().cloned().collect(),
+            capacity,
+        })),
+    };
+    out.send(hello)
+        .await
+        .map_err(|e| WorkerError::Session(e.to_string()))?;
+    let mut inbound = client
+        .work(tokio_stream::wrappers::ReceiverStream::new(outbound))
+        .await
+        .map_err(|e| WorkerError::Session(e.message().to_owned()))?
+        .into_inner();
+    let steps = Arc::new(steps.clone());
+    let mut running = tokio::task::JoinSet::new();
+    loop {
+        let message = inbound
+            .message()
+            .await
+            .map_err(|e| WorkerError::Session(e.message().to_owned()))?;
+        let Some(message) = message else {
+            return Ok(());
         };
-        running.abort_all();
-        result
+        let Some(v1::server_message::Message::Invocation(invocation)) = message.message else {
+            continue;
+        };
+        while running.try_join_next().is_some() {}
+        let (steps, out) = (Arc::clone(&steps), out.clone());
+        running.spawn(async move {
+            let id = invocation.invocation_id.clone();
+            let invocation = Invocation {
+                run_id: invocation.run_id,
+                command: invocation.command,
+                step: invocation.step,
+                input: invocation.input,
+                idempotency_key: invocation.idempotency_key,
+                attempt: invocation.attempt,
+            };
+            let outcome = tokio::task::spawn_blocking(move || execute(&steps, &invocation))
+                .await
+                .unwrap_or_else(|e| Outcome::Retry(e.to_string()));
+            let outcome = match outcome {
+                Outcome::Completed(result) => v1::step_result::Outcome::Completed(result),
+                Outcome::Failed(error) => v1::step_result::Outcome::Failed(error),
+                Outcome::Retry(error) => v1::step_result::Outcome::Retry(error),
+            };
+            let _ = out
+                .send(v1::WorkerMessage {
+                    message: Some(v1::worker_message::Message::Result(v1::StepResult {
+                        invocation_id: id,
+                        outcome: Some(outcome),
+                    })),
+                })
+                .await;
+        });
     }
 }
 
@@ -216,4 +252,97 @@ fn execute(steps: &BTreeMap<String, StepFn>, invocation: &Invocation) -> Outcome
         Some(step) => catch_unwind(AssertUnwindSafe(|| step(invocation)))
             .unwrap_or_else(|_| Outcome::Retry(format!("step `{}` panicked", invocation.step))),
     }
+}
+
+/// A session of the workflow-worker protocol.
+async fn serve_workflows(
+    url: &str,
+    name: &str,
+    capacity: u32,
+    workflows: &BTreeMap<String, WorkflowLogic>,
+) -> Result<(), WorkerError> {
+    let mut client = WorkflowsClient::connect(url.to_owned())
+        .await
+        .map_err(connect_error(url))?;
+    let (out, outbound) = mpsc::channel(64);
+    let hello = v1::WorkflowWorkerMessage {
+        message: Some(v1::workflow_worker_message::Message::Hello(
+            v1::WorkflowHello {
+                worker: name.to_owned(),
+                workflows: workflows.keys().cloned().collect(),
+                capacity,
+            },
+        )),
+    };
+    out.send(hello)
+        .await
+        .map_err(|e| WorkerError::Session(e.to_string()))?;
+    let mut inbound = client
+        .serve(tokio_stream::wrappers::ReceiverStream::new(outbound))
+        .await
+        .map_err(|e| WorkerError::Session(e.message().to_owned()))?
+        .into_inner();
+    let workflows = Arc::new(workflows.clone());
+    let mut running = tokio::task::JoinSet::new();
+    loop {
+        let message = inbound
+            .message()
+            .await
+            .map_err(|e| WorkerError::Session(e.message().to_owned()))?;
+        let Some(message) = message else {
+            return Ok(());
+        };
+        let Some(v1::workflow_server_message::Message::Activation(activation)) = message.message
+        else {
+            continue;
+        };
+        while running.try_join_next().is_some() {}
+        let (workflows, out) = (Arc::clone(&workflows), out.clone());
+        running.spawn(async move {
+            let id = activation.activation_id.clone();
+            let decided = tokio::task::spawn_blocking(move || decide(&workflows, &activation))
+                .await
+                .ok()
+                .flatten();
+            let message = match decided {
+                Some(commands) => v1::workflow_worker_message::Message::Decision(v1::Decision {
+                    activation_id: id,
+                    commands: commands
+                        .iter()
+                        .map(aqueduct_protocol::commands::to_proto)
+                        .collect(),
+                }),
+                // No decision (the history did not verify, or the logic panicked): the capacity is
+                // free again, and the activation is offered again once its lease runs out.
+                None => v1::workflow_worker_message::Message::Credit(1),
+            };
+            let _ = out
+                .send(v1::WorkflowWorkerMessage {
+                    message: Some(message),
+                })
+                .await;
+        });
+    }
+}
+
+/// Verifies an activation's history against its run id, replays it and decides.
+fn decide(
+    workflows: &BTreeMap<String, WorkflowLogic>,
+    activation: &v1::Activation,
+) -> Option<Vec<aqueduct_core::Command>> {
+    let logic = workflows.get(&activation.workflow)?;
+    let verified = aqueduct_codec::verify_chain(
+        &activation.run_id,
+        activation.history.iter().map(Vec::as_slice),
+    )
+    .ok()?;
+    let state = RunState::from_journal(&verified.entries).ok()?;
+    let env = Env {
+        now_ms: activation.now_ms,
+        seed: activation.seed,
+    };
+    catch_unwind(AssertUnwindSafe(|| {
+        logic.decide(&state.view_at(&activation.run_id, env))
+    }))
+    .ok()
 }

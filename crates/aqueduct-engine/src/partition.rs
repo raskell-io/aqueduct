@@ -36,6 +36,9 @@ struct Registered {
     unversioned: Option<SharedDecider>,
     versions: BTreeMap<String, SharedDecider>,
     active: Option<String>,
+    /// Decided by a remote workflow worker (ADR 0039): its activations leave the partition as
+    /// [`Outbound::Activation`], and its decisions come back through [`Partition::decision`].
+    remote: bool,
 }
 
 impl Deciders {
@@ -48,6 +51,16 @@ impl Deciders {
     /// not pinned: they are decided by whatever is registered under the name when they resume.
     pub fn insert(&mut self, workflow: impl Into<String>, decider: SharedDecider) {
         self.by_name.entry(workflow.into()).or_default().unversioned = Some(decider);
+    }
+
+    /// Registers a workflow that a remote workflow worker decides (ADR 0039). Its runs are unversioned.
+    pub fn insert_remote(&mut self, workflow: impl Into<String>) {
+        self.by_name.entry(workflow.into()).or_default().remote = true;
+    }
+
+    /// Whether a workflow is decided remotely.
+    pub fn is_remote(&self, workflow: &str) -> bool {
+        self.by_name.get(workflow).is_some_and(|r| r.remote)
     }
 
     /// Registers a version of a workflow (ADR 0029). Runs started on it are pinned to it: they are only
@@ -139,7 +152,7 @@ impl Deciders {
                 version: version.to_owned(),
             }),
             None if registered.active.is_some() => Ok(registered.active.clone()),
-            None if registered.unversioned.is_some() => Ok(None),
+            None if registered.unversioned.is_some() || registered.remote => Ok(None),
             None => Err(PartitionError::UnknownWorkflow(workflow.to_owned())),
         }
     }
@@ -284,6 +297,18 @@ pub enum Outbound {
         /// The run key.
         key: String,
     },
+    /// A run of a remote workflow needs a decision (ADR 0039): its logic, given the first `at` entries
+    /// of its journal and `env`, returns its commands through [`Partition::decision`].
+    Activation {
+        /// The run id.
+        key: String,
+        /// The workflow.
+        workflow: String,
+        /// How many journal entries the decision is for.
+        at: usize,
+        /// The clock and seed for values the logic records.
+        env: Env,
+    },
     /// A run reached a terminal status.
     Finished {
         /// The run key.
@@ -331,6 +356,9 @@ pub enum PartitionError {
     /// A resolution was refused: an answer supplied for an agent call does not match its output schema.
     #[error("{0}")]
     InvalidResolution(String),
+    /// The request needs something not available for this run yet.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// What an update sent to a run came to, so far (ADR 0036).
@@ -1130,6 +1158,40 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         Ok(UpdateStatus::Accepted { run, cmd })
     }
 
+    /// A remote workflow's decision (ADR 0039): the commands its logic issued, given the first `at`
+    /// entries of run `key`'s journal. A decision for another length is stale (the run has moved on, or
+    /// it is a repeat): it is dropped, and the run is activated again for where it is now. Decisions for
+    /// runs that have ended or are not in memory are dropped.
+    pub fn decision(
+        &mut self,
+        key: &str,
+        at: usize,
+        commands: Vec<aqueduct_core::Command>,
+    ) -> Result<(), PartitionError> {
+        let Some(run) = self.runs.get(key) else {
+            return Ok(());
+        };
+        if run.state.status().is_terminal() || !self.deciders.is_remote(run.state.workflow()) {
+            return Ok(());
+        }
+        if run.state.len() != at {
+            let message = Outbound::Activation {
+                key: key.to_owned(),
+                workflow: run.state.workflow().to_owned(),
+                at: run.state.len(),
+                env: Env {
+                    now_ms: self.now_ms,
+                    seed: self.next_seed(),
+                },
+            };
+            self.send(message);
+            return Ok(());
+        }
+        let transition = run.state.handle_at(Event::Decision(commands), self.now_ms);
+        let effects = self.append(key, transition)?;
+        self.perform(key, effects)
+    }
+
     /// Answers query `name` about a key's latest run, from its logic (ADR 0036): `None` if the logic
     /// has no such query. Nothing is journaled. The run is read as it is in memory, which may include
     /// entries not yet durable: a caller that must not show those answers after the next flush.
@@ -1140,6 +1202,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         let state = self
             .lookup_run(&run)?
             .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        if self.deciders.is_remote(state.workflow()) {
+            return Err(PartitionError::Unsupported(format!(
+                "queries on `{}`, whose logic runs in a remote workflow worker, are not supported yet",
+                state.workflow()
+            )));
+        }
         let decider = self
             .deciders
             .for_run(state.workflow(), state.version())
@@ -1708,6 +1776,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                         .runs
                         .get(key)
                         .ok_or_else(|| PartitionError::Internal(format!("run {key} vanished")))?;
+                    if self.deciders.is_remote(run.state.workflow()) {
+                        let message = Outbound::Activation {
+                            key: key.to_owned(),
+                            workflow: run.state.workflow().to_owned(),
+                            at: run.state.len(),
+                            env,
+                        };
+                        self.send(message);
+                        continue;
+                    }
                     // A run whose workflow or version is not registered waits until it is: a pinned run
                     // is only ever decided by its own version.
                     let Some(decider) = self

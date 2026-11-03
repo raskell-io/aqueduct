@@ -2,7 +2,11 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proto");
-    let files = ["aqueduct/v1/ingress.proto", "aqueduct/v1/worker.proto"];
+    let files = [
+        "aqueduct/v1/ingress.proto",
+        "aqueduct/v1/worker.proto",
+        "aqueduct/v1/workflow.proto",
+    ];
     for file in files {
         println!("cargo:rerun-if-changed={}", root.join(file).display());
     }

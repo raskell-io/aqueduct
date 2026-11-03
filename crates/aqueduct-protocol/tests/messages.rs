@@ -56,3 +56,70 @@ fn services_exist() {
     let _ = aqueduct_protocol::v1::ingress_client::IngressClient::<tonic::transport::Channel>::new;
     let _ = aqueduct_protocol::v1::workers_client::WorkersClient::<tonic::transport::Channel>::new;
 }
+
+#[test]
+fn every_command_round_trips() {
+    use aqueduct_core::{Command, CommandIndex, Payload};
+    use aqueduct_protocol::commands::{from_proto, to_proto};
+    let p = |s: &str| Payload::new(s.as_bytes().to_vec());
+    let commands = vec![
+        Command::ScheduleStep {
+            name: "charge".into(),
+            input: p("1"),
+        },
+        Command::CallAgent {
+            name: "classify".into(),
+            request: p("{}"),
+            budget_tokens: 900,
+        },
+        Command::Sleep { duration_ms: 1_000 },
+        Command::AwaitSignal {
+            name: "go".into(),
+            timeout_ms: 5,
+        },
+        Command::Record {
+            name: "now".into(),
+            value: p("12"),
+        },
+        Command::Escalate {
+            reason: "review".into(),
+            payload: p("null"),
+        },
+        Command::StartChild {
+            workflow: "payment".into(),
+            input: p("2"),
+            key: None,
+        },
+        Command::StartChild {
+            workflow: "payment".into(),
+            input: p("2"),
+            key: Some("pay:1".into()),
+        },
+        Command::AwaitUpdate {
+            name: "address".into(),
+            timeout_ms: 0,
+        },
+        Command::Respond {
+            update: CommandIndex(4),
+            result: Ok(p("\"ok\"")),
+        },
+        Command::Respond {
+            update: CommandIndex(4),
+            result: Err("no".into()),
+        },
+        Command::CompleteRun { output: p("3") },
+        Command::ContinueAsNew { input: p("4") },
+        Command::FailRun {
+            error: "boom".into(),
+        },
+        Command::Park {
+            reason: "stuck".into(),
+        },
+    ];
+    for command in commands {
+        assert_eq!(from_proto(to_proto(&command)).unwrap(), command);
+        let encoded = to_proto(&command).encode_to_vec();
+        let decoded = aqueduct_protocol::v1::WorkflowCommand::decode(encoded.as_slice()).unwrap();
+        assert_eq!(from_proto(decoded).unwrap(), command);
+    }
+}

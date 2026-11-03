@@ -20,3 +20,8 @@ async fn in_process() {
 async fn rust_worker_over_grpc() {
     passes(Transport::RustGrpc).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workflows_decided_by_a_remote_worker() {
+    passes(Transport::RemoteWorkflows).await;
+}

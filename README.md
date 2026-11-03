@@ -235,6 +235,11 @@ Worker::new("billing")
     .await?;
 ```
 
+Code workflows can run in a worker too: register the workflow as remote on the server
+(`.remote_workflow("order")`) and serve its logic with `Worker::workflow("order", Arc::new(workflow(order)))`.
+The server sends each activation the run's verified history and records the commands the workflow
+issues ([ADR 0039](docs/adr/0039-workflow-workers.md)).
+
 Step-worker libraries for [Python](sdks/python/README.md) (3.9+, standard library only) and
 [TypeScript](sdks/typescript/README.md) (Node 22.18+, no dependencies) do the same over HTTP. Every
 worker library passes the [conformance suite](conformance/README.md) (`mise run conformance`).

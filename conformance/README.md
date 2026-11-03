@@ -45,5 +45,6 @@ backoff of 10 ms, so `retry` and `exception` finish quickly.
 ## Transports
 
 The runner checks the steps implemented in the server's own process (the in-process transport), the
-Rust `aqueduct-worker` over gRPC, and any worker command given with `--worker` (the Python and
-TypeScript libraries use HTTP long polling).
+Rust `aqueduct-worker` over gRPC, the same worker also deciding the scenarios' workflows (the
+workflow-worker protocol, ADR 0039: the server keeps only the journals), and any worker command given
+with `--worker` (the Python and TypeScript libraries use HTTP long polling).

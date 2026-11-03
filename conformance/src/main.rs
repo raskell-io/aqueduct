@@ -7,7 +7,11 @@ use aqueduct_conformance::{Transport, run};
 async fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let transports = match args.as_slice() {
-        [] => vec![Transport::InProcess, Transport::RustGrpc],
+        [] => vec![
+            Transport::InProcess,
+            Transport::RustGrpc,
+            Transport::RemoteWorkflows,
+        ],
         [flag, command] if flag == "--worker" => vec![Transport::Command(command.clone())],
         _ => {
             eprintln!("usage: aqueduct-conformance [--worker <command>]");

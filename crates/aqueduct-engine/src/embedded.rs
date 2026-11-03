@@ -190,6 +190,10 @@ pub enum EngineError {
     /// name), or ended before answering it.
     #[error("update rejected: {0}")]
     UpdateRejected(String),
+    /// The request needs something not available for this run yet (for example, a query on a workflow
+    /// decided remotely).
+    #[error("{0}")]
+    Unsupported(String),
     /// The run's logic has no such query.
     #[error("run `{key}` has no query `{name}`")]
     UnknownQuery {
@@ -225,6 +229,8 @@ pub struct Builder {
     agents: Option<Arc<dyn AgentExecutor>>,
     activations: Vec<(String, String)>,
     remote: Option<Duration>,
+    /// Whether some workflow is decided remotely, and the leases of its activations.
+    remote_workflows: Option<Duration>,
 }
 
 impl Builder {
@@ -234,6 +240,22 @@ impl Builder {
     /// error.
     pub fn remote_steps(mut self, lease: Duration) -> Self {
         self.remote = Some(lease);
+        self
+    }
+
+    /// Registers a workflow that a remote workflow worker decides (ADR 0039): its activations go to the
+    /// engine's [`ActivationQueue`](crate::activations::ActivationQueue), with leases of 30 s (see
+    /// [`Builder::activation_lease`]), and its decisions come back through [`Engine::decision`]. Runs
+    /// wait until a worker for the workflow connects.
+    pub fn remote_workflow(mut self, name: &str) -> Self {
+        self.deciders.insert_remote(name);
+        self.remote_workflows.get_or_insert(Duration::from_secs(30));
+        self
+    }
+
+    /// How long a remote workflow worker has to decide an activation before it is offered again.
+    pub fn activation_lease(mut self, lease: Duration) -> Self {
+        self.remote_workflows = Some(lease);
         self
     }
 
@@ -388,6 +410,9 @@ impl Builder {
         let queue = self
             .remote
             .map(|lease| Arc::new(crate::queue::StepQueue::new(lease)));
+        let activation_queue = self
+            .remote_workflows
+            .map(|lease| Arc::new(crate::activations::ActivationQueue::new(lease)));
         let steps = Arc::new(self.steps);
         let workers = (0..self.workers)
             .map(|_| {
@@ -420,6 +445,7 @@ impl Builder {
             answers: Vec::new(),
             deferred: Vec::new(),
             remote: queue.clone().map(|queue| (queue, local)),
+            activations: activation_queue.clone(),
         };
         let redispatch = self.redispatch;
         let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
@@ -428,6 +454,7 @@ impl Builder {
             thread: Some(thread),
             workers,
             queue,
+            activations: activation_queue,
         })
     }
 }
@@ -438,6 +465,7 @@ pub struct Engine {
     thread: Option<JoinHandle<Result<(), String>>>,
     workers: Vec<JoinHandle<()>>,
     queue: Option<Arc<crate::queue::StepQueue>>,
+    activations: Option<Arc<crate::activations::ActivationQueue>>,
 }
 
 impl Engine {
@@ -445,6 +473,29 @@ impl Engine {
     /// ([`Builder::remote_steps`]).
     pub fn step_queue(&self) -> Option<&Arc<crate::queue::StepQueue>> {
         self.queue.as_ref()
+    }
+
+    /// The queue of activations for remote workflow workers, if a workflow is decided remotely
+    /// ([`Builder::remote_workflow`]).
+    pub fn activation_queue(&self) -> Option<&Arc<crate::activations::ActivationQueue>> {
+        self.activations.as_ref()
+    }
+
+    /// Records a remote workflow worker's decision: the commands run `run`'s logic issued given the
+    /// first `at` entries of its history. A stale decision (for another length) is dropped and the run
+    /// activated again. Not acknowledged; a lost one is made up for by the activation being offered
+    /// again.
+    pub fn decision(
+        &self,
+        run: &str,
+        at: usize,
+        commands: Vec<aqueduct_core::Command>,
+    ) -> Result<(), EngineError> {
+        self.send(Request::Decision {
+            key: run.to_owned(),
+            at,
+            commands,
+        })
     }
 
     /// Records the result of an attempt of a step that a remote worker executed. Like a local step's
@@ -489,6 +540,7 @@ impl Engine {
             agents: None,
             activations: Vec::new(),
             remote: None,
+            remote_workflows: None,
         }
     }
 
@@ -745,6 +797,11 @@ enum Request {
         name: String,
         reply: Sender<Result<Payload, EngineError>>,
     },
+    Decision {
+        key: String,
+        at: usize,
+        commands: Vec<aqueduct_core::Command>,
+    },
     Describe {
         key: String,
         reply: Sender<Result<(String, RunState), EngineError>>,
@@ -812,6 +869,8 @@ struct Processor {
         Arc<crate::queue::StepQueue>,
         std::collections::BTreeSet<String>,
     )>,
+    /// With remote workflows: their activations.
+    activations: Option<Arc<crate::activations::ActivationQueue>>,
 }
 
 /// Where the answer to an update or a query goes.
@@ -1002,9 +1061,15 @@ impl Processor {
                     Err(PartitionError::UnknownVersion { workflow, version }) => {
                         Err(EngineError::UnknownVersion { workflow, version })
                     }
+                    Err(PartitionError::Unsupported(why)) => Err(EngineError::Unsupported(why)),
                     Err(error) => return Err(error.to_string()),
                 };
                 self.answers.push((reply, answer));
+            }
+            Request::Decision { key, at, commands } => {
+                self.partition
+                    .decision(&key, at, commands)
+                    .map_err(|e| e.to_string())?;
             }
             Request::Describe { key, reply } => {
                 let answer = match self.partition.latest(&key).map_err(|e| e.to_string())? {
@@ -1183,6 +1248,26 @@ impl Processor {
                     {
                         let _ = replies.remove(0).send(Ok(()));
                     }
+                }
+                Outbound::Activation {
+                    key,
+                    workflow,
+                    at,
+                    env,
+                } => {
+                    let (Some(queue), Some(run)) = (&self.activations, self.partition.run(&key))
+                    else {
+                        continue;
+                    };
+                    // The history as the remote side receives it: the records, chained to the run id.
+                    let mut chain = aqueduct_codec::ChainWriter::new(&key);
+                    let history = run
+                        .journal()
+                        .iter()
+                        .take(at)
+                        .map(|entry| chain.append(entry))
+                        .collect();
+                    queue.offer(&key, &workflow, at, history, env, queue.now_ms());
                 }
                 Outbound::ResultRecorded { .. }
                 | Outbound::AttemptRecorded { .. }

@@ -91,10 +91,28 @@ Each finished invocation returns one unit of credit implicitly. A `credit` messa
 - **Recorded exactly once.** The first result recorded for a command wins. A later one (from a lease
   that expired, or a duplicate) is acknowledged and dropped.
 
-## 4. Not in this draft yet
+## 4. Workflow workers (`aqueduct.v1.Workflows`, ADR 0039)
 
-- **Code workflows over the network:** activations (journal entries to replay, new events) and
-  commands, for SDKs in other processes and languages.
+A workflow worker runs a code workflow's logic outside the server. It opens the `Serve` stream with a
+`WorkflowHello` naming its workflows and its capacity. It then receives `Activation`s:
+
+- the run id and the workflow;
+- `at`, how many history entries the decision is for;
+- those entries as history-format records, hash-chained to the run id;
+- `now_ms` and `seed` for values the logic records.
+
+The worker verifies the chain, replays the history through the logic, and answers with a `Decision`:
+every command the logic has issued, in order (`WorkflowCommand`). The server checks it against the
+journal as it does for local logic.
+
+- **Stale decisions are dropped.** A decision for a history that is no longer the run's (the run moved
+  on, or the decision is a repeat) is dropped, and the run is activated again. Late, lost and repeated
+  decisions are therefore harmless.
+- **Activations are leased** like step invocations.
+- **A worker that cannot decide** returns its credit instead of a decision.
+- **Not yet:** queries on remotely decided workflows, and validation of updates on receipt.
+
+## 5. Not in this draft yet
 - **Push endpoints:** the server calls an HTTP endpoint per invocation, for serverless platforms.
 - **Named task queues** and deployments across workers.
 - **Authentication, authorisation and namespaces.** Until they exist, the server binds to loopback

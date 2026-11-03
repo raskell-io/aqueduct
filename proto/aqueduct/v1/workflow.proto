@@ -1,0 +1,148 @@
+// Aqueduct workflow-worker protocol, version 1 (draft, ADR 0039; not frozen until phase 5).
+//
+// A workflow worker runs code workflows outside the server. The server sends it activations: a run's
+// history so far, in the history format (docs/history-format.md), hash-chained to the run id. The worker
+// verifies the chain, replays the history through the workflow's logic, and answers with every command
+// the logic has issued, in order: a decision. The server compares the decision with the journal exactly
+// as it does for workflows it runs itself.
+//
+// An activation names the history length it is for. A decision for a history that is no longer the
+// run's (the run moved on, or the decision is a repeat) is dropped and the run is activated again, so
+// late, lost and repeated decisions are harmless. Activations are leased like step invocations.
+
+syntax = "proto3";
+
+package aqueduct.v1;
+
+service Workflows {
+  // A worker's session: a Hello, then decisions and credit; the server sends activations, never more
+  // than the worker's outstanding credit.
+  rpc Serve(stream WorkflowWorkerMessage) returns (stream WorkflowServerMessage);
+}
+
+message WorkflowWorkerMessage {
+  oneof message {
+    WorkflowHello hello = 1;
+    Decision decision = 2;
+    uint32 credit = 3;
+  }
+}
+
+message WorkflowHello {
+  string worker = 1;
+  // The workflow names it serves.
+  repeated string workflows = 2;
+  // How many activations it works on at once.
+  uint32 capacity = 3;
+}
+
+message WorkflowServerMessage {
+  oneof message {
+    Activation activation = 1;
+  }
+}
+
+message Activation {
+  string activation_id = 1;
+  string run_id = 2;
+  string workflow = 3;
+  // How many history entries the decision is for: the length of `history`.
+  uint64 at = 4;
+  // The run's history records, in the history format, hash-chained to the run id.
+  repeated bytes history = 5;
+  // The engine's clock (milliseconds since the Unix epoch) and a random seed, for values the logic
+  // records in this activation (the time, random numbers). Values already recorded come from the history.
+  uint64 now_ms = 6;
+  uint64 seed = 7;
+  uint64 lease_ms = 8;
+}
+
+message Decision {
+  string activation_id = 1;
+  // Every command the logic has issued, in order, the last possibly ending the run.
+  repeated WorkflowCommand commands = 2;
+}
+
+message WorkflowCommand {
+  oneof command {
+    ScheduleStep schedule_step = 1;
+    CallAgent call_agent = 2;
+    Sleep sleep = 3;
+    AwaitSignal await_signal = 4;
+    Record record = 5;
+    Escalate escalate = 6;
+    StartChild start_child = 7;
+    AwaitUpdate await_update = 8;
+    Respond respond = 9;
+    CompleteRun complete_run = 10;
+    ContinueAsNew continue_as_new = 11;
+    FailRun fail_run = 12;
+    Park park = 13;
+  }
+}
+
+message ScheduleStep {
+  string name = 1;
+  bytes input = 2;
+}
+
+message CallAgent {
+  string name = 1;
+  bytes request = 2;
+  uint64 budget_tokens = 3;
+}
+
+message Sleep {
+  uint64 duration_ms = 1;
+}
+
+message AwaitSignal {
+  string name = 1;
+  uint64 timeout_ms = 2;
+}
+
+message Record {
+  string name = 1;
+  bytes value = 2;
+}
+
+message Escalate {
+  string reason = 1;
+  bytes payload = 2;
+}
+
+message StartChild {
+  string workflow = 1;
+  bytes input = 2;
+  optional string key = 3;
+}
+
+message AwaitUpdate {
+  string name = 1;
+  uint64 timeout_ms = 2;
+}
+
+message Respond {
+  // The wait that received the update.
+  uint32 update = 1;
+  oneof result {
+    bytes completed = 2;
+    string rejected = 3;
+  }
+}
+
+message CompleteRun {
+  bytes output = 1;
+}
+
+message ContinueAsNew {
+  bytes input = 1;
+}
+
+message FailRun {
+  string error = 1;
+}
+
+message Park {
+  string reason = 1;
+}
