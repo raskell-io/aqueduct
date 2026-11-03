@@ -1,0 +1,75 @@
+// Aqueduct step-worker protocol, version 1 (draft, ADR 0038; not frozen until phase 5).
+//
+// A step worker implements steps by name in any language. It connects to the server, says which steps
+// it implements and how many it runs at once, and receives step invocations; for each it reports a
+// result, a terminal failure, or a retryable failure. That is the whole protocol.
+//
+// Delivery is at least once: an invocation whose result does not arrive within its lease is offered
+// again (to this worker or another), so step bodies must be idempotent, keyed by `idempotency_key`.
+// Recording is exactly once: the first result recorded for a command wins, later ones are dropped.
+//
+// The same exchange is offered as HTTP/JSON long polling (docs/protocol.md), for languages and
+// platforms without a gRPC stack.
+
+syntax = "proto3";
+
+package aqueduct.v1;
+
+service Workers {
+  // A worker's session: the worker sends a Hello, then results and credit; the server sends
+  // invocations, never more than the worker's outstanding credit.
+  rpc Work(stream WorkerMessage) returns (stream ServerMessage);
+}
+
+message WorkerMessage {
+  oneof message {
+    Hello hello = 1;
+    StepResult result = 2;
+    // More capacity: the server may send this many more invocations.
+    uint32 credit = 3;
+  }
+}
+
+message Hello {
+  // A name for the worker, for logs and the console.
+  string worker = 1;
+  // The step names it implements.
+  repeated string steps = 2;
+  // How many invocations it runs at once: its initial credit.
+  uint32 capacity = 3;
+}
+
+message ServerMessage {
+  oneof message {
+    StepInvocation invocation = 1;
+  }
+}
+
+message StepInvocation {
+  // Names this attempt: echo it in the result.
+  string invocation_id = 1;
+  // The run's run id and the step's command index.
+  string run_id = 2;
+  uint32 command = 3;
+  string step = 4;
+  bytes input = 5;
+  // `<run key>/<epoch>/<command>`: the same for every attempt of this command; pass it to external
+  // systems to deduplicate repeated executions.
+  string idempotency_key = 6;
+  // 1 for the first attempt.
+  uint32 attempt = 7;
+  // How long the server waits for the result before offering the step again, in milliseconds.
+  uint64 lease_ms = 8;
+}
+
+message StepResult {
+  string invocation_id = 1;
+  oneof outcome {
+    // The step's result, in the run's codec.
+    bytes completed = 2;
+    // A terminal failure: the step fails, whatever its retry policy.
+    string failed = 3;
+    // A retryable failure: retried by the step's retry policy, with durable backoff.
+    string retry = 4;
+  }
+}
