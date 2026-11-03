@@ -222,9 +222,18 @@ curl -s localhost:7470/v1/runs -d '{"key": "claim-7", "workflow": "claims", "inp
 curl -s 'localhost:7470/v1/runs/claim-7/result?timeout_ms=10000'
 ```
 
-It has no authentication yet, so it listens on loopback unless told otherwise. Step workers in other
-processes come next; until then a procedure's steps run only in a program that embeds the server
-(`aqueduct_server::serve`) and registers them.
+It has no authentication yet, so it listens on loopback unless told otherwise. A procedure's steps run
+on **step workers**: processes in any language that connect to the server, say which steps they
+implement, and run what they are sent, over a gRPC stream or HTTP long polling. A worker holds each
+step under a lease; if it crashes or its result is lost, the step goes to another worker, and the run
+records its result once. In Rust, [`aqueduct-worker`](crates/aqueduct-worker/src/lib.rs):
+
+```rust
+Worker::new("billing")
+    .step("charge", |invocation| Outcome::Completed(charge(&invocation.input)))
+    .run("http://127.0.0.1:7470")
+    .await?;
+```
 
 Planned: the same semantics in a replicated cluster. The full design and phased plan are in [BRIEF.md](BRIEF.md).
 

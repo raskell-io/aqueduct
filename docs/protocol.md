@@ -1,7 +1,7 @@
 # Aqueduct service protocol, version 1 (draft)
 
-Status: **draft** (ADR 0038). The ingress (section 2) is served by `aqueduct server`; step workers
-(section 3) are specified but not served yet. Messages and routes may change until the format and protocol freeze in
+Status: **draft** (ADR 0038). `aqueduct server` serves the ingress (section 2) and step workers
+(section 3); `aqueduct-worker` is a Rust library for writing a step worker. Messages and routes may change until the format and protocol freeze in
 phase 5; after that, changes within v1 are additive. The protobuf definitions in
 [`proto/aqueduct/v1`](../proto/aqueduct/v1) are the source of truth; this document explains them and
 gives the HTTP/JSON form of each call.

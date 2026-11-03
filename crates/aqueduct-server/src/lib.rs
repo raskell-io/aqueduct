@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+mod workers;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -62,7 +64,10 @@ pub async fn serve(
 /// The routes, gRPC and HTTP/JSON, for serving with axum or another tower server.
 pub fn router(engine: Arc<Engine>) -> Router {
     let api = Api { engine };
+    // One set of gRPC routes for both services: each set has its own fallback, and a router can have
+    // only one.
     let grpc = tonic::service::Routes::new(v1::ingress_server::IngressServer::new(api.clone()))
+        .add_service(v1::workers_server::WorkersServer::new(api.clone()))
         .into_axum_router();
     let http = Router::new()
         .route("/v1/runs", post(http_start).get(http_list))
@@ -75,8 +80,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/v1/awakeables/{id}", post(http_complete_awakeable))
         .route("/v1/escalations", get(http_escalations))
         .route("/v1/escalations/{id}", post(http_resolve))
-        .with_state(api);
-    grpc.merge(http)
+        .with_state(api.clone());
+    grpc.merge(http).merge(workers::routes(api))
 }
 
 /// Why a call failed, in terms both transports can say.

@@ -14,6 +14,7 @@ pub mod embedded;
 pub mod metrics;
 mod observe;
 mod partition;
+pub mod queue;
 pub mod replay;
 mod schema;
 

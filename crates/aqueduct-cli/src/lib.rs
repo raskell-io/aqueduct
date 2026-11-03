@@ -327,7 +327,11 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let registry = Registry::open(dir).map_err(|e| e.to_string())?;
     let engine = registry
-        .deploy(aqueduct_engine::embedded::Engine::builder(dir))
+        // Steps run on step workers, which connect to the server (ADR 0038).
+        .deploy(
+            aqueduct_engine::embedded::Engine::builder(dir)
+                .remote_steps(std::time::Duration::from_secs(30)),
+        )
         .map_err(|e| e.to_string())?
         .open()
         .map_err(|e| e.to_string())?;

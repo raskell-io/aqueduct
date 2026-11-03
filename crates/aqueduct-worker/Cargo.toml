@@ -1,0 +1,28 @@
+[package]
+name = "aqueduct-worker"
+description = "A step worker for Aqueduct: implement steps in Rust and serve them to a server (protocol v1, draft)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aqueduct-protocol.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio-stream = { version = "0.1", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }
+
+[dev-dependencies]
+aqueduct-core.workspace = true
+aqueduct-engine.workspace = true
+aqueduct-procedure.workspace = true
+aqueduct-server.workspace = true
+serde_json = "1"
