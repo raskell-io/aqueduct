@@ -59,6 +59,8 @@ export interface WorkerOptions {
   capacity?: number;
   /** How long one poll waits for work, in milliseconds. Default 10,000. */
   pollMs?: number;
+  /** A token with the `work` permission, if the server has authentication. */
+  token?: string;
 }
 
 interface RawInvocation {
@@ -80,6 +82,7 @@ export class Worker {
   readonly url: string;
   readonly capacity: number;
   readonly pollMs: number;
+  #token: string | undefined;
   #steps = new Map<string, Step>();
   #stopping = false;
   #abort = new AbortController();
@@ -89,6 +92,7 @@ export class Worker {
     this.url = options.url.replace(/\/+$/, "");
     this.capacity = Math.max(1, options.capacity ?? 4);
     this.pollMs = options.pollMs ?? 10_000;
+    this.#token = options.token;
   }
 
   /** Implements step `name`. */
@@ -139,9 +143,11 @@ export class Worker {
   }
 
   async #post(path: string, body: unknown): Promise<any> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.#token !== undefined) headers.authorization = `Bearer ${this.#token}`;
     const response = await fetch(this.url + path, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: this.#abort.signal,
     });

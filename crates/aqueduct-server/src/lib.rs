@@ -16,10 +16,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
+pub mod auth;
 mod push;
 mod workers;
 mod workflows;
 
+pub use audit::Audit;
+pub use auth::{Authenticator, Permission, Principal, Refusal};
 pub use push::{Config, PushEndpoint};
 
 use std::future::Future;
@@ -65,21 +69,33 @@ pub async fn serve(
         .await
 }
 
-/// [`serve`], with a [`Config`]: its push endpoints are started (the engine's step routes must already
-/// be set from it, with [`Config::apply`]).
+/// [`serve`], with a [`Config`] and [`Security`]: its push endpoints are started (the engine's step
+/// routes must already be set from it, with [`Config::apply`]), and requests are authenticated and
+/// audited.
 pub async fn serve_with(
     engine: Arc<Engine>,
     listener: tokio::net::TcpListener,
     config: &Config,
+    security: Security,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     push::start(&engine, config).map_err(std::io::Error::other)?;
-    serve(engine, listener, shutdown).await
+    axum::serve(listener, router_secured(engine, security))
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 /// The routes, gRPC and HTTP/JSON, for serving with axum or another tower server.
 pub fn router(engine: Arc<Engine>) -> Router {
-    let api = Api { engine };
+    router_secured(engine, Security::none())
+}
+
+/// [`router`], with authentication and an audit log (ADR 0041).
+pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
+    let api = Api {
+        engine,
+        security: Arc::new(security),
+    };
     // One set of gRPC routes for both services: each set has its own fallback, and a router can have
     // only one.
     let grpc = tonic::service::Routes::new(v1::ingress_server::IngressServer::new(api.clone()))
@@ -98,7 +114,9 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/v1/escalations", get(http_escalations))
         .route("/v1/escalations/{id}", post(http_resolve))
         .with_state(api.clone());
-    grpc.merge(http).merge(workers::routes(api))
+    grpc.merge(http)
+        .merge(workers::routes(api.clone()))
+        .layer(axum::middleware::from_fn_with_state(api, authorize))
 }
 
 /// Why a call failed, in terms both transports can say.
@@ -117,6 +135,110 @@ enum Kind {
     Rejected,
     Unavailable,
     Internal,
+    Unauthenticated,
+    Forbidden,
+}
+
+/// The server's authentication and audit log (ADR 0041).
+#[derive(Debug)]
+pub struct Security {
+    /// Who may do what.
+    pub auth: Authenticator,
+    /// What was done.
+    pub audit: Audit,
+}
+
+impl Security {
+    /// By a data directory's tokens file, if it has one, and its audit log.
+    pub fn for_dir(dir: &std::path::Path) -> Result<Security, String> {
+        Ok(Security {
+            auth: Authenticator::for_dir(dir),
+            audit: Audit::open(dir)?,
+        })
+    }
+
+    /// No authentication, and no audit log.
+    pub fn none() -> Security {
+        Security {
+            auth: Authenticator::none(),
+            audit: Audit::none(),
+        }
+    }
+}
+
+tokio::task_local! {
+    /// Who made the request being handled.
+    static PRINCIPAL: Principal;
+}
+
+/// The permission a route needs, and its name in the audit log. A route not listed needs `admin`, so a
+/// new route is closed until it is given a permission here.
+fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static str) {
+    use axum::http::Method;
+    if let Some(call) = path.strip_prefix("/aqueduct.v1.Ingress/") {
+        return match call {
+            "Start" => (Permission::Start, "start"),
+            "Signal" => (Permission::Signal, "signal"),
+            "CompleteAwakeable" => (Permission::Signal, "complete awakeable"),
+            "Update" => (Permission::Signal, "update"),
+            "Cancel" => (Permission::Cancel, "cancel"),
+            "ResolveEscalation" => (Permission::Resolve, "resolve"),
+            "Wait" | "Describe" | "ListRuns" | "Query" | "ListEscalations" => {
+                (Permission::Read, "read")
+            }
+            _ => (Permission::Admin, "unknown call"),
+        };
+    }
+    if path == "/aqueduct.v1.Workers/Work" || path == "/aqueduct.v1.Workflows/Serve" {
+        return (Permission::Work, "work");
+    }
+    if path.starts_with("/v1/workers/") {
+        return (Permission::Work, "work");
+    }
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match (method, parts.as_slice()) {
+        (&Method::POST, ["v1", "runs"]) => (Permission::Start, "start"),
+        (&Method::POST, ["v1", "runs", _, "signals", _]) => (Permission::Signal, "signal"),
+        (&Method::POST, ["v1", "runs", _, "updates", _]) => (Permission::Signal, "update"),
+        (&Method::POST, ["v1", "runs", _, "cancel"]) => (Permission::Cancel, "cancel"),
+        (&Method::POST, ["v1", "awakeables", _]) => (Permission::Signal, "complete awakeable"),
+        (&Method::POST, ["v1", "escalations", _]) => (Permission::Resolve, "resolve"),
+        (&Method::GET, ["v1", "runs", ..] | ["v1", "escalations"]) => (Permission::Read, "read"),
+        _ => (Permission::Admin, "unknown route"),
+    }
+}
+
+/// Checks every request, gRPC and HTTP alike, before it reaches a handler.
+async fn authorize(
+    State(api): State<Api>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let (needed, action) = required(request.method(), request.uri().path());
+    let header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let refusal = match api.security.auth.check(header, needed) {
+        Ok(principal) => return PRINCIPAL.scope(principal, next.run(request)).await,
+        Err(refusal) => refusal,
+    };
+    let path = request.uri().path().to_owned();
+    let grpc = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/grpc"));
+    let (kind, message) = match refusal {
+        Refusal::Unauthenticated(message) => (Kind::Unauthenticated, message),
+        Refusal::Forbidden(message) => (Kind::Forbidden, message),
+    };
+    api.audit(action, path, format!("refused: {message}")).await;
+    let failure = Failure { kind, message };
+    if grpc {
+        return tonic::Status::from(failure).into_http();
+    }
+    failure.into_response()
 }
 
 impl Failure {
@@ -164,6 +286,8 @@ impl From<Failure> for tonic::Status {
             Kind::Rejected => tonic::Code::FailedPrecondition,
             Kind::Unavailable => tonic::Code::Unavailable,
             Kind::Internal => tonic::Code::Internal,
+            Kind::Unauthenticated => tonic::Code::Unauthenticated,
+            Kind::Forbidden => tonic::Code::PermissionDenied,
         };
         tonic::Status::new(code, failure.message)
     }
@@ -179,6 +303,8 @@ impl IntoResponse for Failure {
             Kind::Rejected => StatusCode::UNPROCESSABLE_ENTITY,
             Kind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Kind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Kind::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Kind::Forbidden => StatusCode::FORBIDDEN,
         };
         (status, Json(json!({ "error": self.message }))).into_response()
     }
@@ -188,9 +314,41 @@ impl IntoResponse for Failure {
 #[derive(Clone)]
 struct Api {
     engine: Arc<Engine>,
+    security: Arc<Security>,
 }
 
 impl Api {
+    /// Records an action in the audit log, for whoever made this request.
+    async fn audit(&self, action: &'static str, target: String, outcome: String) {
+        if !self.security.audit.is_enabled() {
+            return;
+        }
+        let who = PRINCIPAL
+            .try_with(|principal| principal.name().to_owned())
+            .unwrap_or_else(|_| "anyone".to_owned());
+        let security = Arc::clone(&self.security);
+        // Lines are synced to disk: not on the async threads.
+        let _ = tokio::task::spawn_blocking(move || {
+            security.audit.record(&who, action, &target, &outcome);
+        })
+        .await;
+    }
+
+    /// Records the outcome of an action, and passes it on.
+    async fn audited<T>(
+        &self,
+        action: &'static str,
+        target: String,
+        result: Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let outcome = match &result {
+            Ok(_) => "ok".to_owned(),
+            Err(failure) => format!("failed: {}", failure.message),
+        };
+        self.audit(action, target, outcome).await;
+        result
+    }
+
     async fn call<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Engine) -> Result<T, EngineError> + Send + 'static,
@@ -206,6 +364,12 @@ impl Api {
     }
 
     async fn start(&self, start: v1::StartRequest) -> Result<v1::StartResponse, Failure> {
+        let target = start.key.clone();
+        let result = self.do_start(start).await;
+        self.audited("start", target, result).await
+    }
+
+    async fn do_start(&self, start: v1::StartRequest) -> Result<v1::StartResponse, Failure> {
         let input = json_payload("the input", start.input)?;
         let reuse = match v1::ReusePolicy::try_from(start.reuse) {
             Ok(v1::ReusePolicy::ReturnExisting) => ReusePolicy::ReturnExisting,
@@ -269,6 +433,12 @@ impl Api {
     }
 
     async fn signal(&self, signal: v1::SignalRequest) -> Result<v1::Ack, Failure> {
+        let target = format!("{} {}", signal.key, signal.name);
+        let result = self.do_signal(signal).await;
+        self.audited("signal", target, result).await
+    }
+
+    async fn do_signal(&self, signal: v1::SignalRequest) -> Result<v1::Ack, Failure> {
         let payload = json_payload("the payload", signal.payload)?;
         self.call(move |engine| engine.signal(&signal.key, &signal.name, &signal.id, payload))
             .await?;
@@ -276,6 +446,16 @@ impl Api {
     }
 
     async fn complete_awakeable(&self, id: String, payload: Vec<u8>) -> Result<v1::Ack, Failure> {
+        let target = id.clone();
+        let result = self.do_complete_awakeable(id, payload).await;
+        self.audited("complete awakeable", target, result).await
+    }
+
+    async fn do_complete_awakeable(
+        &self,
+        id: String,
+        payload: Vec<u8>,
+    ) -> Result<v1::Ack, Failure> {
         let payload = json_payload("the payload", payload)?;
         self.call(move |engine| engine.complete_awakeable(&id, payload))
             .await?;
@@ -283,6 +463,12 @@ impl Api {
     }
 
     async fn cancel(&self, key: String, reason: String) -> Result<v1::Ack, Failure> {
+        let target = key.clone();
+        let result = self.do_cancel(key, reason).await;
+        self.audited("cancel", target, result).await
+    }
+
+    async fn do_cancel(&self, key: String, reason: String) -> Result<v1::Ack, Failure> {
         let reason = if reason.is_empty() {
             "cancelled through the ingress".to_owned()
         } else {
@@ -299,6 +485,20 @@ impl Api {
     }
 
     async fn update(&self, update: v1::UpdateRequest) -> Result<v1::UpdateResponse, Failure> {
+        let target = format!("{} {}", update.key, update.name);
+        let result = self.do_update(update).await;
+        if let Ok(v1::UpdateResponse {
+            answer: Some(v1::update_response::Answer::Rejected(why)),
+        }) = &result
+        {
+            self.audit("update", target, format!("rejected: {why}"))
+                .await;
+            return result;
+        }
+        self.audited("update", target, result).await
+    }
+
+    async fn do_update(&self, update: v1::UpdateRequest) -> Result<v1::UpdateResponse, Failure> {
         let payload = json_payload("the payload", update.payload)?;
         let timeout = timeout(update.timeout_ms);
         let answer = self
@@ -335,6 +535,12 @@ impl Api {
     }
 
     async fn resolve(&self, id: String, outcome: Vec<u8>) -> Result<v1::Ack, Failure> {
+        let target = id.clone();
+        let result = self.do_resolve(id, outcome).await;
+        self.audited("resolve", target, result).await
+    }
+
+    async fn do_resolve(&self, id: String, outcome: Vec<u8>) -> Result<v1::Ack, Failure> {
         let outcome = json_payload("the outcome", outcome)?;
         self.call(move |engine| engine.resolve_escalation(&id, outcome))
             .await?;

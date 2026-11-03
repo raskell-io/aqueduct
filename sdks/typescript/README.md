@@ -22,6 +22,8 @@ await worker.run();
   them from 1.
 - At most `capacity` steps run at once; `worker.stop()` makes `run()` resolve.
 
+If the server has authentication, give the worker a token with the `work` permission: `new Worker({..., token: "aqd_..."})`.
+
 **As a push endpoint** (for serverless platforms; ADR 0040), the same steps answer the server's
 requests instead of polling: `worker.handlePush(body)` turns a request body into the status and answer to send back, for
 use in a function handler, and `worker.servePush(port)` serves it over HTTP. Configure the server to push the steps'

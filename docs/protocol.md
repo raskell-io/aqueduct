@@ -24,7 +24,13 @@ gives the HTTP/JSON form of each call.
   - `INVALID_ARGUMENT` / 400: a payload is not JSON, or a key is invalid;
   - `DEADLINE_EXCEEDED` / 504: a wait or an update timed out;
   - `FAILED_PRECONDITION` / 422: an update was rejected, or a resolution does not match its schema;
-  - `UNAVAILABLE` / 503: the server is overloaded or stopping; retry later.
+  - `UNAVAILABLE` / 503: the server is overloaded or stopping; retry later;
+  - `UNAUTHENTICATED` / 401: no token, or one the server does not know;
+  - `PERMISSION_DENIED` / 403: the token lacks the permission.
+- **Authentication** (ADR 0041). If the server's data directory has tokens, every request carries one:
+  `authorization: Bearer <token>`, as an HTTP header or gRPC metadata. The permissions are `read` (wait,
+  describe, list, query, list escalations), `start`, `signal` (signals, awakeables, updates), `cancel`,
+  `resolve`, `work` (step and workflow workers) and `admin` (everything).
 
 ## 2. Ingress (`aqueduct.v1.Ingress`)
 
@@ -127,7 +133,7 @@ journal as it does for local logic.
 ## 5. Not in this draft yet
 - **Push endpoints:** the server calls an HTTP endpoint per invocation, for serverless platforms.
 - **Named task queues** and deployments across workers.
-- **Authentication, authorisation and namespaces.** Until they exist, the server binds to loopback
-  by default.
+- **TLS on the server, OIDC/JWT and namespaces.** Until the server has TLS, it binds to loopback by
+  default.
 - **Version management** over the network (register, propose, prove, approve): for now through
   `aqueduct versions` on the server's data directory, and the MCP server.

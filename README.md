@@ -222,7 +222,11 @@ curl -s localhost:7470/v1/runs -d '{"key": "claim-7", "workflow": "claims", "inp
 curl -s 'localhost:7470/v1/runs/claim-7/result?timeout_ms=10000'
 ```
 
-It has no authentication yet, so it listens on loopback unless told otherwise. A procedure's steps run
+**Tokens** turn authentication on: `aqueduct tokens create ./data --name billing-worker --permissions
+work` prints a secret once and stores only its hash; every route then needs its permission, and a
+hash-chained audit log records who did what, and every refused request (`aqueduct audit ./data`;
+[ADR 0041](docs/adr/0041-authentication.md)). The server has no TLS yet, so it still listens on loopback
+unless told otherwise. A procedure's steps run
 on **step workers**: processes in any language that connect to the server, say which steps they
 implement, and run what they are sent, over a gRPC stream or HTTP long polling. A worker holds each
 step under a lease; if it crashes or its result is lost, the step goes to another worker, and the run

@@ -242,6 +242,13 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
         .port();
     let config = config(transport, push_port);
     let engine = Arc::new(engine(&dir, transport, &config)?);
+    // Authentication is on: the worker under test must present a token with the `work` permission.
+    let token = aqueduct_server::auth::create_token(
+        &dir,
+        "conformance",
+        [aqueduct_server::Permission::Work].into(),
+    )?;
+    let security = aqueduct_server::Security::for_dir(&dir)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| e.to_string())?;
@@ -252,7 +259,8 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
     let server = {
         let (engine, config) = (Arc::clone(&engine), config.clone());
         tokio::spawn(async move {
-            aqueduct_server::serve_with(engine, listener, &config, std::future::pending()).await
+            aqueduct_server::serve_with(engine, listener, &config, security, std::future::pending())
+                .await
         })
     };
 
@@ -265,7 +273,8 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
             let mut built = STEPS.iter().fold(
                 aqueduct_worker::Worker::new("conformance")
                     .capacity(8)
-                    .queue(QUEUE),
+                    .queue(QUEUE)
+                    .token(&token),
                 |worker, name| {
                     worker.step(name, |i| {
                         match step(
@@ -295,7 +304,11 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
         }
         Transport::Command(command) | Transport::Push(command) => {
             let mut process = tokio::process::Command::new("sh");
-            process.arg("-c").arg(command).env("AQUEDUCT_URL", &url);
+            process
+                .arg("-c")
+                .arg(command)
+                .env("AQUEDUCT_URL", &url)
+                .env("AQUEDUCT_TOKEN", &token);
             // Only a push endpoint is told its port: a worker that has one serves pushes.
             if let Transport::Push(_) = transport {
                 process.env("AQUEDUCT_PUSH_PORT", push_port.to_string());

@@ -25,6 +25,8 @@ worker.run()
   them from 1.
 - `capacity` threads each run one step at a time; `worker.stop()` ends `run()`.
 
+If the server has authentication, give the worker a token with the `work` permission: `Worker(..., token="aqd_...")`.
+
 **As a push endpoint** (for serverless platforms; ADR 0040), the same steps answer the server's
 requests instead of polling: `worker.handle_push(body)` turns a request body into the status and answer to send back, for
 use in a function handler, and `worker.serve_push(port)` serves it over HTTP. Configure the server to push the steps'

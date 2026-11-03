@@ -48,10 +48,17 @@ commands:
   server <dir> [--listen <address>] [--listen-anywhere] [--config <file.json>]
                                       serve the directory's approved procedures over gRPC and
                                       HTTP/JSON (protocol v1, draft; ADR 0038) on 127.0.0.1:7470;
-                                      until there is authentication, an address other than loopback
+                                      until the server has TLS, an address other than loopback
                                       needs --listen-anywhere. Steps run on workers; the config
                                       routes them to named queues and push endpoints (ADR 0040).
                                       Ctrl-C or SIGTERM stops it
+  tokens create <dir> --name <name> --permissions <p,p,...>
+                                      create a token for the server (ADR 0041) and print it, once;
+                                      the first token turns authentication on. Permissions: read,
+                                      start, signal, cancel, resolve, work, admin
+  tokens list <dir>                   tokens: name and permissions (secrets are not stored)
+  tokens revoke <dir> <name>          revoke a token; it stops working at once
+  audit <dir>                         verify the server's audit log and print it
   mcp <dir> [--as <identity>] [--read-only]
                                       serve the Model Context Protocol on stdio, for agents: propose,
                                       validate and replay versions, start and inspect runs, resolve
@@ -177,6 +184,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
         }
         Some("start") => start(Path::new(arg(1, "data directory")?), &args[2..]),
         Some("server") => server(Path::new(arg(1, "data directory")?), &args[2..]),
+        Some("tokens") => tokens(&args[1..]),
+        Some("audit") => audit(Path::new(arg(1, "data directory")?)),
         Some("metrics") => metrics(
             Path::new(arg(1, "data directory")?),
             args.get(2).map(String::as_str),
@@ -297,10 +306,89 @@ fn signal(
     Ok(format!("signal {name} sent to {key} ({state})\n"))
 }
 
+/// `aqueduct tokens ...`.
+fn tokens(args: &[String]) -> Result<String, String> {
+    use aqueduct_server::auth;
+    let usage = || format!("tokens needs create, list or revoke\n\n{USAGE}");
+    let (Some(command), Some(dir)) = (args.first(), args.get(1)) else {
+        return Err(usage());
+    };
+    let dir = Path::new(dir);
+    let log = |action: &str, target: &str| {
+        aqueduct_server::Audit::open(dir).map(|audit| audit.record("cli", action, target, "ok"))
+    };
+    match command.as_str() {
+        "create" => {
+            let (mut name, mut permissions) = (None, std::collections::BTreeSet::new());
+            let mut rest = args[2..].iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--name" => name = rest.next().cloned(),
+                    "--permissions" => {
+                        let list = rest.next().ok_or("--permissions needs a list")?;
+                        for permission in list.split(',') {
+                            permissions.insert(aqueduct_server::Permission::parse(permission)?);
+                        }
+                    }
+                    other => return Err(format!("unknown option `{other}`")),
+                }
+            }
+            let name = name.ok_or("tokens create needs --name")?;
+            let token = auth::create_token(dir, &name, permissions)?;
+            log("token create", &name)?;
+            Ok(format!(
+                "{token}\n# Token `{name}`: keep it secret, it is not stored and will not be shown again.\n"
+            ))
+        }
+        "list" => {
+            let mut out = String::new();
+            for token in auth::list_tokens(dir)? {
+                let permissions: Vec<&str> = token.permissions.iter().map(|p| p.as_str()).collect();
+                out.push_str(&format!("{}  {}\n", token.name, permissions.join(",")));
+            }
+            Ok(out)
+        }
+        "revoke" => {
+            let name = args.get(2).ok_or("tokens revoke needs a name")?;
+            auth::revoke_token(dir, name)?;
+            log("token revoke", name)?;
+            Ok(format!("token `{name}` revoked\n"))
+        }
+        _ => Err(usage()),
+    }
+}
+
+/// `aqueduct audit`: verifies the audit log's chain and prints it.
+fn audit(dir: &Path) -> Result<String, String> {
+    let path = aqueduct_server::audit::audit_path(dir);
+    if !path.exists() {
+        return Ok("no audit log\n".to_owned());
+    }
+    let (lines, head) = aqueduct_server::audit::verify(&path)?;
+    let mut out = String::new();
+    let field =
+        |line: &serde_json::Value, name: &str| line[name].as_str().unwrap_or_default().to_owned();
+    for line in &lines {
+        out.push_str(&format!(
+            "{}  {}  {}  {}  {}\n",
+            line["time_ms"],
+            field(line, "who"),
+            field(line, "action"),
+            field(line, "target"),
+            field(line, "outcome")
+        ));
+    }
+    out.push_str(&format!(
+        "{} lines, chain verified, head {head}\n",
+        lines.len()
+    ));
+    Ok(out)
+}
+
 /// `aqueduct server`'s options: where it listens (`--listen`, or loopback on the default port; anything
-/// but loopback needs `--listen-anywhere` until the server has authentication, ADR 0038), and its
-/// configuration (`--config`, ADR 0040).
+/// but loopback needs `--listen-anywhere`, ADR 0041), and its configuration (`--config`, ADR 0040).
 fn server_options(
+    dir: &Path,
     args: &[String],
 ) -> Result<(std::net::SocketAddr, aqueduct_server::Config), String> {
     let mut address = std::net::SocketAddr::from(([127, 0, 0, 1], aqueduct_server::DEFAULT_PORT));
@@ -324,8 +412,13 @@ fn server_options(
         }
     }
     if !aqueduct_server::is_loopback(&address) && !anywhere {
+        let why = if aqueduct_server::auth::tokens_path(dir).exists() {
+            "and the server has no TLS yet: tokens and payloads would cross the network in the clear"
+        } else {
+            "and this directory has no tokens (aqueduct tokens create): anyone who can reach the server could start, signal and cancel runs"
+        };
         return Err(format!(
-            "{address} is not a loopback address, and the server has no authentication yet: anyone who can reach it can start, signal and cancel runs. Pass --listen-anywhere to serve it anyway"
+            "{address} is not a loopback address, {why}. Pass --listen-anywhere to serve it anyway"
         ));
     }
     Ok((address, config))
@@ -333,7 +426,7 @@ fn server_options(
 
 /// Serves a data directory until Ctrl-C.
 fn server(dir: &Path, args: &[String]) -> Result<String, String> {
-    let (address, config) = server_options(args)?;
+    let (address, config) = server_options(dir, args)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let registry = Registry::open(dir).map_err(|e| e.to_string())?;
     // Steps run on step workers and push endpoints (ADR 0038, ADR 0040).
@@ -344,6 +437,12 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .open()
         .map_err(|e| e.to_string())?;
+    let security = aqueduct_server::Security::for_dir(dir)?;
+    if !security.auth.is_enabled() {
+        eprintln!(
+            "no tokens in this directory: requests are not authenticated (aqueduct tokens create)"
+        );
+    }
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(address)
@@ -376,9 +475,15 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
                 let _ = tokio::signal::ctrl_c().await;
             }
         };
-        aqueduct_server::serve_with(std::sync::Arc::new(engine), listener, &config, stop)
-            .await
-            .map_err(|e| e.to_string())
+        aqueduct_server::serve_with(
+            std::sync::Arc::new(engine),
+            listener,
+            &config,
+            security,
+            stop,
+        )
+        .await
+        .map_err(|e| e.to_string())
     })?;
     Ok("stopped\n".to_owned())
 }

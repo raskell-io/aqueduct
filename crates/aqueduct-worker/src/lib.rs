@@ -95,6 +95,7 @@ pub struct Worker {
     steps: BTreeMap<String, StepFn>,
     workflows: BTreeMap<String, WorkflowLogic>,
     queues: Vec<String>,
+    token: Option<String>,
 }
 
 impl Worker {
@@ -106,6 +107,7 @@ impl Worker {
             steps: BTreeMap::new(),
             workflows: BTreeMap::new(),
             queues: Vec::new(),
+            token: None,
         }
     }
 
@@ -123,6 +125,12 @@ impl Worker {
         step: impl Fn(&Invocation) -> Outcome + Send + Sync + 'static,
     ) -> Worker {
         self.steps.insert(name.to_owned(), Arc::new(step));
+        self
+    }
+
+    /// Authenticates with a token that has the `work` permission (ADR 0041).
+    pub fn token(mut self, token: &str) -> Worker {
+        self.token = Some(token.to_owned());
         self
     }
 
@@ -156,13 +164,28 @@ impl Worker {
             if self.steps.is_empty() {
                 return std::future::pending().await;
             }
-            serve_steps(url, &self.name, self.capacity, &self.steps, &self.queues).await
+            serve_steps(
+                url,
+                &self.name,
+                self.capacity,
+                &self.steps,
+                &self.queues,
+                self.token.as_deref(),
+            )
+            .await
         };
         let workflows = async {
             if self.workflows.is_empty() {
                 return std::future::pending().await;
             }
-            serve_workflows(url, &self.name, self.capacity, &self.workflows).await
+            serve_workflows(
+                url,
+                &self.name,
+                self.capacity,
+                &self.workflows,
+                self.token.as_deref(),
+            )
+            .await
         };
         tokio::select! {
             result = steps => result,
@@ -172,11 +195,41 @@ impl Worker {
     }
 }
 
-fn connect_error(url: &str) -> impl Fn(tonic::transport::Error) -> WorkerError + '_ {
-    move |e| WorkerError::Connect {
+/// Connects to the server.
+async fn connect(url: &str) -> Result<tonic::transport::Channel, WorkerError> {
+    let error = |e: tonic::transport::Error| WorkerError::Connect {
         url: url.to_owned(),
         error: e.to_string(),
-    }
+    };
+    tonic::transport::Endpoint::from_shared(url.to_owned())
+        .map_err(error)?
+        .connect()
+        .await
+        .map_err(error)
+}
+
+/// Adds the token to every request, if there is one.
+fn with_token(
+    token: Option<&str>,
+) -> Result<
+    impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + use<>,
+    WorkerError,
+> {
+    let header = token
+        .map(|token| format!("Bearer {token}").parse())
+        .transpose()
+        .map_err(|_| WorkerError::Session("the token is not a valid header value".into()))?;
+    Ok(
+        move |mut request: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+            if let Some(header) = &header {
+                request.metadata_mut().insert(
+                    "authorization",
+                    tonic::metadata::MetadataValue::clone(header),
+                );
+            }
+            Ok(request)
+        },
+    )
 }
 
 /// A session of the step-worker protocol. Dropping it aborts the steps in flight (their tasks hold the
@@ -187,10 +240,9 @@ async fn serve_steps(
     capacity: u32,
     steps: &BTreeMap<String, StepFn>,
     queues: &[String],
+    token: Option<&str>,
 ) -> Result<(), WorkerError> {
-    let mut client = WorkersClient::connect(url.to_owned())
-        .await
-        .map_err(connect_error(url))?;
+    let mut client = WorkersClient::with_interceptor(connect(url).await?, with_token(token)?);
     let (out, outbound) = mpsc::channel(64);
     let hello = v1::WorkerMessage {
         message: Some(v1::worker_message::Message::Hello(v1::Hello {
@@ -271,10 +323,9 @@ async fn serve_workflows(
     name: &str,
     capacity: u32,
     workflows: &BTreeMap<String, WorkflowLogic>,
+    token: Option<&str>,
 ) -> Result<(), WorkerError> {
-    let mut client = WorkflowsClient::connect(url.to_owned())
-        .await
-        .map_err(connect_error(url))?;
+    let mut client = WorkflowsClient::with_interceptor(connect(url).await?, with_token(token)?);
     let (out, outbound) = mpsc::channel(64);
     let hello = v1::WorkflowWorkerMessage {
         message: Some(v1::workflow_worker_message::Message::Hello(
