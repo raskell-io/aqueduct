@@ -235,6 +235,10 @@ Worker::new("billing")
     .await?;
 ```
 
+Step-worker libraries for [Python](sdks/python/README.md) (3.9+, standard library only) and
+[TypeScript](sdks/typescript/README.md) (Node 22.18+, no dependencies) do the same over HTTP. Every
+worker library passes the [conformance suite](conformance/README.md) (`mise run conformance`).
+
 Planned: the same semantics in a replicated cluster. The full design and phased plan are in [BRIEF.md](BRIEF.md).
 
 ## Testing it yourself

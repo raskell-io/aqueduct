@@ -53,7 +53,29 @@ use crate::{
 };
 
 /// A step implementation.
-pub type StepFn = Arc<dyn Fn(&Payload) -> Attempt + Send + Sync>;
+pub type StepFn = Arc<dyn Fn(&StepCall<'_>) -> Attempt + Send + Sync>;
+
+/// One attempt of a step, as a step function registered with [`Builder::step_with`] sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct StepCall<'a> {
+    /// The run's run id.
+    pub run: &'a str,
+    /// The step's command index in the run.
+    pub cmd: CommandIndex,
+    /// The step's name.
+    pub step: &'a str,
+    /// The step's input.
+    pub input: &'a Payload,
+    /// 1 for the first attempt: the attempts the run has recorded as failed, plus one.
+    pub attempt: u32,
+}
+
+impl StepCall<'_> {
+    /// The same for every attempt of this step: pass it to external systems to deduplicate.
+    pub fn idempotency_key(&self) -> aqueduct_core::IdempotencyKey {
+        aqueduct_core::IdempotencyKey::new(aqueduct_core::split_run_id(self.run).0, 0, self.cmd)
+    }
+}
 
 /// The result of one attempt of a step (ADR 0012).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,7 +287,21 @@ impl Builder {
     ) -> Self {
         self.steps.insert(
             name.to_owned(),
-            Arc::new(move |input: &Payload| step(input).into()),
+            Arc::new(move |call: &StepCall<'_>| step(call.input).into()),
+        );
+        self
+    }
+
+    /// Registers a step function that also sees which run, command and attempt it runs for, and the
+    /// step's idempotency key ([`StepCall`]).
+    pub fn step_with<R: Into<Attempt>>(
+        mut self,
+        name: &str,
+        step: impl Fn(&StepCall<'_>) -> R + Send + Sync + 'static,
+    ) -> Self {
+        self.steps.insert(
+            name.to_owned(),
+            Arc::new(move |call: &StepCall<'_>| step(call).into()),
         );
         self
     }
@@ -753,6 +789,8 @@ struct Job {
     input: Payload,
     /// For an agent call: its token budget. `None` for a step.
     agent: Option<u64>,
+    /// The attempt: the run's recorded failed attempts of the command, plus one.
+    attempt: u32,
 }
 
 struct Processor {
@@ -1042,6 +1080,14 @@ impl Processor {
         Ok(())
     }
 
+    /// The attempt a dispatch of `cmd` is: the run's recorded failed attempts of it, plus one.
+    fn attempt(&self, key: &str, cmd: CommandIndex) -> u32 {
+        self.partition
+            .run(key)
+            .and_then(|run| run.state().steps().get(cmd.0 as usize))
+            .map_or(1, |step| step.failed_attempts + 1)
+    }
+
     /// Called right after a flush: sends the answers computed before it, and answers accepted updates
     /// whose run has answered them, or has ended without doing so.
     fn answer_updates(&mut self) -> Result<(), PartitionError> {
@@ -1090,8 +1136,9 @@ impl Processor {
                     .as_ref()
                     .is_some_and(|(_, local)| !local.contains(&name)) =>
                 {
+                    let attempt = self.attempt(&key, cmd);
                     if let Some((queue, _)) = &self.remote {
-                        queue.offer(&key, cmd, &name, input, queue.now_ms());
+                        queue.offer(&key, cmd, &name, input, attempt, queue.now_ms());
                     }
                 }
                 Outbound::Dispatch {
@@ -1100,12 +1147,14 @@ impl Processor {
                     name,
                     input,
                 } => {
+                    let attempt = self.attempt(&key, cmd);
                     let _ = self.jobs.send(Job {
                         key,
                         cmd,
                         name,
                         input,
                         agent: None,
+                        attempt,
                     });
                 }
                 Outbound::DispatchAgent {
@@ -1115,12 +1164,14 @@ impl Processor {
                     request,
                     budget_tokens,
                 } => {
+                    let attempt = self.attempt(&key, cmd);
                     let _ = self.jobs.send(Job {
                         key,
                         cmd,
                         name,
                         input: request,
                         agent: Some(budget_tokens),
+                        attempt,
                     });
                 }
                 Outbound::Signaled { key }
@@ -1277,8 +1328,16 @@ fn worker(
         let attempt = match steps.get(&job.name) {
             // A deployment problem, not a property of the input: retry, so registering the step heals it.
             None => Attempt::Retry(format!("no step named `{}` is registered", job.name)),
-            Some(step) => catch_unwind(AssertUnwindSafe(|| step(&job.input)))
-                .unwrap_or_else(|_| Attempt::Retry(format!("step `{}` panicked", job.name))),
+            Some(step) => catch_unwind(AssertUnwindSafe(|| {
+                step(&StepCall {
+                    run: &job.key,
+                    cmd: job.cmd,
+                    step: &job.name,
+                    input: &job.input,
+                    attempt: job.attempt,
+                })
+            }))
+            .unwrap_or_else(|_| Attempt::Retry(format!("step `{}` panicked", job.name))),
         };
         if let Some(observer) = observer {
             let end = match &attempt {

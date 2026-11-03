@@ -91,7 +91,8 @@ struct Held {
 
 /// Flushes the partition and offers its dispatches to the queue.
 fn flush(partition: &mut Partition<MemLog>, queue: &StepQueue, now: u64) {
-    for message in partition.flush().unwrap() {
+    let messages = partition.flush().unwrap();
+    for message in messages {
         if let Outbound::Dispatch {
             key,
             cmd,
@@ -99,7 +100,11 @@ fn flush(partition: &mut Partition<MemLog>, queue: &StepQueue, now: u64) {
             input,
         } = message
         {
-            queue.offer(&key, cmd, &name, input, now);
+            let attempt = partition
+                .run(&key)
+                .and_then(|run| run.state().steps().get(cmd.0 as usize))
+                .map_or(1, |step| step.failed_attempts + 1);
+            queue.offer(&key, cmd, &name, input, attempt, now);
         }
     }
 }

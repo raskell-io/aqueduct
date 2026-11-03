@@ -229,18 +229,9 @@ async fn http_poll(State(api): State<Api>, Body(poll): Body<Poll>) -> Result<Jso
 
 #[derive(Deserialize)]
 struct Results {
-    results: Vec<ResultBody>,
-}
-
-#[derive(Deserialize)]
-struct ResultBody {
-    invocation_id: String,
-    #[serde(default)]
-    completed: Option<Value>,
-    #[serde(default)]
-    failed: Option<String>,
-    #[serde(default)]
-    retry: Option<String>,
+    /// Objects with an `invocation_id` and exactly one of `completed` (any JSON, `null` included),
+    /// `failed` and `retry`.
+    results: Vec<serde_json::Map<String, Value>>,
 }
 
 async fn http_results(
@@ -249,19 +240,23 @@ async fn http_results(
 ) -> Result<Json<Value>, Failure> {
     let queue = api.queue()?;
     for result in results.results {
-        let outcome = match (result.completed, result.failed, result.retry) {
+        let text = |field: &str| result.get(field).map(|v| v.as_str().map(str::to_owned));
+        let outcome = match (result.get("completed"), text("failed"), text("retry")) {
             (Some(value), None, None) => {
                 Attempt::Completed(aqueduct_core::Payload::new(value.to_string().into_bytes()))
             }
-            (None, Some(error), None) => Attempt::Fail(error),
-            (None, None, Some(error)) => Attempt::Retry(error),
+            (None, Some(Some(error)), None) => Attempt::Fail(error),
+            (None, None, Some(Some(error))) => Attempt::Retry(error),
             _ => {
                 return Err(Failure::invalid(
-                    "a result has exactly one of completed, failed and retry",
+                    "a result has exactly one of completed (any JSON), failed and retry (strings)",
                 ));
             }
         };
-        record(&api.engine, &queue, &result.invocation_id, outcome)?;
+        let Some(id) = result.get("invocation_id").and_then(Value::as_str) else {
+            return Err(Failure::invalid("a result needs its invocation_id"));
+        };
+        record(&api.engine, &queue, id, outcome)?;
     }
     Ok(Json(json!({})))
 }
