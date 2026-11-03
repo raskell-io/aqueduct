@@ -52,6 +52,7 @@ pub mod registry {
 
 /// The embedded engine: a durable engine inside your process.
 pub mod embedded {
+    pub use aqueduct_core::AgentResponse;
     pub use aqueduct_engine::embedded::{
         Attempt, Builder, Engine, EngineError, EngineStats, Escalation, RunResult,
     };

@@ -138,6 +138,16 @@ with `engine.escalations()` or `aqueduct escalations`, and resolve them with `re
 reference pipeline with all of it: concurrent steps, a review through an awakeable with a deadline, and
 an escalation when nobody reviews in time.
 
+Two examples show the path from agents to procedures, with a stand-in model so they need no API key:
+
+- [`crystallise.rs`](crates/aqueduct/examples/crystallise.rs): an agent triages claims; then, through
+  the MCP server, it writes a procedure from what it did (rules for the clear cases, the agent only for
+  the rest), proposes it and replays it against its past runs. The report shows the one claim it got
+  wrong; a person approves the version with a signature, and new claims cost a third of the tokens.
+- [`bounded_agent.rs`](crates/aqueduct/examples/bounded_agent.rs): one agent step under a token budget
+  and an output schema; a run whose budget is too small escalates for more, an answer that does not
+  match the schema goes to a person, and a restart makes no model call again.
+
 ## Guarantees
 
 What holds today, for the embedded engine, and how it is checked:

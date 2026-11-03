@@ -4,4 +4,6 @@ quickstart-data/
 approval-data/
 order-saga-data/
 ingest-data/
+crystallise-data/
+bounded-agent-data/
 .claude/settings.local.json
