@@ -8,12 +8,15 @@ scenario, and checks its outcome.
 cargo run -p aqueduct-conformance                                  # steps in process, then the Rust worker over gRPC
 cargo run -p aqueduct-conformance -- --worker "python3 sdks/python/conformance_worker.py"
 cargo run -p aqueduct-conformance -- --worker "node sdks/typescript/conformance_worker.ts"
+cargo run -p aqueduct-conformance -- --push "python3 sdks/python/conformance_worker.py"   # as a push endpoint
 mise run conformance                                               # all of them, as CI runs them
 ```
 
 The worker under test is started with `AQUEDUCT_URL` set to the server's address (for example
 `http://127.0.0.1:50123`). It must connect, implement the steps below, and keep running until it is
-killed.
+killed. With `--push`, it is started with `AQUEDUCT_PUSH_PORT` instead and must serve the steps as a push
+endpoint (ADR 0040) on `127.0.0.1:$AQUEDUCT_PUSH_PORT`: the steps are routed to the named queue
+`conformance`, and the server posts each invocation to it.
 
 ## The steps a conformance worker implements
 

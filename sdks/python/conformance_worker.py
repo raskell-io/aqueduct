@@ -12,7 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aqueduct_worker import Failure, Retry, Worker  # noqa: E402
 
-worker = Worker("conformance-python", url=os.environ["AQUEDUCT_URL"], capacity=8, poll_ms=1_000)
+worker = Worker(
+    "conformance-python", url=os.environ.get("AQUEDUCT_URL", ""), capacity=8, poll_ms=1_000
+)
 
 
 @worker.step("conformance.echo")
@@ -56,4 +58,7 @@ def sleep(ms, invocation):
     return ms
 
 
-worker.run()
+if os.environ.get("AQUEDUCT_PUSH_PORT"):
+    worker.serve_push(int(os.environ["AQUEDUCT_PUSH_PORT"]))
+else:
+    worker.run()

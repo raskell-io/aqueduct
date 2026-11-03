@@ -33,10 +33,13 @@ message WorkerMessage {
 message Hello {
   // A name for the worker, for logs and the console.
   string worker = 1;
-  // The step names it implements.
+  // The step names it implements: it takes steps from the queues of these names (by default, a step's
+  // queue is its own name).
   repeated string steps = 2;
   // How many invocations it runs at once: its initial credit.
   uint32 capacity = 3;
+  // Named task queues it takes steps from (ADR 0040), besides the queues of its step names.
+  repeated string queues = 4;
 }
 
 message ServerMessage {

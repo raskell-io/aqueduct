@@ -81,7 +81,19 @@ Each finished invocation returns one unit of credit implicitly. A `credit` messa
 | `POST /v1/workers/poll` | `{"worker", "steps": [...], "max", "wait_ms"}` | `{"invocations": [...]}`, empty after `wait_ms` |
 | `POST /v1/workers/results` | `{"results": [{"invocation_id", "completed" \| "failed" \| "retry"}]}` | `{}` |
 
-### 3.3 Delivery
+### 3.3 Named task queues and push endpoints (ADR 0040)
+
+- **Queues.** A step waits in a queue: by default the queue of its own name, or a named queue the
+  server's configuration routes it to (`{"queues": {"billing": ["charge", "refund"]}}`). A worker takes
+  from the queues of its step names, and from the named queues in its `Hello` (`queues`) or its poll
+  (`"queues"`).
+- **Push endpoints.** A configured endpoint (`{"push": [{"queue", "url", "concurrency", "timeout_ms",
+  "headers"}]}`) receives a queue's steps, one `POST` per invocation, with a JSON body of the same shape
+  as a polled invocation, and an `aqueduct-idempotency-key` header. It answers `200` with
+  `{"completed": <any JSON>}`, `{"failed": "..."}` or `{"retry": "..."}`. Any other status, a timeout,
+  or an answer of another shape is a retryable failure.
+
+### 3.4 Delivery
 
 - **Leases.** An invocation is leased to one worker for `lease_ms`. If its result does not arrive
   within the lease, or the worker's stream ends, the invocation is offered again: to the same worker

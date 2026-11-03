@@ -13,8 +13,9 @@ async fn main() -> std::process::ExitCode {
             Transport::RemoteWorkflows,
         ],
         [flag, command] if flag == "--worker" => vec![Transport::Command(command.clone())],
+        [flag, command] if flag == "--push" => vec![Transport::Push(command.clone())],
         _ => {
-            eprintln!("usage: aqueduct-conformance [--worker <command>]");
+            eprintln!("usage: aqueduct-conformance [--worker <command> | --push <command>]");
             return std::process::ExitCode::from(2);
         }
     };

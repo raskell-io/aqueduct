@@ -16,8 +16,11 @@
 
 #![forbid(unsafe_code)]
 
+mod push;
 mod workers;
 mod workflows;
+
+pub use push::{Config, PushEndpoint};
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -60,6 +63,18 @@ pub async fn serve(
     axum::serve(listener, router(engine))
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// [`serve`], with a [`Config`]: its push endpoints are started (the engine's step routes must already
+/// be set from it, with [`Config::apply`]).
+pub async fn serve_with(
+    engine: Arc<Engine>,
+    listener: tokio::net::TcpListener,
+    config: &Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    push::start(&engine, config).map_err(std::io::Error::other)?;
+    serve(engine, listener, shutdown).await
 }
 
 /// The routes, gRPC and HTTP/JSON, for serving with axum or another tower server.

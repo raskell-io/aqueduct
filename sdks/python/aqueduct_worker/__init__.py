@@ -16,19 +16,24 @@ pool of threads, and sends back each outcome::
 
     worker.run()
 
+The same steps can be served as a **push endpoint** instead (ADR 0040): the server posts each invocation
+to it, which suits serverless platforms. ``worker.handle_push(body)`` turns a request body into the
+answer; ``worker.serve_push(port)`` serves it with the standard library's HTTP server.
+
 A step may run more than once (a lease runs out, a result is lost), so it should be idempotent:
 ``invocation.idempotency_key`` is the same for every attempt of a step. Raising ``Failure`` fails the
 step for good; raising ``Retry``, or any other exception, makes the server retry it by its retry policy.
 """
 
 import json
+import http.server
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 __all__ = ["Failure", "Invocation", "Retry", "Worker"]
 
@@ -94,6 +99,40 @@ class Worker:
                     thread.join(timeout=0.5)
         except KeyboardInterrupt:
             self.stop()
+
+    def handle_push(self, body: bytes) -> Tuple[int, bytes]:
+        """Answers one pushed invocation (a request body): the HTTP status and the answer's body."""
+        try:
+            raw = json.loads(body)
+            answer = self._execute(raw)
+        except (ValueError, KeyError, TypeError) as error:
+            return 400, json.dumps({"error": f"not an invocation: {error}"}).encode()
+        return 200, json.dumps(answer).encode()
+
+    def serve_push(self, port: int, host: str = "127.0.0.1") -> None:
+        """Serves the steps as a push endpoint on ``host:port`` (every path) until interrupted."""
+        worker = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - the name http.server calls
+                length = int(self.headers.get("content-length") or 0)
+                status, answer = worker.handle_push(self.rfile.read(length))
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+        server = http.server.ThreadingHTTPServer((host, port), Handler)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
 
     def _post(self, path: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         request = urllib.request.Request(

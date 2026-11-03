@@ -240,9 +240,16 @@ Code workflows can run in a worker too: register the workflow as remote on the s
 The server sends each activation the run's verified history and records the commands the workflow
 issues ([ADR 0039](docs/adr/0039-workflow-workers.md)).
 
+For serverless platforms, a queue's steps can be **pushed** instead: the server posts each invocation
+to an HTTP endpoint and records the answer (`aqueduct server --config server.json`, with
+`{"queues": {"billing": ["charge"]}, "push": [{"queue": "billing", "url": "https://..."}]}`;
+[ADR 0040](docs/adr/0040-task-queues-and-push.md)).
+
 Step-worker libraries for [Python](sdks/python/README.md) (3.9+, standard library only) and
 [TypeScript](sdks/typescript/README.md) (Node 22.18+, no dependencies) do the same over HTTP. Every
-worker library passes the [conformance suite](conformance/README.md) (`mise run conformance`).
+worker library passes the [conformance suite](conformance/README.md) (`mise run conformance`), polling
+and as a push endpoint (`worker.handle_push(body)` / `worker.handlePush(body)` in a function, or
+`serve_push(port)` / `servePush(port)`).
 
 Planned: the same semantics in a replicated cluster. The full design and phased plan are in [BRIEF.md](BRIEF.md).
 
