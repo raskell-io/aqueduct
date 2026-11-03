@@ -67,6 +67,8 @@ cargo run --release -p aqueduct --example quickstart
 cargo run --release -p aqueduct --example approval -- --auto
 cargo run --release -p aqueduct --example order_saga
 cargo run --release -p aqueduct --example ingest -- --auto
+cargo run --release -p aqueduct --example crystallise
+cargo run --release -p aqueduct --example bounded_agent
 """
 
 # =============================================================================
@@ -141,5 +143,5 @@ mise run test
 description = "Remove build artifacts and the examples' data directories"
 run = """
 cargo clean
-rm -rf quickstart-data approval-data order-saga-data ingest-data
+rm -rf quickstart-data approval-data order-saga-data ingest-data crystallise-data bounded-agent-data
 """

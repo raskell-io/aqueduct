@@ -89,6 +89,7 @@ checksum = "e149dc73cd30538307e7ffa2acd3d2221148eaeed4871f246657b1c3eaa1cbd2"
 name = "aqueduct"
 version = "0.0.0"
 dependencies = [
+ "aqueduct-cli",
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
