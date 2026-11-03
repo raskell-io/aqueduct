@@ -670,7 +670,8 @@ impl World<'_> {
                 }
                 Outbound::ResultRecorded { key, cmd } => Ev::WorkerResultAck { key, cmd },
                 Outbound::AttemptRecorded { key, cmd } => Ev::WorkerAttemptAck { key, cmd },
-                Outbound::Finished { .. } => continue,
+                // The simulator's workloads decide their runs in the partition, not remotely.
+                Outbound::Finished { .. } | Outbound::Activation { .. } => continue,
             };
             self.send(ev);
         }

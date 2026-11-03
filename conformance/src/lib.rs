@@ -22,6 +22,9 @@ pub enum Transport {
     InProcess,
     /// Implemented by `aqueduct-worker`, over gRPC.
     RustGrpc,
+    /// Implemented by `aqueduct-worker` over gRPC, which also runs the scenarios' workflow logic
+    /// (ADR 0039): the server only keeps the journals.
+    RemoteWorkflows,
     /// Implemented by a worker started with this shell command, with `AQUEDUCT_URL` set.
     Command(String),
 }
@@ -31,6 +34,9 @@ impl std::fmt::Display for Transport {
         match self {
             Transport::InProcess => f.write_str("in process"),
             Transport::RustGrpc => f.write_str("aqueduct-worker over gRPC"),
+            Transport::RemoteWorkflows => {
+                f.write_str("aqueduct-worker over gRPC, workflows decided remotely")
+            }
             Transport::Command(command) => write!(f, "`{command}`"),
         }
     }
@@ -149,6 +155,11 @@ const STEPS: [&str; 6] = [
     "conformance.sleep",
 ];
 
+fn procedure(scenario: &Scenario) -> Result<Procedure, String> {
+    Procedure::compile(&format!("{}.star", scenario.name), scenario.source)
+        .map_err(|e| e.to_string())
+}
+
 fn engine(dir: &std::path::Path, transport: &Transport) -> Result<Engine, String> {
     let mut builder: Builder = Engine::builder(dir).default_retry_policy(RetryPolicy {
         max_attempts: 10,
@@ -157,9 +168,11 @@ fn engine(dir: &std::path::Path, transport: &Transport) -> Result<Engine, String
         max_backoff_ms: 10,
     });
     for scenario in scenarios() {
-        let procedure = Procedure::compile(&format!("{}.star", scenario.name), scenario.source)
-            .map_err(|e| e.to_string())?;
-        builder = builder.workflow(scenario.name, Arc::new(procedure));
+        builder = if *transport == Transport::RemoteWorkflows {
+            builder.remote_workflow(scenario.name)
+        } else {
+            builder.workflow(scenario.name, Arc::new(procedure(&scenario)?))
+        };
     }
     builder = match transport {
         Transport::InProcess => STEPS.iter().fold(builder.workers(8), |builder, name| {
@@ -207,8 +220,8 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
     let mut worker = None;
     match transport {
         Transport::InProcess => {}
-        Transport::RustGrpc => {
-            let built = STEPS.iter().fold(
+        Transport::RustGrpc | Transport::RemoteWorkflows => {
+            let mut built = STEPS.iter().fold(
                 aqueduct_worker::Worker::new("conformance").capacity(8),
                 |worker, name| {
                     worker.step(name, |i| {
@@ -229,6 +242,11 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
                     })
                 },
             );
+            if *transport == Transport::RemoteWorkflows {
+                for scenario in scenarios() {
+                    built = built.workflow(scenario.name, Arc::new(procedure(&scenario)?));
+                }
+            }
             let url = url.clone();
             worker = Some(tokio::spawn(async move { built.run(&url).await }));
         }

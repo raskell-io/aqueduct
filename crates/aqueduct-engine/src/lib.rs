@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod activations;
 mod agent;
 pub mod counterfactual;
 pub mod drift;

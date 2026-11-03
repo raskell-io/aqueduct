@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod workers;
+mod workflows;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -68,6 +69,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
     // only one.
     let grpc = tonic::service::Routes::new(v1::ingress_server::IngressServer::new(api.clone()))
         .add_service(v1::workers_server::WorkersServer::new(api.clone()))
+        .add_service(v1::workflows_server::WorkflowsServer::new(api.clone()))
         .into_axum_router();
     let http = Router::new()
         .route("/v1/runs", post(http_start).get(http_list))
@@ -123,7 +125,9 @@ impl From<EngineError> for Failure {
             | EngineError::InvalidEscalation(_)
             | EngineError::InvalidAwakeable(_) => Kind::Invalid,
             EngineError::Timeout(_) => Kind::Timeout,
-            EngineError::UpdateRejected(_) | EngineError::InvalidResolution(_) => Kind::Rejected,
+            EngineError::UpdateRejected(_)
+            | EngineError::InvalidResolution(_)
+            | EngineError::Unsupported(_) => Kind::Rejected,
             EngineError::Stopped(_) => Kind::Unavailable,
             EngineError::Open(_) => Kind::Internal,
         };
