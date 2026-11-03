@@ -227,8 +227,8 @@ impl Principal {
 pub enum Refusal {
     /// No token, or one the server does not know.
     Unauthenticated(String),
-    /// A known token without the permission.
-    Forbidden(String),
+    /// A known token without the permission: the token's name, and why.
+    Forbidden(String, String),
 }
 
 /// Checks requests against a data directory's tokens file, which it reads again when it changes, so
@@ -330,11 +330,14 @@ impl Authenticator {
             .find(|t| constant_time_eq(t.sha256.as_bytes(), digest.as_bytes()))
             .ok_or_else(|| Refusal::Unauthenticated("unknown or revoked token".into()))?;
         if !token.allows(needed) {
-            return Err(Refusal::Forbidden(format!(
-                "token `{}` lacks the `{}` permission",
-                token.name,
-                needed.as_str()
-            )));
+            return Err(Refusal::Forbidden(
+                token.name.clone(),
+                format!(
+                    "token `{}` lacks the `{}` permission",
+                    token.name,
+                    needed.as_str()
+                ),
+            ));
         }
         Ok(Principal::Token(token.name.clone()))
     }
@@ -373,7 +376,7 @@ mod tests {
         );
         assert!(matches!(
             auth.check(Some(&bearer(&reader)), Permission::Start),
-            Err(Refusal::Forbidden(_))
+            Err(Refusal::Forbidden(..))
         ));
         assert!(auth.check(Some(&bearer(&admin)), Permission::Work).is_ok());
         assert!(matches!(

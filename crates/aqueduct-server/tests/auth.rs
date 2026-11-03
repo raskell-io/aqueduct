@@ -265,10 +265,19 @@ async fn grpc_calls_are_refused_with_grpc_codes_and_audited() {
         summary.contains(&("starter".into(), "start".into(), "ok".into())),
         "{summary:#?}"
     );
+    // Refusals name who was refused: the token's holder, or `unauthenticated` without a valid token.
+    assert!(
+        summary.iter().any(|(who, action, outcome)| who == "reader"
+            && action == "start"
+            && outcome.contains("lacks the `start` permission")),
+        "{summary:#?}"
+    );
     assert!(
         summary
             .iter()
-            .any(|(_, action, outcome)| action == "start" && outcome.contains("refused")),
+            .any(|(who, action, outcome)| who == "unauthenticated"
+                && action == "start"
+                && outcome.contains("refused")),
         "{summary:#?}"
     );
     assert!(

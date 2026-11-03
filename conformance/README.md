@@ -12,9 +12,10 @@ cargo run -p aqueduct-conformance -- --push "python3 sdks/python/conformance_wor
 mise run conformance                                               # all of them, as CI runs them
 ```
 
-The server has authentication on (ADR 0041). The worker under test is started with `AQUEDUCT_URL` set to
-the server's address (for example `http://127.0.0.1:50123`) and `AQUEDUCT_TOKEN` to a token with the
-`work` permission, which it must present. It must connect, implement the steps below, and keep running until it is
+The server has authentication and TLS on (ADR 0041, ADR 0042). The worker under test is started with
+`AQUEDUCT_URL` set to the server's address (for example `https://127.0.0.1:50123`), `AQUEDUCT_TOKEN` to a
+token with the `work` permission, which it must present, and `AQUEDUCT_CA_FILE` to the server's
+self-signed certificate, which it must trust (`NODE_EXTRA_CA_CERTS` is set to it as well, for Node). It must connect, implement the steps below, and keep running until it is
 killed. With `--push`, it is started with `AQUEDUCT_PUSH_PORT` instead and must serve the steps as a push
 endpoint (ADR 0040) on `127.0.0.1:$AQUEDUCT_PUSH_PORT`: the steps are routed to the named queue
 `conformance`, and the server posts each invocation to it.

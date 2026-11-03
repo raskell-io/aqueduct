@@ -41,7 +41,7 @@ work with no outside services; OIDC/JWT follows for teams with an identity provi
 - **Workers and libraries** take a token: `Worker::token` in Rust, a `token` option in Python and
   TypeScript. The conformance suite runs its network transports with authentication on.
 - **Beyond loopback still needs `--listen-anywhere`.** Over plain HTTP, tokens and payloads cross the
-  network in the clear; TLS on the server is the next step.
+  network in the clear. (ADR 0042 adds TLS; beyond loopback then needs tokens and a certificate.)
 
 ## Consequences
 

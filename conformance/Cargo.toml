@@ -19,5 +19,6 @@ aqueduct-engine.workspace = true
 aqueduct-procedure.workspace = true
 aqueduct-server.workspace = true
 aqueduct-worker.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process", "time"] }

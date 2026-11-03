@@ -22,7 +22,7 @@ await worker.run();
   them from 1.
 - At most `capacity` steps run at once; `worker.stop()` makes `run()` resolve.
 
-If the server has authentication, give the worker a token with the `work` permission: `new Worker({..., token: "aqd_..."})`.
+If the server has authentication, give the worker a token with the `work` permission: `new Worker({..., token: "aqd_..."})`. For an `https://` server with a private CA or self-signed certificate, run Node with `NODE_EXTRA_CA_CERTS=ca.pem`.
 
 **As a push endpoint** (for serverless platforms; ADR 0040), the same steps answer the server's
 requests instead of polling: `worker.handlePush(body)` turns a request body into the status and answer to send back, for

@@ -249,18 +249,32 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
         [aqueduct_server::Permission::Work].into(),
     )?;
     let security = aqueduct_server::Security::for_dir(&dir)?;
+    // TLS is on too, with a certificate the worker under test is told to trust.
+    let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+        .map_err(|e| e.to_string())?;
+    let (certificate, key) = (issued.cert.pem(), issued.signing_key.serialize_pem());
+    let ca_file = dir.join("conformance-ca.pem");
+    std::fs::write(&ca_file, &certificate).map_err(|e| e.to_string())?;
+    let tls = aqueduct_server::Tls::from_pem(&certificate, &key)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| e.to_string())?;
     let url = format!(
-        "http://{}",
+        "https://{}",
         listener.local_addr().map_err(|e| e.to_string())?
     );
     let server = {
         let (engine, config) = (Arc::clone(&engine), config.clone());
         tokio::spawn(async move {
-            aqueduct_server::serve_with(engine, listener, &config, security, std::future::pending())
-                .await
+            aqueduct_server::serve_tls(
+                engine,
+                listener,
+                &config,
+                security,
+                tls,
+                std::future::pending(),
+            )
+            .await
         })
     };
 
@@ -274,7 +288,8 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
                 aqueduct_worker::Worker::new("conformance")
                     .capacity(8)
                     .queue(QUEUE)
-                    .token(&token),
+                    .token(&token)
+                    .ca_certificate(&certificate),
                 |worker, name| {
                     worker.step(name, |i| {
                         match step(
@@ -308,7 +323,9 @@ pub async fn run(transport: &Transport) -> Result<Vec<Check>, String> {
                 .arg("-c")
                 .arg(command)
                 .env("AQUEDUCT_URL", &url)
-                .env("AQUEDUCT_TOKEN", &token);
+                .env("AQUEDUCT_TOKEN", &token)
+                .env("AQUEDUCT_CA_FILE", &ca_file)
+                .env("NODE_EXTRA_CA_CERTS", &ca_file);
             // Only a push endpoint is told its port: a worker that has one serves pushes.
             if let Transport::Push(_) = transport {
                 process.env("AQUEDUCT_PUSH_PORT", push_port.to_string());

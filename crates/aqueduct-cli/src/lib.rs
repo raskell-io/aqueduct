@@ -46,10 +46,11 @@ commands:
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
   server <dir> [--listen <address>] [--listen-anywhere] [--config <file.json>]
+         [--tls-cert <file.pem> --tls-key <file.pem>]
                                       serve the directory's approved procedures over gRPC and
                                       HTTP/JSON (protocol v1, draft; ADR 0038) on 127.0.0.1:7470;
-                                      until the server has TLS, an address other than loopback
-                                      needs --listen-anywhere. Steps run on workers; the config
+                                      an address other than loopback needs tokens and TLS (ADR 0042),
+                                      or --listen-anywhere. Steps run on workers; the config
                                       routes them to named queues and push endpoints (ADR 0040).
                                       Ctrl-C or SIGTERM stops it
   tokens create <dir> --name <name> --permissions <p,p,...>
@@ -390,10 +391,18 @@ fn audit(dir: &Path) -> Result<String, String> {
 fn server_options(
     dir: &Path,
     args: &[String],
-) -> Result<(std::net::SocketAddr, aqueduct_server::Config), String> {
+) -> Result<
+    (
+        std::net::SocketAddr,
+        aqueduct_server::Config,
+        Option<aqueduct_server::Tls>,
+    ),
+    String,
+> {
     let mut address = std::net::SocketAddr::from(([127, 0, 0, 1], aqueduct_server::DEFAULT_PORT));
     let mut anywhere = false;
     let mut config = aqueduct_server::Config::default();
+    let (mut tls_cert, mut tls_key) = (None, None);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -408,25 +417,38 @@ fn server_options(
                 })?;
             }
             "--listen-anywhere" => anywhere = true,
+            "--tls-cert" => tls_cert = Some(rest.next().ok_or("--tls-cert needs a file")?),
+            "--tls-key" => tls_key = Some(rest.next().ok_or("--tls-key needs a file")?),
             other => return Err(format!("unknown option `{other}`")),
         }
     }
+    let tls = match (tls_cert, tls_key) {
+        (Some(certificate), Some(key)) => Some(aqueduct_server::Tls::from_files(
+            Path::new(certificate),
+            Path::new(key),
+        )?),
+        (None, None) => None,
+        _ => return Err("--tls-cert and --tls-key go together".to_owned()),
+    };
     if !aqueduct_server::is_loopback(&address) && !anywhere {
-        let why = if aqueduct_server::auth::tokens_path(dir).exists() {
-            "and the server has no TLS yet: tokens and payloads would cross the network in the clear"
-        } else {
-            "and this directory has no tokens (aqueduct tokens create): anyone who can reach the server could start, signal and cancel runs"
-        };
-        return Err(format!(
-            "{address} is not a loopback address, {why}. Pass --listen-anywhere to serve it anyway"
-        ));
+        let has_tokens = aqueduct_server::auth::tokens_path(dir).exists();
+        if !has_tokens {
+            return Err(format!(
+                "{address} is not a loopback address, and this directory has no tokens (aqueduct tokens create): anyone who can reach the server could start, signal and cancel runs. Pass --listen-anywhere to serve it anyway"
+            ));
+        }
+        if tls.is_none() {
+            return Err(format!(
+                "{address} is not a loopback address, and the server has no certificate (--tls-cert, --tls-key): tokens and payloads would cross the network in the clear. Pass --listen-anywhere to serve it anyway"
+            ));
+        }
     }
-    Ok((address, config))
+    Ok((address, config, tls))
 }
 
 /// Serves a data directory until Ctrl-C.
 fn server(dir: &Path, args: &[String]) -> Result<String, String> {
-    let (address, config) = server_options(dir, args)?;
+    let (address, config, tls) = server_options(dir, args)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let registry = Registry::open(dir).map_err(|e| e.to_string())?;
     // Steps run on step workers and push endpoints (ADR 0038, ADR 0040).
@@ -449,8 +471,9 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
             .await
             .map_err(|e| format!("cannot listen on {address}: {e}"))?;
         eprintln!(
-            "serving {} on http://{} (gRPC and HTTP/JSON); Ctrl-C or SIGTERM stops",
+            "serving {} on {}://{} (gRPC and HTTP/JSON); Ctrl-C or SIGTERM stops",
             dir.display(),
+            if tls.is_some() { "https" } else { "http" },
             listener.local_addr().map_err(|e| e.to_string())?
         );
         // Ctrl-C, or SIGTERM (how service managers and containers stop a process).
@@ -475,14 +498,13 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
                 let _ = tokio::signal::ctrl_c().await;
             }
         };
-        aqueduct_server::serve_with(
-            std::sync::Arc::new(engine),
-            listener,
-            &config,
-            security,
-            stop,
-        )
-        .await
+        let engine = std::sync::Arc::new(engine);
+        match tls {
+            Some(tls) => {
+                aqueduct_server::serve_tls(engine, listener, &config, security, tls, stop).await
+            }
+            None => aqueduct_server::serve_with(engine, listener, &config, security, stop).await,
+        }
         .map_err(|e| e.to_string())
     })?;
     Ok("stopped\n".to_owned())
