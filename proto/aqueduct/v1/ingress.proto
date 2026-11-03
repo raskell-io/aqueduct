@@ -1,0 +1,201 @@
+// Aqueduct ingress API, version 1 (draft, ADR 0038; not frozen until phase 5).
+//
+// Clients start runs and talk to them through this service. Every call is answered only once what it did
+// is durable. The same calls are offered as HTTP/JSON (docs/protocol.md), where payloads are embedded as
+// JSON values instead of bytes.
+//
+// Payloads are opaque bytes in the run's codec; the default codec is JSON (ADR 0010).
+
+syntax = "proto3";
+
+package aqueduct.v1;
+
+service Ingress {
+  // Starts a run, or returns the run the key already has (by the reuse policy).
+  rpc Start(StartRequest) returns (StartResponse);
+  // Waits until a key's latest run has ended (following continue-as-new), or the timeout passes.
+  rpc Wait(WaitRequest) returns (RunResult);
+  // A run's state: status, version, input, output and commands.
+  rpc Describe(DescribeRequest) returns (RunDescription);
+  // Runs, newest first.
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  // Sends a signal; deduplicated by its id when it has one.
+  rpc Signal(SignalRequest) returns (Ack);
+  // Completes an awakeable, by the id the run handed out.
+  rpc CompleteAwakeable(CompleteAwakeableRequest) returns (Ack);
+  // Asks a run to stop: what it waits for fails as cancelled.
+  rpc Cancel(CancelRequest) returns (Ack);
+  // Asks a run a query: the last value its logic published under the name (ADR 0036).
+  rpc Query(QueryRequest) returns (QueryResponse);
+  // Sends an update and waits for the run's answer (ADR 0036).
+  rpc Update(UpdateRequest) returns (UpdateResponse);
+  // Open escalations across runs.
+  rpc ListEscalations(ListEscalationsRequest) returns (ListEscalationsResponse);
+  // Resolves an escalation; the run continues with the outcome.
+  rpc ResolveEscalation(ResolveEscalationRequest) returns (Ack);
+}
+
+message StartRequest {
+  string key = 1;
+  string workflow = 2;
+  bytes input = 3;
+  // The version to pin the run to; by default the workflow's active version.
+  string version = 4;
+  // The run's token budget for agent calls; 0 means none.
+  uint64 budget_tokens = 5;
+  ReusePolicy reuse = 6;
+}
+
+enum ReusePolicy {
+  // Return the existing run if it has the same workflow and input; otherwise fail.
+  REUSE_POLICY_RETURN_EXISTING = 0;
+  // Fail whenever the key has a run.
+  REUSE_POLICY_REJECT = 1;
+  // Start the key's next run if its latest has ended.
+  REUSE_POLICY_ALLOW_AFTER_COMPLETION = 2;
+}
+
+message StartResponse {
+  // The run id: the key for its first run, `<key>\0<generation>` after that.
+  string run_id = 1;
+  // The version the run is pinned to; empty for an unversioned workflow.
+  string version = 2;
+}
+
+message WaitRequest {
+  string key = 1;
+  uint64 timeout_ms = 2;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_RUNNING = 1;
+  STATUS_COMPLETED = 2;
+  STATUS_FAILED = 3;
+  STATUS_PARKED = 4;
+  STATUS_CONTINUED = 5;
+}
+
+message RunResult {
+  Status status = 1;
+  bytes output = 2;
+  string error = 3;
+  string version = 4;
+}
+
+message DescribeRequest {
+  string key = 1;
+}
+
+message Command {
+  uint32 index = 1;
+  // `step`, `agent`, `sleep`, `signal`, `update`, `record`, `escalation`, `child` or `response`.
+  string kind = 2;
+  string name = 3;
+  bytes input = 4;
+  // Empty while pending.
+  oneof outcome {
+    bytes completed = 5;
+    string failed = 6;
+  }
+}
+
+message RunDescription {
+  string run_id = 1;
+  string workflow = 2;
+  string version = 3;
+  Status status = 4;
+  bytes input = 5;
+  bytes output = 6;
+  string error = 7;
+  repeated Command commands = 8;
+  // Journal entries so far.
+  uint64 entries = 9;
+}
+
+message ListRunsRequest {
+  // Only runs of this workflow, if set.
+  string workflow = 1;
+  // Only runs with this status, if set.
+  Status status = 2;
+  uint32 limit = 3;
+}
+
+message RunSummary {
+  string run_id = 1;
+  string workflow = 2;
+  Status status = 3;
+  uint64 entries = 4;
+}
+
+message ListRunsResponse {
+  repeated RunSummary runs = 1;
+}
+
+message SignalRequest {
+  string key = 1;
+  string name = 2;
+  // The sender's id: a signal whose id the run has recorded is dropped. Empty disables that.
+  string id = 3;
+  bytes payload = 4;
+}
+
+message CompleteAwakeableRequest {
+  string id = 1;
+  bytes payload = 2;
+}
+
+message CancelRequest {
+  string key = 1;
+  string reason = 2;
+}
+
+message QueryRequest {
+  string key = 1;
+  string name = 2;
+}
+
+message QueryResponse {
+  bytes value = 1;
+}
+
+message UpdateRequest {
+  string key = 1;
+  string name = 2;
+  // The sender's id: an update the run has received under it is not delivered again, and gets the
+  // first one's answer. Empty disables that.
+  string id = 3;
+  bytes payload = 4;
+  // How long to wait for the answer. Past it, the update may still be answered: send it again with
+  // the same id to read the answer.
+  uint64 timeout_ms = 5;
+}
+
+message UpdateResponse {
+  oneof answer {
+    bytes result = 1;
+    // The run rejected the update, could not take it, or ended without answering.
+    string rejected = 2;
+  }
+}
+
+message ListEscalationsRequest {}
+
+message Escalation {
+  // `<run id>#<command>`.
+  string id = 1;
+  string key = 2;
+  string reason = 3;
+  bytes payload = 4;
+}
+
+message ListEscalationsResponse {
+  repeated Escalation escalations = 1;
+}
+
+message ResolveEscalationRequest {
+  string id = 1;
+  bytes outcome = 2;
+}
+
+message Ack {}

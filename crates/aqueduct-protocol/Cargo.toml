@@ -1,0 +1,23 @@
+[package]
+name = "aqueduct-protocol"
+description = "Aqueduct's service protocol v1 (draft): the ingress API and the step-worker protocol, in protobuf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+prost = "0.14"
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "server"] }
+tonic-prost = "0.14"
+
+[build-dependencies]
+protox = "0.9"
+tonic-prost-build = "0.14"
