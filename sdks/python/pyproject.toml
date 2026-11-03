@@ -1,0 +1,18 @@
+[project]
+name = "aqueduct-worker"
+version = "0.0.0"
+description = "A step worker for Aqueduct: implement steps in Python and serve them to a server"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0 OR MIT"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/raskell-io/aqueduct"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["aqueduct_worker"]

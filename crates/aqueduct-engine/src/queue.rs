@@ -92,9 +92,19 @@ impl StepQueue {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Offers a step for execution. A step already waiting or leased is not offered twice (the engine
-    /// re-sends dispatches periodically); one whose lease has run out is offered again.
-    pub fn offer(&self, run: &str, cmd: CommandIndex, step: &str, input: Payload, now_ms: u64) {
+    /// Offers attempt `attempt` of a step for execution (the run's recorded failed attempts, plus one).
+    /// A step already waiting or leased is not offered twice (the engine re-sends dispatches
+    /// periodically); one whose lease has run out is offered again, and an attempt offered again after
+    /// a lost lease counts as the next.
+    pub fn offer(
+        &self,
+        run: &str,
+        cmd: CommandIndex,
+        step: &str,
+        input: Payload,
+        attempt: u32,
+        now_ms: u64,
+    ) {
         let mut inner = self.lock();
         let target = (run.to_owned(), cmd);
         if let Some(entry) = inner.entries.get(&target) {
@@ -111,6 +121,8 @@ impl StepQueue {
             lease: None,
         });
         entry.lease = None;
+        // Never below what the run has recorded.
+        entry.attempts = entry.attempts.max(attempt.saturating_sub(1));
         inner.waiting.push_back(target);
         drop(inner);
         self.ready.notify_all();
@@ -264,8 +276,8 @@ mod tests {
     #[test]
     fn a_step_goes_to_a_worker_that_implements_it() {
         let q = queue();
-        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 0);
-        q.offer("r", CommandIndex(1), "ship", Payload::new(*b"2"), 0);
+        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 1, 0);
+        q.offer("r", CommandIndex(1), "ship", Payload::new(*b"2"), 1, 0);
         assert!(q.take("w", &names(&["refund"]), 10, 0).is_empty());
         let taken = q.take("w", &names(&["ship"]), 10, 0);
         assert_eq!(taken.len(), 1);
@@ -283,10 +295,10 @@ mod tests {
     #[test]
     fn an_expired_lease_is_offered_again_and_the_first_result_counts() {
         let q = queue();
-        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 0);
+        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 1, 0);
         let first = q.take("slow", &names(&["charge"]), 1, 0);
         // Re-sent dispatches do not offer a leased step again.
-        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 50);
+        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 1, 50);
         assert!(q.take("fast", &names(&["charge"]), 1, 99).is_empty());
         let second = q.take("fast", &names(&["charge"]), 1, 100);
         assert_eq!(second[0].attempt, 2);
@@ -299,10 +311,19 @@ mod tests {
     #[test]
     fn a_session_that_ends_releases_its_leases() {
         let q = queue();
-        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 0);
+        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 1, 0);
         q.take("gone", &names(&["charge"]), 1, 0);
         q.release("gone");
         let again = q.take("other", &names(&["charge"]), 1, 1);
         assert_eq!(again[0].attempt, 2);
+    }
+
+    #[test]
+    fn attempts_continue_from_what_the_run_recorded() {
+        let q = queue();
+        // The run has recorded two failed attempts: this is the third.
+        q.offer("r", CommandIndex(0), "charge", Payload::new(*b"1"), 3, 0);
+        let taken = q.take("w", &names(&["charge"]), 1, 0);
+        assert_eq!(taken[0].attempt, 3);
     }
 }

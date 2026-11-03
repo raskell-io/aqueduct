@@ -1,0 +1,11 @@
+{
+  "name": "@aqueduct/worker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A step worker for Aqueduct: implement steps in TypeScript and serve them to a server",
+  "license": "Apache-2.0 OR MIT",
+  "repository": "https://github.com/raskell-io/aqueduct",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "engines": { "node": ">=22.18" }
+}
