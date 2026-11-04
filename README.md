@@ -15,7 +15,7 @@
 > format will still change. It runs [Starlark procedures](docs/adr/0008-procedure-language-starlark.md)
 > and [Rust workflows](docs/adr/0014-rust-sdk.md) with durable timers, exactly-once signals, journaled
 > retries and checkpoints, survives `kill -9`, and is tested by a deterministic simulator on every change.
-> See the [build brief](BRIEF.md) and the [decision records](docs/adr/).
+> See the [build brief](BRIEF.md), the [decision records](docs/adr/) and the [FAQ](docs/faq.md).
 
 ## The idea
 
