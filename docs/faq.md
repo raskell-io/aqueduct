@@ -21,8 +21,8 @@ let result = engine.wait("greet:u-1", Duration::from_secs(10))?;
 **How it differs from Tokio:**
 
 - **It runs on its own threads.** One owns the log and the runs, and a small pool runs steps.
-- **The engine's API is blocking.** Inside a Tokio application, call `start`, `wait` and the rest through
-  `spawn_blocking`.
+- **The engine's API is blocking.** Inside a Tokio application, use `AsyncEngine` (the `tokio` feature),
+  which runs the same calls on Tokio's blocking pool. A long `wait` holds a blocking thread while it waits.
 - **Workflows are `async fn`, but they do not run on an async runtime.** The engine polls a workflow once
   per activation, replaying it from its journal. You cannot `.await` Tokio I/O or timers inside one; that
   work belongs in a step, and durable waits use `ctx.sleep` and similar.
@@ -33,11 +33,10 @@ let result = engine.wait("greet:u-1", Duration::from_secs(10))?;
 
 - **It is not on crates.io.** Every crate has `publish = false`, so depend on it by git or path. The API
   will still change.
-- **It is heavy for a library:** about 200 crates, much of that from Starlark. The `aqueduct` crate always
-  includes procedures and the registry, with no feature flag to leave them out.
+- **It is heavy with procedures:** about 200 crates by default, much of that from Starlark. For Rust
+  workflows alone, `default-features = false` turns off the `procedures` feature and brings it to about
+  75.
 - **One process per data directory.** The engine holds the state store open while it runs.
-- **Some newer APIs are not exported from `aqueduct`.** `StepCall`, the remote queues and the replay check
-  are reachable only through the `aqueduct-engine` crate.
 
 **You can also mix the two.** A Rust program can embed the engine and serve it over the network with
 `aqueduct-server`, which does use Tokio, or run its steps and workflows elsewhere with `aqueduct-worker`.

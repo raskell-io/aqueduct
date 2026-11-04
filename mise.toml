@@ -60,6 +60,16 @@ run = "cargo test --workspace"
 description = "Documentation tests"
 run = "cargo test --workspace --doc"
 
+[tasks."test:features"]
+description = "The aqueduct crate's feature combinations: without procedures, and with Tokio"
+run = """
+cargo test -p aqueduct --no-default-features
+cargo test -p aqueduct --all-features
+cargo clippy -p aqueduct --all-targets --no-default-features -- -D warnings
+cargo clippy -p aqueduct --all-targets --all-features -- -D warnings
+! cargo tree -p aqueduct --no-default-features -e normal | grep -q starlark
+"""
+
 [tasks.conformance]
 description = "The worker conformance suite: in process, the Rust worker over gRPC, Python and TypeScript, polling and as push endpoints"
 run = """
@@ -134,6 +144,7 @@ mise run test:doc
 mise run doc
 mise run deny
 mise run examples
+mise run test:features
 mise run conformance
 mise run sim:ci
 mise run crash:ci
