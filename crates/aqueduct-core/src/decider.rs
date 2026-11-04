@@ -186,6 +186,13 @@ impl<'a> RunView<'a> {
         step.name.strip_prefix(PATCH_PREFIX)
     }
 
+    /// How many signals with this name are kept, waiting for a command to wait for them. It depends on
+    /// when the logic runs, not only on the journal, so logic may use it only for decisions that are
+    /// not replayed: at the end of the journal, as a run that continues as new.
+    pub fn buffered_signals(&self, name: &str) -> usize {
+        self.state.buffered_signals(name)
+    }
+
     /// Whether a cancellation completed this command (its outcome is then a failure).
     pub fn cancelled(&self, cmd: CommandIndex) -> bool {
         usize::try_from(cmd.0)

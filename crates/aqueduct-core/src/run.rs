@@ -1150,6 +1150,14 @@ impl RunState {
         self.responses.get(&update)
     }
 
+    /// How many signals with this name are kept, waiting for a command to wait for them.
+    pub fn buffered_signals(&self, name: &str) -> usize {
+        self.buffered_signals
+            .iter()
+            .filter(|(buffered, _)| buffered == name)
+            .count()
+    }
+
     /// The number of journal entries applied.
     pub fn len(&self) -> usize {
         self.entries

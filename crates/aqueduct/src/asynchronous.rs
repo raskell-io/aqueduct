@@ -126,6 +126,32 @@ impl AsyncEngine {
             .await
     }
 
+    /// See [`Engine::call_object`].
+    pub async fn call_object(
+        &self,
+        object: &str,
+        key: &str,
+        handler: &str,
+        id: &str,
+        args: Payload,
+        timeout: Duration,
+    ) -> Result<Payload, EngineError> {
+        let (object, key, handler, id) = (
+            object.to_owned(),
+            key.to_owned(),
+            handler.to_owned(),
+            id.to_owned(),
+        );
+        self.call(move |e| e.call_object(&object, &key, &handler, &id, &args, timeout))
+            .await
+    }
+
+    /// See [`Engine::object_state`].
+    pub async fn object_state(&self, object: &str, key: &str) -> Result<Payload, EngineError> {
+        let (object, key) = (object.to_owned(), key.to_owned());
+        self.call(move |e| e.object_state(&object, &key)).await
+    }
+
     /// See [`Engine::query`].
     pub async fn query(&self, key: &str, name: &str) -> Result<Payload, EngineError> {
         let (key, name) = (key.to_owned(), name.to_owned());

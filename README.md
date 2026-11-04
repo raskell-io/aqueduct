@@ -191,6 +191,10 @@ What holds today, for the embedded engine, and how it is checked:
   procedure) keeps runs that already passed that point on the old code and sends every other run down
   the new one; `aqueduct_engine::replay::check` replays a corpus of journals against new code to prove
   it ([ADR 0035](docs/adr/0035-patched.md)).
+- **Virtual objects:** keyed, durable state whose handlers run one at a time per key
+  (`Builder::object_handler`, `Engine::call_object`); a handler's state changes commit atomically with
+  its completion, and a failed handler commits nothing
+  ([ADR 0043](docs/adr/0043-virtual-objects.md)). In embedded mode only, so far.
 - **Queries and updates:** a run publishes state (`publish("address", address)`, `ctx.publish(...)`)
   that queries read without journaling anything (`aqueduct query`, `Engine::query`); an update is a
   request whose sender waits for the run's answer (`wait(update("change"))`, then `respond` or

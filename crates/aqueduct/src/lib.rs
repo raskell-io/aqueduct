@@ -47,8 +47,8 @@ pub use aqueduct_engine::{RetryPolicy, ReusePolicy, StartOptions};
 #[cfg(feature = "procedures")]
 pub use aqueduct_procedure::Procedure;
 pub use aqueduct_sdk::{
-    AgentOptions, Either, Saga, Update, WorkflowContext, WorkflowError, join, join_all, select,
-    select_all, workflow,
+    AgentOptions, Either, ObjectContext, Saga, Update, WorkflowContext, WorkflowError, join,
+    join_all, object_handler, select, select_all, workflow,
 };
 
 /// The version registry: procedure versions with provenance, replay evidence, approvals and a

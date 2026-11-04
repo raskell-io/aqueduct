@@ -288,7 +288,9 @@ impl From<EngineError> for Failure {
             EngineError::Timeout(_) => Kind::Timeout,
             EngineError::UpdateRejected(_)
             | EngineError::InvalidResolution(_)
+            | EngineError::HandlerFailed(_)
             | EngineError::Unsupported(_) => Kind::Rejected,
+            EngineError::InvalidPayload(_) => Kind::Invalid,
             EngineError::Stopped(_) => Kind::Unavailable,
             EngineError::Open(_) => Kind::Internal,
         };

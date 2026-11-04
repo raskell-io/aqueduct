@@ -194,6 +194,12 @@ pub enum EngineError {
     /// decided remotely).
     #[error("{0}")]
     Unsupported(String),
+    /// An object's handler failed; it committed nothing.
+    #[error("handler failed: {0}")]
+    HandlerFailed(String),
+    /// A payload is not JSON.
+    #[error("{0}")]
+    InvalidPayload(String),
     /// The run's logic has no such query.
     #[error("run `{key}` has no query `{name}`")]
     UnknownQuery {
@@ -242,6 +248,23 @@ impl Builder {
     /// error.
     pub fn remote_steps(mut self, lease: Duration) -> Self {
         self.remote = Some(lease);
+        self
+    }
+
+    /// Registers a handler of a virtual object (ADR 0043): `decider` (for a Rust handler,
+    /// `aqueduct_sdk::object_handler`) runs for each call of `object`'s `handler`, one at a time per key.
+    pub fn object_handler(
+        mut self,
+        object: &str,
+        handler: &str,
+        decider: Arc<dyn Decider + Send + Sync>,
+    ) -> Self {
+        self.deciders
+            .insert(crate::objects::handler_workflow(object, handler), decider);
+        self.deciders.insert(
+            crate::objects::loop_workflow(object),
+            Arc::new(crate::objects::ObjectLoop::new(object)),
+        );
         self
     }
 
@@ -571,6 +594,9 @@ impl Engine {
         input: Payload,
         options: impl Into<StartOptions>,
     ) -> Result<(), EngineError> {
+        if crate::objects::is_reserved_key(key) {
+            return Err(EngineError::InvalidKey(key.to_owned()));
+        }
         let (reply, answer) = mpsc::channel();
         self.send(Request::Start {
             key: key.to_owned(),
@@ -591,6 +617,9 @@ impl Engine {
         id: &str,
         payload: Payload,
     ) -> Result<(), EngineError> {
+        if crate::objects::is_reserved_key(key) {
+            return Err(EngineError::InvalidKey(key.to_owned()));
+        }
         let (reply, answer) = mpsc::channel();
         self.send(Request::Signal {
             key: key.to_owned(),
@@ -660,6 +689,72 @@ impl Engine {
     pub fn runs(&self) -> Result<Vec<RunSummary>, EngineError> {
         let (reply, answer) = mpsc::channel();
         self.send(Request::Runs { reply })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// Calls a handler of a virtual object (ADR 0043) and waits for its output. Calls to one key run one
+    /// at a time, in the order they arrive; a call's state changes commit atomically with its
+    /// completion, and a failed handler commits nothing ([`EngineError::HandlerFailed`]). Calling again
+    /// with the same `id` (for example, after a [`EngineError::Timeout`]) runs it once and returns its
+    /// outcome; an empty `id` makes the call a new one every time.
+    pub fn call_object(
+        &self,
+        object: &str,
+        key: &str,
+        handler: &str,
+        id: &str,
+        args: &Payload,
+        timeout: Duration,
+    ) -> Result<Payload, EngineError> {
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let args: serde_json::Value = serde_json::from_slice(args.as_bytes())
+            .map_err(|e| EngineError::InvalidPayload(format!("the arguments are not JSON: {e}")))?;
+        let id = if id.is_empty() {
+            use std::hash::{BuildHasher, Hasher};
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u64(now_ms());
+            let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("{:016x}-{call}", hasher.finish())
+        } else {
+            id.to_owned()
+        };
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::CallObject {
+            object: object.to_owned(),
+            key: key.to_owned(),
+            handler: handler.to_owned(),
+            id,
+            args,
+            reply,
+        })?;
+        let result = match answer.recv_timeout(timeout) {
+            Ok(result) => result?,
+            Err(RecvTimeoutError::Timeout) => return Err(EngineError::Timeout(key.to_owned())),
+            Err(RecvTimeoutError::Disconnected) => return Err(self.stopped()),
+        };
+        if result.status != Status::Completed {
+            return Err(EngineError::HandlerFailed(
+                result
+                    .error
+                    .unwrap_or_else(|| format!("{:?}", result.status)),
+            ));
+        }
+        let output: serde_json::Value = result
+            .output
+            .as_ref()
+            .and_then(|output| serde_json::from_slice(output.as_bytes()).ok())
+            .unwrap_or_default();
+        Ok(Payload::new(output["output"].to_string().into_bytes()))
+    }
+
+    /// A virtual object key's committed state, as a JSON object (ADR 0043).
+    pub fn object_state(&self, object: &str, key: &str) -> Result<Payload, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Query {
+            key: crate::objects::object_run_key(object, key),
+            name: crate::objects::STATE_QUERY.to_owned(),
+            reply,
+        })?;
         answer.recv().map_err(|_| self.stopped())?
     }
 
@@ -808,6 +903,14 @@ enum Request {
         key: String,
         name: String,
         reply: Sender<Result<Payload, EngineError>>,
+    },
+    CallObject {
+        object: String,
+        key: String,
+        handler: String,
+        id: String,
+        args: serde_json::Value,
+        reply: Sender<Result<RunResult, EngineError>>,
     },
     Decision {
         key: String,
@@ -1078,6 +1181,50 @@ impl Processor {
                 };
                 self.answers.push((reply, answer));
             }
+            Request::CallObject {
+                object,
+                key,
+                handler,
+                id,
+                args,
+                reply,
+            } => match self
+                .partition
+                .call_object(&object, &key, &handler, &id, &args)
+            {
+                Ok(call) => {
+                    let unloaded = match self.partition.run(&call) {
+                        Some(_) => None,
+                        None => self
+                            .partition
+                            .lookup_run(&call)
+                            .map_err(|e| e.to_string())?,
+                    };
+                    match unloaded {
+                        // An ended call whose run has left memory (durable in a checkpoint).
+                        Some(state) => {
+                            let _ = reply.send(Ok(RunResult {
+                                status: state.status(),
+                                output: state.output().cloned(),
+                                error: state.error().map(str::to_owned),
+                                version: state.version().map(str::to_owned),
+                            }));
+                        }
+                        // Running, or still in the inbox: answered after the flush once it has ended.
+                        None => self.waiters.entry(call).or_default().push(reply),
+                    }
+                }
+                Err(PartitionError::UnknownWorkflow(name)) => {
+                    let _ = reply.send(Err(EngineError::UnknownWorkflow(name)));
+                }
+                Err(PartitionError::InvalidKey(key)) => {
+                    let _ = reply.send(Err(EngineError::InvalidKey(key)));
+                }
+                Err(PartitionError::KeyConflict(key)) => {
+                    let _ = reply.send(Err(EngineError::KeyConflict(key)));
+                }
+                Err(error) => return Err(error.to_string()),
+            },
             Request::Decision { key, at, commands } => {
                 self.partition
                     .decision(&key, at, commands)
