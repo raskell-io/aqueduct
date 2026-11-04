@@ -890,6 +890,100 @@ pub async fn select_all<F: Future>(futures: Vec<F>) -> (usize, F::Output) {
     .await
 }
 
+/// What a handler of a virtual object works with (ADR 0043): the object key's state, and through
+/// `Deref` everything a workflow can do (steps, sleeps, signals). Reads see the state as committed when
+/// the handler started, and its own writes; the writes commit atomically with the handler's completion,
+/// and a failed handler commits nothing.
+#[derive(Clone)]
+pub struct ObjectContext {
+    context: WorkflowContext,
+    state: Rc<RefCell<serde_json::Map<String, serde_json::Value>>>,
+    writes: Rc<RefCell<serde_json::Map<String, serde_json::Value>>>,
+}
+
+impl std::ops::Deref for ObjectContext {
+    type Target = WorkflowContext;
+
+    fn deref(&self) -> &WorkflowContext {
+        &self.context
+    }
+}
+
+impl ObjectContext {
+    /// The value under `name`, if it has one.
+    pub fn get<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>, WorkflowError> {
+        self.state
+            .borrow()
+            .get(name)
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|e| WorkflowError::Payload(e.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Sets the value under `name`, when the handler completes. A value that encodes as JSON `null`
+    /// removes the name.
+    pub fn set<V: Serialize + ?Sized>(&self, name: &str, value: &V) -> Result<(), WorkflowError> {
+        let value =
+            serde_json::to_value(value).map_err(|e| WorkflowError::Payload(e.to_string()))?;
+        if value.is_null() {
+            self.state.borrow_mut().remove(name);
+        } else {
+            self.state
+                .borrow_mut()
+                .insert(name.to_owned(), value.clone());
+        }
+        self.writes.borrow_mut().insert(name.to_owned(), value);
+        Ok(())
+    }
+
+    /// Removes `name`, when the handler completes.
+    pub fn clear(&self, name: &str) {
+        self.state.borrow_mut().remove(name);
+        self.writes
+            .borrow_mut()
+            .insert(name.to_owned(), serde_json::Value::Null);
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct HandlerInput<I> {
+    args: I,
+    state: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct HandlerOutput<O> {
+    output: O,
+    writes: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Turns `async fn(ObjectContext, I) -> Result<O, WorkflowError>` into a handler of a virtual object
+/// (ADR 0043), for `Builder::object_handler`. Its arguments and output are JSON.
+pub fn object_handler<F, Fut, I, O>(function: F) -> impl Decider + Send + Sync
+where
+    F: Fn(ObjectContext, I) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<O, WorkflowError>>,
+    I: DeserializeOwned,
+    O: Serialize,
+{
+    workflow(move |context: WorkflowContext, input: HandlerInput<I>| {
+        let writes = Rc::new(RefCell::new(serde_json::Map::new()));
+        let object = ObjectContext {
+            context,
+            state: Rc::new(RefCell::new(input.state)),
+            writes: Rc::clone(&writes),
+        };
+        let handler = function(object, input.args);
+        async move {
+            let output = handler.await?;
+            let writes = writes.take();
+            Ok(HandlerOutput { output, writes })
+        }
+    })
+}
+
 /// An update a workflow received ([`WorkflowContext::wait_update`]): its payload, and which wait
 /// received it, to answer it by.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1158,6 +1158,46 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         Ok(UpdateStatus::Accepted { run, cmd })
     }
 
+    /// Puts a call to an object's handler in the object key's inbox (ADR 0043), starting the key's loop if
+    /// it has none, and returns the call's run key: the call's outcome is that run's. A call whose id
+    /// has a run already, or is already in the inbox, is not delivered again.
+    pub fn call_object(
+        &mut self,
+        object: &str,
+        key: &str,
+        handler: &str,
+        id: &str,
+        args: &serde_json::Value,
+    ) -> Result<String, PartitionError> {
+        use crate::objects::{INVOKE, call_key, handler_workflow, loop_workflow, object_run_key};
+        let workflow = handler_workflow(object, handler);
+        if self.deciders.get(&workflow).is_none() {
+            return Err(PartitionError::UnknownWorkflow(workflow));
+        }
+        let call = call_key(object, key, id);
+        if !valid_key(&call) {
+            return Err(PartitionError::InvalidKey(call));
+        }
+        if self.latest(&call)?.is_some() {
+            return Ok(call);
+        }
+        let run = object_run_key(object, key);
+        self.start_with(
+            &run,
+            &loop_workflow(object),
+            Payload::new(*b"{\"state\":{}}"),
+            StartOptions::default(),
+        )?;
+        let message = serde_json::json!({ "handler": handler, "key": call, "args": args });
+        self.signal(
+            &run,
+            INVOKE,
+            &call,
+            Payload::new(message.to_string().into_bytes()),
+        )?;
+        Ok(call)
+    }
+
     /// A remote workflow's decision (ADR 0039): the commands its logic issued, given the first `at`
     /// entries of run `key`'s journal. A decision for another length is stale (the run has moved on, or
     /// it is a repeat): it is dropped, and the run is activated again for where it is now. Decisions for
