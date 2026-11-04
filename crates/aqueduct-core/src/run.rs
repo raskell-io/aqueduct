@@ -87,6 +87,9 @@ pub enum CommandKind {
         /// A result, not a rejection.
         ok: bool,
     },
+    /// A message sent (ADR 0044). It is born completed. Its name is `<object>\0<handler>`, its child key
+    /// the target key, and its input the arguments.
+    Sent,
 }
 
 impl CommandKind {
@@ -99,7 +102,10 @@ impl CommandKind {
     /// Whether commands of this kind are complete the moment they are issued (recorded values and
     /// responses to updates): they never wait, so a cancellation never takes them.
     pub fn is_born_completed(self) -> bool {
-        matches!(self, CommandKind::Recorded | CommandKind::Response { .. })
+        matches!(
+            self,
+            CommandKind::Recorded | CommandKind::Response { .. } | CommandKind::Sent
+        )
     }
 }
 
@@ -204,8 +210,30 @@ impl ScheduledStep {
         })
     }
 
+    /// The effect that delivers this command's message, if it is one.
+    fn send(&self, cmd: CommandIndex) -> Option<Effect> {
+        if self.kind != CommandKind::Sent {
+            return None;
+        }
+        let (object, handler) = self.name.split_once('\0')?;
+        Some(Effect::Send {
+            cmd,
+            object: object.to_owned(),
+            key: self.child_key.clone().unwrap_or_default(),
+            handler: handler.to_owned(),
+            args: self.input.clone(),
+        })
+    }
+
     fn describe(&self) -> String {
         match self.kind {
+            CommandKind::Sent => {
+                let (object, handler) = self.name.split_once('\0').unwrap_or((&self.name, ""));
+                format!(
+                    "a message to {object}.{handler} of key `{}`",
+                    self.child_key.as_deref().unwrap_or_default()
+                )
+            }
             CommandKind::Step => format!("step `{}`", self.name),
             CommandKind::Agent { budget_tokens } => {
                 format!("agent call `{}` (budget {budget_tokens} tokens)", self.name)
@@ -369,6 +397,19 @@ pub enum Effect {
     CancelChild {
         /// The command that started it.
         cmd: CommandIndex,
+    },
+    /// Deliver a message (ADR 0044). Idempotent: performed again after a restart while the run runs.
+    Send {
+        /// The command that sent it.
+        cmd: CommandIndex,
+        /// The target object.
+        object: String,
+        /// The target object key.
+        key: String,
+        /// The handler to call.
+        handler: String,
+        /// The call's arguments (JSON).
+        args: Payload,
     },
     /// The run reached a terminal status.
     Finished(Status),
@@ -655,6 +696,19 @@ impl RunState {
             Entry::ChildFailed { cmd, error } => {
                 self.expect_kind(*cmd, |kind| kind == CommandKind::Child)?;
                 self.record(*cmd, StepOutcome::Failed(error.clone()))?;
+            }
+            Entry::MessageSent {
+                cmd,
+                object,
+                key,
+                handler,
+                args,
+            } => {
+                let name = format!("{object}\0{handler}");
+                self.push_command(*cmd, &name, args.clone(), CommandKind::Sent)?;
+                let index = self.index(*cmd)?;
+                self.steps[index].child_key = Some(key.clone());
+                self.record(*cmd, StepOutcome::Completed(Payload::new(*b"null")))?;
             }
             Entry::UpdateAwaited {
                 cmd,
@@ -981,7 +1035,14 @@ impl RunState {
         if self.status.is_terminal() {
             return Vec::new();
         }
-        let mut effects = vec![Effect::Activate];
+        // Messages come first, so the run's end can never be logged before they are delivered.
+        let mut effects: Vec<Effect> = self
+            .steps
+            .iter()
+            .zip(0u32..)
+            .filter_map(|(step, index)| step.send(CommandIndex(index)))
+            .collect();
+        effects.push(Effect::Activate);
         effects.extend(self.pending_steps());
         // Children: started again (idempotent) if the run still waits for them, which also delivers
         // the outcome of a child that ended while its parent's record of it was lost; cancelled again
@@ -1398,7 +1459,8 @@ impl RunState {
             | CommandKind::Escalation
             | CommandKind::Agent { .. }
             | CommandKind::Child
-            | CommandKind::Response { .. } => false,
+            | CommandKind::Response { .. }
+            | CommandKind::Sent => false,
         };
         if step.outcome.is_some() || !has_timer {
             return Transition::none();
@@ -1490,6 +1552,7 @@ impl RunState {
                     update: *update,
                     ok: result.is_ok(),
                 }),
+                Command::Send { .. } => Some(CommandKind::Sent),
                 _ => None,
             };
             if let Some(kind) = new_kind {
@@ -1507,6 +1570,12 @@ impl RunState {
                     Command::AwaitSignal { name, .. }
                     | Command::Record { name, .. }
                     | Command::AwaitUpdate { name, .. } => (name.clone(), Payload::default()),
+                    Command::Send {
+                        object,
+                        handler,
+                        args,
+                        ..
+                    } => (format!("{object}\0{handler}"), args.clone()),
                     Command::Respond { result, .. } => (
                         String::new(),
                         match result {
@@ -1527,6 +1596,7 @@ impl RunState {
                     held: None,
                     child_key: match &command {
                         Command::StartChild { key, .. } => key.clone(),
+                        Command::Send { key, .. } => Some(key.clone()),
                         _ => None,
                     },
                 };
@@ -1607,7 +1677,11 @@ impl RunState {
                                 timeout_ms,
                                 wake_at,
                             },
-                            CommandKind::Recorded | CommandKind::Response { .. } => continue,
+                            CommandKind::Recorded
+                            | CommandKind::Response { .. }
+                            | CommandKind::Sent => {
+                                continue;
+                            }
                         });
                         if !transition.effects.contains(&Effect::Activate) {
                             transition.effects.push(Effect::Activate);
@@ -1726,6 +1800,41 @@ impl RunState {
                                 wake_at,
                             });
                         }
+                        CommandKind::Sent => {
+                            let Command::Send {
+                                object,
+                                key,
+                                handler,
+                                args,
+                            } = command
+                            else {
+                                continue;
+                            };
+                            transition.entries.push(Entry::MessageSent {
+                                cmd,
+                                object: object.clone(),
+                                key: key.clone(),
+                                handler: handler.clone(),
+                                args: args.clone(),
+                            });
+                            // Before any activation this decision asks for, in the order sent: the
+                            // next decision may end the run, and its end must not precede delivery.
+                            let at = transition
+                                .effects
+                                .iter()
+                                .take_while(|e| matches!(e, Effect::Send { .. }))
+                                .count();
+                            transition.effects.insert(
+                                at,
+                                Effect::Send {
+                                    cmd,
+                                    object,
+                                    key,
+                                    handler,
+                                    args,
+                                },
+                            );
+                        }
                         CommandKind::Response { update, .. } => {
                             transition.entries.push(match command {
                                 Command::Respond {
@@ -1755,7 +1864,8 @@ impl RunState {
                 | Command::CallAgent { .. }
                 | Command::StartChild { .. }
                 | Command::AwaitUpdate { .. }
-                | Command::Respond { .. } => {}
+                | Command::Respond { .. }
+                | Command::Send { .. } => {}
                 Command::CompleteRun { .. }
                 | Command::FailRun { .. }
                 | Command::Park { .. }
@@ -1765,6 +1875,20 @@ impl RunState {
                     return Transition::park(format!(
                         "the logic issued a terminal command at position {position} that is not its last command"
                     ));
+                }
+                // A run that sends and ends in one decision ends in the next, after delivery: a crash can
+                // keep a prefix of a batch, and the run's end must not be kept without its messages.
+                Command::CompleteRun { .. }
+                | Command::ContinueAsNew { .. }
+                | Command::FailRun { .. }
+                    if transition
+                        .effects
+                        .iter()
+                        .any(|e| matches!(e, Effect::Send { .. })) =>
+                {
+                    if !transition.effects.contains(&Effect::Activate) {
+                        transition.effects.push(Effect::Activate);
+                    }
                 }
                 Command::CompleteRun { output } => {
                     if steps_seen < known {
@@ -1829,7 +1953,8 @@ fn same_command(recorded: &ScheduledStep, issued: &ScheduledStep) -> bool {
                 CommandKind::Response { update: a, ok: x },
                 CommandKind::Response { update: b, ok: y },
             ) => a == b && x == y,
-            (CommandKind::Recorded, CommandKind::Recorded) => true,
+            (CommandKind::Recorded, CommandKind::Recorded)
+            | (CommandKind::Sent, CommandKind::Sent) => true,
             (CommandKind::Escalation, CommandKind::Escalation)
             | (CommandKind::Child, CommandKind::Child) => true,
             (CommandKind::Agent { budget_tokens: a }, CommandKind::Agent { budget_tokens: b }) => {

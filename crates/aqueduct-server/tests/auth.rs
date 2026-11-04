@@ -133,6 +133,13 @@ async fn every_http_route_needs_its_permission() {
             json!({"outcome": 1}),
         ),
         (
+            Permission::Signal,
+            "POST",
+            "/v1/objects/o/k/h",
+            json!({"args": 1, "timeout_ms": 1}),
+        ),
+        (Permission::Read, "GET", "/v1/objects/o/k", json!({})),
+        (
             Permission::Work,
             "POST",
             "/v1/workers/poll",

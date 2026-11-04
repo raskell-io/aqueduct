@@ -10,6 +10,8 @@
 //! - **A handler's input is `{"args": ..., "state": {...}}`, and its output `{"output": ..., "writes":
 //!   {...}}`** (a `null` write removes the name). The output is one `RunCompleted` record, so its writes
 //!   commit atomically with the handler's completion, and a failed handler writes nothing.
+//! - **An output's `sends`** are messages to other object keys (ADR 0044): the loop issues them as commands
+//!   when it folds the output, so they commit with the writes, and a failed handler sends nothing.
 //! - **The state is the fold of the outputs** in the loop's journal. Every so often the loop continues
 //!   as new with the state as its input, so the journal stays short; only with an empty inbox, because
 //!   signals kept by a generation do not reach the next.
@@ -138,6 +140,22 @@ impl ObjectLoop {
                                 state.insert(name.clone(), value.clone());
                             }
                         }
+                    }
+                    // Its messages, committed with its writes (ADR 0044).
+                    for message in output["sends"].as_array().into_iter().flatten() {
+                        let (Some(object), Some(key), Some(handler)) = (
+                            message["object"].as_str(),
+                            message["key"].as_str(),
+                            message["handler"].as_str(),
+                        ) else {
+                            continue;
+                        };
+                        commands.push(Command::Send {
+                            object: object.to_owned(),
+                            key: key.to_owned(),
+                            handler: handler.to_owned(),
+                            args: Payload::new(message["args"].to_string().into_bytes()),
+                        });
                     }
                 }
             }

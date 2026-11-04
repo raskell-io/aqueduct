@@ -69,6 +69,7 @@ record = version:u8  kind:u8  prev:hash  fields
 | 31 | `UpdateReceived` | `cmd:cmd`, `id:string`, `payload:bytes` |
 | 32 | `UpdateCompleted` | `cmd:cmd`, `update:cmd`, `result:bytes` |
 | 33 | `UpdateRejected` | `cmd:cmd`, `update:cmd`, `error:string` |
+| 34 | `MessageSent` | `cmd:cmd`, `object:string`, `key:string`, `handler:string`, `args:bytes` |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal or update wait has no timeout. A signal's `id` is
@@ -109,8 +110,8 @@ A decoded history is a valid journal if:
 
 1. The first entry is `Started`, and it occurs only once.
 2. `StepScheduled`, `TimerStarted`, `SignalAwaited`, `ValueRecorded`, `Escalated`,
-   `AgentCallScheduled`, `AgentCallEscalated`, `ChildStarted`, `UpdateAwaited`, `UpdateCompleted` and
-   `UpdateRejected` share one sequence of command indexes: 0, 1, 2, ... in order, without gaps.
+   `AgentCallScheduled`, `AgentCallEscalated`, `ChildStarted`, `UpdateAwaited`, `UpdateCompleted`,
+   `UpdateRejected` and `MessageSent` share one sequence of command indexes: 0, 1, 2, ... in order, without gaps.
 3. Each command has at most one outcome. `StepCompleted` and `StepFailed` complete a step. `TimerFired`
    completes a sleep (outcome `null`) or times out a signal wait that has a timeout. A `SignalReceived`
    completes the oldest signal wait with the same name that has no outcome yet; if there is none, the
@@ -134,6 +135,8 @@ A decoded history is a valid journal if:
    child failed, or could not be started) complete it; nothing else does, except a cancellation. The
    child's own history is that of an ordinary run; a child continued as new has not ended, so its
    outcome is that of the last run of its chain.
+   `MessageSent` is a command, born completed (outcome `null`): a call to an object's handler, delivered
+   exactly once under an id derived from the run and the command (ADR 0044).
    `UpdateAwaited` waits for an update (a request whose sender waits for the answer, ADR 0036).
    `UpdateReceived` completes the wait `cmd`, which has no outcome yet, with outcome `payload`; updates
    are never kept for a later wait. `TimerFired` times out an update wait that has a timeout.
@@ -144,7 +147,7 @@ A decoded history is a valid journal if:
    `CancelRequested` occurs at most once. It completes every command that has no outcome yet (a step,
    including one waiting to retry, a sleep or a signal wait) as failed with the error
    `cancelled: <reason>`, in command order, and marks them cancelled. If no command is waiting, the next
-   command other than `ValueRecorded`, `UpdateCompleted` and `UpdateRejected` (a `StepScheduled`,
+   command other than `ValueRecorded`, `UpdateCompleted`, `UpdateRejected` and `MessageSent` (a `StepScheduled`,
    `TimerStarted`, `SignalAwaited`, `ChildStarted`, ...) is completed that way when it is recorded (a
    cancelled signal wait takes no kept signal). Commands after that are not affected.
 4. `StepRetryScheduled` records a failed, retryable attempt of a step that has no outcome and no pending

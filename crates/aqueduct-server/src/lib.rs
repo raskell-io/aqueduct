@@ -128,6 +128,11 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
         .route("/v1/awakeables/{id}", post(http_complete_awakeable))
         .route("/v1/escalations", get(http_escalations))
         .route("/v1/escalations/{id}", post(http_resolve))
+        .route("/v1/objects/{object}/{key}", get(http_object_state))
+        .route(
+            "/v1/objects/{object}/{key}/{handler}",
+            post(http_call_object),
+        )
         .with_state(api.clone());
     grpc.merge(http)
         .merge(workers::routes(api.clone()))
@@ -198,7 +203,8 @@ fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static st
             "Update" => (Permission::Signal, "update"),
             "Cancel" => (Permission::Cancel, "cancel"),
             "ResolveEscalation" => (Permission::Resolve, "resolve"),
-            "Wait" | "Describe" | "ListRuns" | "Query" | "ListEscalations" => {
+            "CallObject" => (Permission::Signal, "call object"),
+            "Wait" | "Describe" | "ListRuns" | "Query" | "ListEscalations" | "GetObjectState" => {
                 (Permission::Read, "read")
             }
             _ => (Permission::Admin, "unknown call"),
@@ -218,6 +224,8 @@ fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static st
         (&Method::POST, ["v1", "runs", _, "cancel"]) => (Permission::Cancel, "cancel"),
         (&Method::POST, ["v1", "awakeables", _]) => (Permission::Signal, "complete awakeable"),
         (&Method::POST, ["v1", "escalations", _]) => (Permission::Resolve, "resolve"),
+        (&Method::POST, ["v1", "objects", _, _, _]) => (Permission::Signal, "call object"),
+        (&Method::GET, ["v1", "objects", _, _]) => (Permission::Read, "read"),
         (&Method::GET, ["v1", "runs", ..] | ["v1", "escalations"]) => (Permission::Read, "read"),
         _ => (Permission::Admin, "unknown route"),
     }
@@ -545,6 +553,47 @@ impl Api {
         })
     }
 
+    async fn call_object(
+        &self,
+        call: v1::CallObjectRequest,
+    ) -> Result<v1::CallObjectResponse, Failure> {
+        let target = format!("{} {} {}", call.object, call.key, call.handler);
+        let result = self.do_call_object(call).await;
+        self.audited("call object", target, result).await
+    }
+
+    async fn do_call_object(
+        &self,
+        call: v1::CallObjectRequest,
+    ) -> Result<v1::CallObjectResponse, Failure> {
+        let args = json_payload("the arguments", call.args)?;
+        let timeout = timeout(call.timeout_ms);
+        let output = self
+            .call(move |engine| {
+                engine.call_object(
+                    &call.object,
+                    &call.key,
+                    &call.handler,
+                    &call.id,
+                    &args,
+                    timeout,
+                )
+            })
+            .await?;
+        Ok(v1::CallObjectResponse { output: output.0 })
+    }
+
+    async fn object_state(
+        &self,
+        object: String,
+        key: String,
+    ) -> Result<v1::GetObjectStateResponse, Failure> {
+        let state = self
+            .call(move |engine| engine.object_state(&object, &key))
+            .await?;
+        Ok(v1::GetObjectStateResponse { state: state.0 })
+    }
+
     async fn escalations(&self) -> Result<v1::ListEscalationsResponse, Failure> {
         let open = self.call(Engine::escalations).await?;
         Ok(v1::ListEscalationsResponse {
@@ -615,6 +664,7 @@ fn description(run_id: String, state: &RunState) -> v1::RunDescription {
                 CommandKind::Escalation => "escalation",
                 CommandKind::Child => "child",
                 CommandKind::Response { .. } => "response",
+                CommandKind::Sent => "send",
             };
             v1::Command {
                 index,
@@ -705,6 +755,21 @@ impl v1::ingress_server::Ingress for Api {
         request: tonic::Request<v1::UpdateRequest>,
     ) -> Answer<v1::UpdateResponse> {
         answer(Api::update(self, request.into_inner()).await)
+    }
+
+    async fn call_object(
+        &self,
+        request: tonic::Request<v1::CallObjectRequest>,
+    ) -> Answer<v1::CallObjectResponse> {
+        answer(Api::call_object(self, request.into_inner()).await)
+    }
+
+    async fn get_object_state(
+        &self,
+        request: tonic::Request<v1::GetObjectStateRequest>,
+    ) -> Answer<v1::GetObjectStateResponse> {
+        let request = request.into_inner();
+        answer(self.object_state(request.object, request.key).await)
     }
 
     async fn list_escalations(
@@ -1002,6 +1067,42 @@ async fn http_update(
             message: "no answer".into(),
         }),
     }
+}
+
+#[derive(Deserialize)]
+struct ObjectCallBody {
+    #[serde(default)]
+    args: Value,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    timeout_ms: u64,
+}
+
+async fn http_call_object(
+    State(api): State<Api>,
+    Path((object, key, handler)): Path<(String, String, String)>,
+    Body(body): Body<ObjectCallBody>,
+) -> Result<Json<Value>, Failure> {
+    let answer = api
+        .call_object(v1::CallObjectRequest {
+            object,
+            key,
+            handler,
+            id: body.id,
+            args: bytes(&body.args),
+            timeout_ms: body.timeout_ms,
+        })
+        .await?;
+    Ok(Json(json!({ "output": value(&answer.output) })))
+}
+
+async fn http_object_state(
+    State(api): State<Api>,
+    Path((object, key)): Path<(String, String)>,
+) -> Result<Json<Value>, Failure> {
+    let answer = api.object_state(object, key).await?;
+    Ok(Json(json!({ "state": value(&answer.state) })))
 }
 
 async fn http_escalations(State(api): State<Api>) -> Result<Json<Value>, Failure> {

@@ -115,6 +115,12 @@ fn every_command_round_trips() {
         Command::Park {
             reason: "stuck".into(),
         },
+        Command::Send {
+            object: "scores".into(),
+            key: "git".into(),
+            handler: "record".into(),
+            args: p("1"),
+        },
     ];
     for command in commands {
         assert_eq!(from_proto(to_proto(&command)).unwrap(), command);

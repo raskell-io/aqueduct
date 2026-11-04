@@ -30,7 +30,8 @@ gives the HTTP/JSON form of each call.
 - **Authentication** (ADR 0041). If the server's data directory has tokens, every request carries one:
   `authorization: Bearer <token>`, as an HTTP header or gRPC metadata. The permissions are `read` (wait,
   describe, list, query, list escalations), `start`, `signal` (signals, awakeables, updates), `cancel`,
-  `resolve`, `work` (step and workflow workers) and `admin` (everything).
+  `resolve`, `work` (step and workflow workers) and `admin` (everything). Calling an object's handler needs
+  `signal`; reading its state, `read`.
 
 ## 2. Ingress (`aqueduct.v1.Ingress`)
 
@@ -47,6 +48,8 @@ gives the HTTP/JSON form of each call.
 | `Update` | `POST /v1/runs/{key}/updates/{name}` | `{"payload", "id"?, "timeout_ms"?}` | `{"result"}` or 422 `{"error"}` |
 | `ListEscalations` | `GET /v1/escalations` | | `{"escalations": [{"id", "key", "reason", "payload"}]}` |
 | `ResolveEscalation` | `POST /v1/escalations/{id}` | `{"outcome"}` | `{}` |
+| `CallObject` | `POST /v1/objects/{object}/{key}/{handler}` | `{"args", "id"?, "timeout_ms"?}` | `{"output"}`, or 422 `{"error"}` if the handler failed |
+| `GetObjectState` | `GET /v1/objects/{object}/{key}` | | `{"state"}` |
 
 `reuse` is `"return_existing"` (the default), `"reject"` or `"allow_after_completion"`. Statuses are
 `"running"`, `"completed"`, `"failed"`, `"parked"` and `"continued"`. Ids containing `#` or a NUL are

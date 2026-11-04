@@ -251,6 +251,16 @@ impl Builder {
         self
     }
 
+    /// Registers a virtual object whose handlers are workflows registered under `<object>.<handler>` some
+    /// other way: as registry versions, or remote workflows (ADR 0043).
+    pub fn object(mut self, object: &str) -> Self {
+        self.deciders.insert(
+            crate::objects::loop_workflow(object),
+            Arc::new(crate::objects::ObjectLoop::new(object)),
+        );
+        self
+    }
+
     /// Registers a handler of a virtual object (ADR 0043): `decider` (for a Rust handler,
     /// `aqueduct_sdk::object_handler`) runs for each call of `object`'s `handler`, one at a time per key.
     pub fn object_handler(

@@ -216,3 +216,165 @@ fn calls_survive_a_crash_at_every_point() {
         }
     }
 }
+
+// Outboxes (ADR 0044).
+
+/// Moves its argument to the key `dest`: its writes and its message commit together.
+const TRANSFER: &str = r#"
+def run(call):
+    n = call["state"].get("n", 0) - call["args"]
+    if n < 0:
+        fail("insufficient")
+    return {
+        "output": n,
+        "writes": {"n": n},
+        "sends": [{"object": "counter", "key": "dest", "handler": "add", "args": call["args"]}],
+    }
+"#;
+
+/// A workflow that sends and ends in one decision. The recorded value before its message asks for an
+/// activation: delivery must still come first, or the next decision logs the run's end before it.
+const NOTIFY: &str = r#"
+def run(amount):
+    patched("first")
+    send("counter", "notified", "add", amount)
+    return "sent"
+"#;
+
+fn open_with_sends(log: MemLog) -> Partition<MemLog> {
+    let mut deciders = Deciders::new();
+    deciders.insert(
+        loop_workflow("counter"),
+        Arc::new(ObjectLoop::new("counter")),
+    );
+    for (name, source) in [
+        ("counter.add", ADD),
+        ("counter.transfer", TRANSFER),
+        ("notify", NOTIFY),
+    ] {
+        deciders.insert(
+            name,
+            Arc::new(Procedure::compile("p.star", source).unwrap()),
+        );
+    }
+    Partition::recover(log, deciders).unwrap()
+}
+
+#[test]
+fn a_handlers_messages_commit_with_it() {
+    let mut partition = open_with_sends(MemLog::default());
+    partition
+        .call_object("counter", "a", "add", "fund", &json!(10))
+        .unwrap();
+    work(&mut partition);
+    partition
+        .call_object("counter", "a", "transfer", "t1", &json!(4))
+        .unwrap();
+    work(&mut partition);
+    // More than it has: fails, writes nothing and sends nothing.
+    partition
+        .call_object("counter", "a", "transfer", "t2", &json!(100))
+        .unwrap();
+    work(&mut partition);
+    assert_eq!(state(&mut partition, "a"), json!({"n": 6}));
+    assert_eq!(state(&mut partition, "dest"), json!({"n": 4}));
+}
+
+/// Without holding a run's end back until its messages are delivered, some prefixes keep the sender's
+/// end and lose its message, with nothing left to deliver it again.
+#[test]
+fn a_message_survives_a_crash_at_every_point_exactly_once() {
+    let mut partition = open_with_sends(MemLog::default());
+    partition
+        .start("n-1", "notify", Payload::new(*b"3"))
+        .unwrap();
+    partition
+        .call_object("counter", "a", "add", "fund", &json!(10))
+        .unwrap();
+    partition
+        .call_object("counter", "a", "transfer", "t1", &json!(4))
+        .unwrap();
+    work(&mut partition);
+    assert_eq!(state(&mut partition, "notified"), json!({"n": 3}));
+    assert_eq!(state(&mut partition, "dest"), json!({"n": 4}));
+    let log = partition.into_log();
+
+    for cut in 0..=log.records.len() {
+        let mut partition = open_with_sends(MemLog {
+            records: log.records[..cut].to_vec(),
+            pending: Vec::new(),
+        });
+        let sender_ended = partition
+            .run("n-1")
+            .is_some_and(|run| run.state().status().is_terminal());
+        work(&mut partition);
+        if sender_ended {
+            // An ended run is not recovered: its message must already be in what survived.
+            assert_eq!(
+                state(&mut partition, "notified"),
+                json!({"n": 3}),
+                "cut at {cut}"
+            );
+        }
+        // The same requests again: everything happens exactly once.
+        partition
+            .start("n-1", "notify", Payload::new(*b"3"))
+            .unwrap();
+        partition
+            .call_object("counter", "a", "add", "fund", &json!(10))
+            .unwrap();
+        partition
+            .call_object("counter", "a", "transfer", "t1", &json!(4))
+            .unwrap();
+        work(&mut partition);
+        assert_eq!(
+            state(&mut partition, "notified"),
+            json!({"n": 3}),
+            "cut at {cut}"
+        );
+        assert_eq!(
+            state(&mut partition, "dest"),
+            json!({"n": 4}),
+            "cut at {cut}"
+        );
+        assert_eq!(state(&mut partition, "a"), json!({"n": 6}), "cut at {cut}");
+    }
+}
+
+/// A message to an object not deployed is delivered once it is: after a restart, while the sender runs.
+#[test]
+fn a_message_waits_for_its_target_to_be_deployed() {
+    const WAITS: &str = r#"
+def run(amount):
+    send("counter", "late", "add", amount)
+    return wait(signal("go"), timeout = 3600)
+"#;
+    let mut without = Deciders::new();
+    without.insert(
+        "waits",
+        Arc::new(Procedure::compile("w.star", WAITS).unwrap()),
+    );
+    let mut partition = Partition::recover(MemLog::default(), without).unwrap();
+    partition
+        .start("w-1", "waits", Payload::new(*b"5"))
+        .unwrap();
+    partition.flush().unwrap();
+    let log = partition.into_log();
+
+    let mut deciders = Deciders::new();
+    deciders.insert(
+        "waits",
+        Arc::new(Procedure::compile("w.star", WAITS).unwrap()),
+    );
+    deciders.insert(
+        loop_workflow("counter"),
+        Arc::new(ObjectLoop::new("counter")),
+    );
+    deciders.insert(
+        "counter.add",
+        Arc::new(Procedure::compile("a.star", ADD).unwrap()),
+    );
+    let mut partition = Partition::recover(log, deciders).unwrap();
+    work(&mut partition);
+    assert_eq!(state(&mut partition, "late"), json!({"n": 5}));
+}

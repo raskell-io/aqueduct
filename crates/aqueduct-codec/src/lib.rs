@@ -72,6 +72,7 @@ mod kind {
     pub const UPDATE_RECEIVED: u8 = 31;
     pub const UPDATE_COMPLETED: u8 = 32;
     pub const UPDATE_REJECTED: u8 = 33;
+    pub const MESSAGE_SENT: u8 = 34;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -198,6 +199,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::UpdateReceived { .. } => kind::UPDATE_RECEIVED,
         Entry::UpdateCompleted { .. } => kind::UPDATE_COMPLETED,
         Entry::UpdateRejected { .. } => kind::UPDATE_REJECTED,
+        Entry::MessageSent { .. } => kind::MESSAGE_SENT,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -246,6 +248,19 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::ChildCompleted { cmd, output } => {
             put_varint(&mut out, u64::from(cmd.0));
             put_bytes(&mut out, output.as_bytes());
+        }
+        Entry::MessageSent {
+            cmd,
+            object,
+            key,
+            handler,
+            args,
+        } => {
+            put_varint(&mut out, u64::from(cmd.0));
+            put_bytes(&mut out, object.as_bytes());
+            put_bytes(&mut out, key.as_bytes());
+            put_bytes(&mut out, handler.as_bytes());
+            put_bytes(&mut out, args.as_bytes());
         }
         Entry::UpdateAwaited {
             cmd,
@@ -542,6 +557,13 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         kind::CHILD_FAILED => Entry::ChildFailed {
             cmd: reader.cmd()?,
             error: reader.string()?,
+        },
+        kind::MESSAGE_SENT => Entry::MessageSent {
+            cmd: reader.cmd()?,
+            object: reader.string()?,
+            key: reader.string()?,
+            handler: reader.string()?,
+            args: reader.payload()?,
         },
         kind::UPDATE_AWAITED => Entry::UpdateAwaited {
             cmd: reader.cmd()?,
