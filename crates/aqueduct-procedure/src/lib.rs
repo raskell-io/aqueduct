@@ -31,6 +31,9 @@
 //!   timeout passes first; `respond(request, result)` answers it and `reject(request, reason)` refuses
 //!   it. A rejection in the same activation that receives the update is validation: the update leaves
 //!   no trace in the journal.
+//! - `send(object, key, handler, args = None)` calls a virtual object's handler without waiting for it:
+//!   the message is durable and delivered exactly once (ADR 0044). A handler written as a procedure
+//!   commits messages with its writes by returning them as `"sends"` instead.
 //! - `publish(name, value)` makes `value` the answer to query `name` from this point of the run on. A
 //!   query replays the run to where it is and returns the last value published under its name;
 //!   publishing is not journaled.
@@ -655,6 +658,23 @@ fn aqueduct_functions(builder: &mut GlobalsBuilder) {
             None => suspend_or_fail(Stop::Suspend),
             Some(_) => Ok(NoneType),
         }
+    }
+
+    /// Sends a message: calls a virtual object's handler without waiting for it (ADR 0044).
+    fn send<'v>(
+        object: &str,
+        key: &str,
+        handler: &str,
+        #[starlark(default = NoneType)] args: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let command = Command::Send {
+            object: object.to_owned(),
+            key: key.to_owned(),
+            handler: handler.to_owned(),
+            args: to_payload(args)?,
+        };
+        with_activation(|act| act.issue_command(command))?;
+        Ok(NoneType)
     }
 
     /// Makes `value` the answer to query `name`, from this point of the run on (not journaled).

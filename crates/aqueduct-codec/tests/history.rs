@@ -104,6 +104,15 @@ fn entry() -> impl Strategy<Value = Entry> {
                 result,
             }
         }),
+        (any::<u32>(), ".{0,12}", ".{0,12}", ".{0,12}", payload()).prop_map(
+            |(cmd, object, key, handler, args)| Entry::MessageSent {
+                cmd: CommandIndex(cmd),
+                object,
+                key,
+                handler,
+                args,
+            }
+        ),
         (any::<u32>(), any::<u32>(), ".{0,12}").prop_map(|(cmd, update, error)| {
             Entry::UpdateRejected {
                 cmd: CommandIndex(cmd),

@@ -82,6 +82,17 @@ pub mod commands {
             }
             Command::FailRun { error } => C::FailRun(v1::FailRun { error }),
             Command::Park { reason } => C::Park(v1::Park { reason }),
+            Command::Send {
+                object,
+                key,
+                handler,
+                args,
+            } => C::Send(v1::Send {
+                object,
+                key,
+                handler,
+                args: args.0,
+            }),
         };
         v1::WorkflowCommand {
             command: Some(command),
@@ -139,6 +150,12 @@ pub mod commands {
             },
             C::FailRun(c) => Command::FailRun { error: c.error },
             C::Park(c) => Command::Park { reason: c.reason },
+            C::Send(c) => Command::Send {
+                object: c.object,
+                key: c.key,
+                handler: c.handler,
+                args: Payload::new(c.args),
+            },
         })
     }
 }

@@ -81,6 +81,18 @@ pub enum Command {
         /// The result, or why the update is rejected.
         result: Result<Payload, String>,
     },
+    /// Send a message: call a virtual object's handler without waiting for it (ADR 0044). Born completed.
+    /// The message is durable with the command, and delivered exactly once.
+    Send {
+        /// The target object.
+        object: String,
+        /// The target object key.
+        key: String,
+        /// The handler to call.
+        handler: String,
+        /// The call's arguments (JSON).
+        args: Payload,
+    },
     /// Complete the run. Must be the last command.
     CompleteRun {
         /// The run's output.

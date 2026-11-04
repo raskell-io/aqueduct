@@ -34,6 +34,13 @@ pub struct Config {
     /// Endpoints that queues' steps are pushed to.
     #[serde(default)]
     pub push: Vec<PushEndpoint>,
+    /// Virtual objects (ADR 0043). Their handlers are workflows named `<object>.<handler>`: approved
+    /// registry versions, or remote workflows.
+    #[serde(default)]
+    pub objects: Vec<String>,
+    /// Workflows that workflow workers run (ADR 0039).
+    #[serde(default)]
+    pub remote_workflows: Vec<String>,
 }
 
 /// An HTTP endpoint a queue's steps are pushed to.
@@ -113,6 +120,12 @@ impl Config {
     pub fn apply(&self, mut builder: Builder) -> Result<Builder, String> {
         for (step, queue) in self.routes()? {
             builder = builder.step_route(&step, &queue);
+        }
+        for workflow in &self.remote_workflows {
+            builder = builder.remote_workflow(workflow);
+        }
+        for object in &self.objects {
+            builder = builder.object(object);
         }
         Ok(builder)
     }

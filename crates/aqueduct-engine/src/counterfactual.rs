@@ -693,6 +693,14 @@ pub fn describe(step: &ScheduledStep) -> String {
         CommandKind::Escalation => "escalation",
         CommandKind::Agent { .. } => "agent call",
         CommandKind::Child => "child run of",
+        CommandKind::Sent => {
+            return format!(
+                "message to {} of key `{}` {}",
+                step.name.replace('\0', "."),
+                step.child_key.as_deref().unwrap_or_default(),
+                text(&step.input)
+            );
+        }
         CommandKind::Update { timeout_ms, .. } if timeout_ms > 0 => {
             return format!("wait for update `{}` ({timeout_ms} ms)", step.name);
         }

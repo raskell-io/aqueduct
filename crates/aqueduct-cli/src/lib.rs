@@ -668,6 +668,12 @@ fn describe(dir: &Path, key: &str) -> Result<String, String> {
                         aqueduct_core::CommandIndex(u32::try_from(index).unwrap_or(u32::MAX))
                     ))
             ),
+            CommandKind::Sent => format!(
+                "message to {} of key {}: {}",
+                step.name.replace('\0', "."),
+                step.child_key.as_deref().unwrap_or_default(),
+                text(&step.input)
+            ),
             CommandKind::Update { timeout_ms, .. } if timeout_ms > 0 => {
                 format!("wait for update {} (timeout {timeout_ms} ms)", step.name)
             }
@@ -1783,6 +1789,16 @@ fn describe_entry(entry: &Entry) -> String {
             format!("[{cmd}] child completed with {}", text(output))
         }
         Entry::ChildFailed { cmd, error } => format!("[{cmd}] child failed: {error}"),
+        Entry::MessageSent {
+            cmd,
+            object,
+            key,
+            handler,
+            args,
+        } => format!(
+            "[{cmd}] message to {object}.{handler} of key {key}: {}",
+            text(args)
+        ),
         Entry::UpdateAwaited {
             cmd,
             name,
@@ -1942,6 +1958,16 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         Entry::ChildFailed { cmd: c, error } => {
             json!({"kind": "ChildFailed", "cmd": cmd(c), "error": error})
         }
+        Entry::MessageSent {
+            cmd: c,
+            object,
+            key,
+            handler,
+            args,
+        } => json!({
+            "kind": "MessageSent", "cmd": cmd(c), "object": object, "key": key,
+            "handler": handler, "args": payload(args)
+        }),
         Entry::UpdateAwaited {
             cmd: c,
             name,

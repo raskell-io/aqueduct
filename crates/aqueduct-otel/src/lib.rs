@@ -324,6 +324,20 @@ impl Observer for OtelObserver {
                 vec![cmd_attribute(*cmd)],
                 Some(error.clone()),
             ),
+            Entry::MessageSent {
+                cmd,
+                object,
+                key,
+                handler,
+                ..
+            } => point(
+                format!("message to {object}.{handler}"),
+                vec![
+                    cmd_attribute(*cmd),
+                    KeyValue::new("aqueduct.object.key", key.clone()),
+                ],
+                None,
+            ),
             Entry::UpdateAwaited { cmd, name, .. } => point(
                 format!("wait for update {name}"),
                 vec![cmd_attribute(*cmd)],

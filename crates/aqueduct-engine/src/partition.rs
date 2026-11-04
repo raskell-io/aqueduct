@@ -1171,7 +1171,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     ) -> Result<String, PartitionError> {
         use crate::objects::{INVOKE, call_key, handler_workflow, loop_workflow, object_run_key};
         let workflow = handler_workflow(object, handler);
-        if self.deciders.get(&workflow).is_none() {
+        if self.deciders.get(&workflow).is_none() && !self.deciders.is_remote(&workflow) {
             return Err(PartitionError::UnknownWorkflow(workflow));
         }
         let call = call_key(object, key, id);
@@ -1859,6 +1859,27 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     key: child,
                 } => self.start_child(key, cmd, &workflow, input, child)?,
                 Effect::CancelChild { cmd } => self.cancel_child(key, cmd)?,
+                Effect::Send {
+                    cmd,
+                    object,
+                    key: target,
+                    handler,
+                    args,
+                } => {
+                    let id = child_key(key, cmd);
+                    let args = serde_json::from_slice(args.as_bytes()).unwrap_or_default();
+                    match self.call_object(&object, &target, &handler, &id, &args) {
+                        // A target not deployed (yet) is delivered to when it is: this is performed
+                        // again after a restart while the sender runs.
+                        Ok(_)
+                        | Err(
+                            PartitionError::UnknownWorkflow(_)
+                            | PartitionError::InvalidKey(_)
+                            | PartitionError::KeyConflict(_),
+                        ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 Effect::ContinueAsNew { input } => {
                     let (workflow, budget) = self
                         .runs

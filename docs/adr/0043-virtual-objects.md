@@ -52,8 +52,5 @@ recovery and retries.
 - **A handler removed from the deployment** after its call entered the inbox fails to start: its call has
   no run, and its caller times out. A call to an unknown handler is refused up front.
 - **Cancelling a loop run ends the object key.** Later calls to it are dropped until they time out.
-- **Not done yet:**
-  - durable outboxes: a handler sending messages atomically with its commit;
-  - objects over the network: HTTP and gRPC routes, remote handlers, and registering them in
-    `aqueduct server`, which so far means objects work only in a program that embeds the engine;
-  - object scenarios in the conformance suite and the simulator's workloads.
+- **Not done yet:** object scenarios in the conformance suite and the simulator's workloads. (ADR 0044 adds
+  outboxes, and objects over the network.)

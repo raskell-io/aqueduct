@@ -303,6 +303,21 @@ pub enum Entry {
         /// Why, returned to the update's sender.
         error: String,
     },
+    /// The run sent a message: a call to a virtual object's handler, which goes to that key's inbox
+    /// (ADR 0044). A command, born completed. Delivery is idempotent, under an id derived from this run
+    /// and command ([`crate::child_key`]), and repeated after a restart while the run is running.
+    MessageSent {
+        /// The command's index.
+        cmd: CommandIndex,
+        /// The target object.
+        object: String,
+        /// The target object key.
+        key: String,
+        /// The handler to call.
+        handler: String,
+        /// The call's arguments (JSON).
+        args: Payload,
+    },
     /// The run ended and asked for a new run of the same workflow under the same key, with this input
     /// (continue-as-new). The engine starts it as the key's next generation.
     ContinuedAsNew {

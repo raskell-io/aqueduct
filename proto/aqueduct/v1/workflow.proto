@@ -78,7 +78,16 @@ message WorkflowCommand {
     ContinueAsNew continue_as_new = 11;
     FailRun fail_run = 12;
     Park park = 13;
+    Send send = 14;
   }
+}
+
+// A call to a virtual object's handler, sent without waiting for it (ADR 0044).
+message Send {
+  string object = 1;
+  string key = 2;
+  string handler = 3;
+  bytes args = 4;
 }
 
 message ScheduleStep {

@@ -29,6 +29,11 @@ service Ingress {
   rpc Query(QueryRequest) returns (QueryResponse);
   // Sends an update and waits for the run's answer (ADR 0036).
   rpc Update(UpdateRequest) returns (UpdateResponse);
+  // Calls a handler of a virtual object and waits for its output (ADR 0043). A failed handler is
+  // FAILED_PRECONDITION; it committed nothing.
+  rpc CallObject(CallObjectRequest) returns (CallObjectResponse);
+  // A virtual object key's committed state, as a JSON object.
+  rpc GetObjectState(GetObjectStateRequest) returns (GetObjectStateResponse);
   // Open escalations across runs.
   rpc ListEscalations(ListEscalationsRequest) returns (ListEscalationsResponse);
   // Resolves an escalation; the run continues with the outcome.
@@ -89,7 +94,7 @@ message DescribeRequest {
 
 message Command {
   uint32 index = 1;
-  // `step`, `agent`, `sleep`, `signal`, `update`, `record`, `escalation`, `child` or `response`.
+  // `step`, `agent`, `sleep`, `signal`, `update`, `record`, `escalation`, `child`, `response` or `send`.
   string kind = 2;
   string name = 3;
   bytes input = 4;
@@ -177,6 +182,31 @@ message UpdateResponse {
     // The run rejected the update, could not take it, or ended without answering.
     string rejected = 2;
   }
+}
+
+message CallObjectRequest {
+  string object = 1;
+  string key = 2;
+  string handler = 3;
+  // The call's id: a call under an id that has run is not run again, and gets that outcome. Empty makes
+  // a new call.
+  string id = 4;
+  bytes args = 5;
+  // How long to wait for the output. Past it, the call may still run: call again with the same id.
+  uint64 timeout_ms = 6;
+}
+
+message CallObjectResponse {
+  bytes output = 1;
+}
+
+message GetObjectStateRequest {
+  string object = 1;
+  string key = 2;
+}
+
+message GetObjectStateResponse {
+  bytes state = 1;
 }
 
 message ListEscalationsRequest {}

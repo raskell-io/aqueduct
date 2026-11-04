@@ -97,6 +97,7 @@ fn run(
                 };
                 Event::ChildResult { cmd, outcome }
             }
+            Effect::Send { .. } => continue,
             Effect::Finished(_) | Effect::ContinueAsNew { .. } | Effect::CancelChild { .. } => {
                 continue;
             }

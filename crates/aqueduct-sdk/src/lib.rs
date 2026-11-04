@@ -395,6 +395,27 @@ impl WorkflowContext {
         )
     }
 
+    /// Sends a message: calls a virtual object's handler without waiting for it (ADR 0044). The message
+    /// is durable from here on and delivered exactly once, even if the run ends at once. In an object's
+    /// handler, [`ObjectContext::send`] commits it with the handler instead.
+    pub fn send<A: Serialize + ?Sized>(
+        &self,
+        object: &str,
+        key: &str,
+        handler: &str,
+        args: &A,
+    ) -> Result<(), WorkflowError> {
+        let args = serde_json::to_vec(args).map_err(|e| WorkflowError::Payload(e.to_string()))?;
+        let (index, _) = self.issue(Command::Send {
+            object: object.to_owned(),
+            key: key.to_owned(),
+            handler: handler.to_owned(),
+            args: Payload::new(args),
+        });
+        self.activation.borrow_mut().resolve(index);
+        Ok(())
+    }
+
     /// Calls a model through the engine's agent executor (an agent step) and decodes its response. The
     /// request carries `input`, the prompt and the output schema; the call may use at most
     /// `options.budget_tokens` tokens (a response that cost more fails the call). The response, the model
@@ -899,6 +920,7 @@ pub struct ObjectContext {
     context: WorkflowContext,
     state: Rc<RefCell<serde_json::Map<String, serde_json::Value>>>,
     writes: Rc<RefCell<serde_json::Map<String, serde_json::Value>>>,
+    sends: Rc<RefCell<Vec<serde_json::Value>>>,
 }
 
 impl std::ops::Deref for ObjectContext {
@@ -938,6 +960,22 @@ impl ObjectContext {
         Ok(())
     }
 
+    /// Sends a message to a virtual object's handler when this handler completes (ADR 0044): it commits
+    /// atomically with the writes, is delivered exactly once, and is not sent if this handler fails.
+    pub fn send<A: Serialize + ?Sized>(
+        &self,
+        object: &str,
+        key: &str,
+        handler: &str,
+        args: &A,
+    ) -> Result<(), WorkflowError> {
+        let args = serde_json::to_value(args).map_err(|e| WorkflowError::Payload(e.to_string()))?;
+        self.sends.borrow_mut().push(serde_json::json!({
+            "object": object, "key": key, "handler": handler, "args": args,
+        }));
+        Ok(())
+    }
+
     /// Removes `name`, when the handler completes.
     pub fn clear(&self, name: &str) {
         self.state.borrow_mut().remove(name);
@@ -957,6 +995,7 @@ struct HandlerInput<I> {
 struct HandlerOutput<O> {
     output: O,
     writes: serde_json::Map<String, serde_json::Value>,
+    sends: Vec<serde_json::Value>,
 }
 
 /// Turns `async fn(ObjectContext, I) -> Result<O, WorkflowError>` into a handler of a virtual object
@@ -970,16 +1009,22 @@ where
 {
     workflow(move |context: WorkflowContext, input: HandlerInput<I>| {
         let writes = Rc::new(RefCell::new(serde_json::Map::new()));
+        let sends = Rc::new(RefCell::new(Vec::new()));
         let object = ObjectContext {
             context,
             state: Rc::new(RefCell::new(input.state)),
             writes: Rc::clone(&writes),
+            sends: Rc::clone(&sends),
         };
         let handler = function(object, input.args);
         async move {
             let output = handler.await?;
-            let writes = writes.take();
-            Ok(HandlerOutput { output, writes })
+            let (writes, sends) = (writes.take(), sends.take());
+            Ok(HandlerOutput {
+                output,
+                writes,
+                sends,
+            })
         }
     })
 }

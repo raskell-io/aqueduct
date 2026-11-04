@@ -78,7 +78,8 @@ fn reference(decider: &dyn Decider, n: u64) -> Result<String, String> {
             | Effect::ContinueAsNew { .. }
             | Effect::DispatchAgent { .. }
             | Effect::StartChild { .. }
-            | Effect::CancelChild { .. } => {
+            | Effect::CancelChild { .. }
+            | Effect::Send { .. } => {
                 continue;
             }
         };

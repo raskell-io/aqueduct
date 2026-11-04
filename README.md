@@ -194,7 +194,9 @@ What holds today, for the embedded engine, and how it is checked:
 - **Virtual objects:** keyed, durable state whose handlers run one at a time per key
   (`Builder::object_handler`, `Engine::call_object`); a handler's state changes commit atomically with
   its completion, and a failed handler commits nothing
-  ([ADR 0043](docs/adr/0043-virtual-objects.md)). In embedded mode only, so far.
+  ([ADR 0043](docs/adr/0043-virtual-objects.md)). A handler's messages to other objects commit with its
+  writes and arrive exactly once, so no hand-written outbox tables
+  ([ADR 0044](docs/adr/0044-outboxes.md)).
 - **Queries and updates:** a run publishes state (`publish("address", address)`, `ctx.publish(...)`)
   that queries read without journaling anything (`aqueduct query`, `Engine::query`); an update is a
   request whose sender waits for the run's answer (`wait(update("change"))`, then `respond` or
