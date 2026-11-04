@@ -30,6 +30,7 @@ jobs:
       - run: mise run test:doc
       - run: mise run doc
       - run: mise run examples
+      - run: mise run test:features
 
   sim:
     name: simulation

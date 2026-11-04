@@ -3,7 +3,13 @@
 //! and audit.
 //!
 //! This facade re-exports what an application needs: Rust workflows ([`workflow`],
-//! [`WorkflowContext`]), Starlark procedures ([`Procedure`]) and the embedded engine ([`embedded`]).
+//! [`WorkflowContext`]), Starlark procedures (`Procedure`) and the embedded engine ([`embedded`]).
+//!
+//! # Features
+//!
+//! - `procedures` (on by default): Starlark procedures and the version registry. A program with only
+//!   Rust workflows can turn it off (`default-features = false`) and depend on far fewer crates.
+//! - `tokio`: `embedded::AsyncEngine`, the embedded engine for async code on Tokio.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -25,15 +31,20 @@
 //! # Ok::<(), aqueduct::embedded::EngineError>(())
 //! ```
 //!
-//! Procedure versions are pinned (ADR 0029) and go through a lifecycle in the [`registry`] (ADR 0030):
+//! Procedure versions are pinned (ADR 0029) and go through a lifecycle in the `registry` (ADR 0030):
 //! `Registry::open(dir)?.deploy(Engine::builder(dir))` registers the deployable ones.
 //!
-//! The project is in phase 2 (BRIEF.md): the API will change.
+//! The project is in phase 3 (BRIEF.md): the API will change.
 
 #![forbid(unsafe_code)]
 
-pub use aqueduct_core::{Payload, Status, StepOutcome};
+#[cfg(feature = "tokio")]
+mod asynchronous;
+
+pub use aqueduct_core::{CommandIndex, Decider, Payload, RunState, Status, StepOutcome};
+pub use aqueduct_engine::replay;
 pub use aqueduct_engine::{RetryPolicy, ReusePolicy, StartOptions};
+#[cfg(feature = "procedures")]
 pub use aqueduct_procedure::Procedure;
 pub use aqueduct_sdk::{
     AgentOptions, Either, Saga, Update, WorkflowContext, WorkflowError, join, join_all, select,
@@ -42,6 +53,7 @@ pub use aqueduct_sdk::{
 
 /// The version registry: procedure versions with provenance, replay evidence, approvals and a
 /// lifecycle.
+#[cfg(feature = "procedures")]
 pub mod registry {
     pub use aqueduct_registry::{
         Action, Approval, Event, Identities, Policy, Provenance, PublicKey, Registry,
@@ -52,11 +64,15 @@ pub mod registry {
 
 /// The embedded engine: a durable engine inside your process.
 pub mod embedded {
+    #[cfg(feature = "tokio")]
+    pub use crate::asynchronous::AsyncEngine;
     pub use aqueduct_core::AgentResponse;
     pub use aqueduct_engine::embedded::{
         Attempt, Builder, Engine, EngineError, EngineStats, Escalation, RunResult, RunSummary,
+        StepCall,
     };
     pub use aqueduct_engine::{
         AgentAttempt, AgentCall, AgentExecutor, Durability, Observer, StepEnd,
     };
+    pub use aqueduct_engine::{activations, queue};
 }
