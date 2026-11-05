@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aqueduct_engine::activations::{Activation, ActivationQueue};
+use aqueduct_engine::namespaces::Scope;
 use aqueduct_protocol::v1;
 use tokio::sync::{Notify, mpsc};
 
@@ -51,6 +52,7 @@ impl v1::workflows_server::Workflows for Api {
         request: tonic::Request<tonic::Streaming<v1::WorkflowWorkerMessage>>,
     ) -> Result<tonic::Response<ServeStream>, tonic::Status> {
         let queue = self.activations()?;
+        let scope = crate::worker_scope();
         let mut inbound = request.into_inner();
         let hello = match inbound.message().await? {
             Some(v1::WorkflowWorkerMessage {
@@ -77,7 +79,7 @@ impl v1::workflows_server::Workflows for Api {
         {
             let (engine, queue) = (Arc::clone(&self.engine), Arc::clone(&queue));
             let (credit, closed, changed) = (credit.clone(), closed.clone(), changed.clone());
-            let (session, gone) = (session.clone(), out.clone());
+            let (session, gone, scope) = (session.clone(), out.clone(), scope.clone());
             tokio::spawn(async move {
                 loop {
                     let message = tokio::select! {
@@ -97,7 +99,7 @@ impl v1::workflows_server::Workflows for Api {
                             // A decision that does not decode is dropped; its lease runs out and the
                             // activation is offered again.
                             if let (Ok(commands), Some((run, at))) =
-                                (commands, queue.complete(&decision.activation_id))
+                                (commands, queue.complete_in(&scope, &decision.activation_id))
                             {
                                 let _ = engine.decision(&run, at, commands);
                             }
@@ -117,7 +119,7 @@ impl v1::workflows_server::Workflows for Api {
         }
 
         tokio::spawn(serve_activations(
-            queue, session, workflows, credit, closed, changed, out,
+            queue, scope, session, workflows, credit, closed, changed, out,
         ));
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(stream),
@@ -125,8 +127,10 @@ impl v1::workflows_server::Workflows for Api {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_activations(
     queue: Arc<ActivationQueue>,
+    scope: Scope,
     session: String,
     workflows: Arc<Vec<String>>,
     credit: Arc<AtomicU32>,
@@ -140,9 +144,14 @@ async fn serve_activations(
             changed.notified().await;
             continue;
         }
-        let (taking, names, name) = (Arc::clone(&queue), Arc::clone(&workflows), session.clone());
+        let (taking, names, name, scope) = (
+            Arc::clone(&queue),
+            Arc::clone(&workflows),
+            session.clone(),
+            scope.clone(),
+        );
         let taken = tokio::task::spawn_blocking(move || {
-            taking.wait_take(&name, &names, available as usize, TAKE_WAIT)
+            taking.wait_take_in(&scope, &name, &names, available as usize, TAKE_WAIT)
         })
         .await
         .unwrap_or_default();

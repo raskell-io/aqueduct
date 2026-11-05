@@ -185,6 +185,7 @@ fn config(transport: &Transport, push_port: u16) -> aqueduct_server::Config {
             concurrency: 8,
             timeout_ms: 10_000,
             headers: std::collections::BTreeMap::new(),
+            namespace: None,
         });
     }
     config

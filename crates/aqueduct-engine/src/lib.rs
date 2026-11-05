@@ -13,6 +13,7 @@ pub mod counterfactual;
 pub mod drift;
 pub mod embedded;
 pub mod metrics;
+pub mod namespaces;
 pub mod objects;
 mod observe;
 mod partition;

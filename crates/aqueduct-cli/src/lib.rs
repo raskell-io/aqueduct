@@ -53,11 +53,13 @@ commands:
                                       or --listen-anywhere. Steps run on workers; the config
                                       routes them to named queues and push endpoints (ADR 0040).
                                       Ctrl-C or SIGTERM stops it
-  tokens create <dir> --name <name> --permissions <p,p,...>
+  tokens create <dir> --name <name> --permissions <p,p,...> [--namespace <namespace>]
                                       create a token for the server (ADR 0041) and print it, once;
                                       the first token turns authentication on. Permissions: read,
-                                      start, signal, cancel, resolve, work, admin
-  tokens list <dir>                   tokens: name and permissions (secrets are not stored)
+                                      start, signal, cancel, resolve, work, admin. A token works in
+                                      one namespace (ADR 0046): the default one, or <namespace>;
+                                      * lets it choose one per request, and serve all as a worker
+  tokens list <dir>                   tokens: name, namespace and permissions (secrets are not stored)
   tokens revoke <dir> <name>          revoke a token; it stops working at once
   audit <dir>                         verify the server's audit log and print it
   mcp <dir> [--as <identity>] [--read-only]
@@ -321,10 +323,14 @@ fn tokens(args: &[String]) -> Result<String, String> {
     match command.as_str() {
         "create" => {
             let (mut name, mut permissions) = (None, std::collections::BTreeSet::new());
+            let mut namespace = aqueduct_engine::namespaces::DEFAULT.to_owned();
             let mut rest = args[2..].iter();
             while let Some(arg) = rest.next() {
                 match arg.as_str() {
                     "--name" => name = rest.next().cloned(),
+                    "--namespace" => {
+                        namespace = rest.next().ok_or("--namespace needs a name")?.clone();
+                    }
                     "--permissions" => {
                         let list = rest.next().ok_or("--permissions needs a list")?;
                         for permission in list.split(',') {
@@ -335,7 +341,7 @@ fn tokens(args: &[String]) -> Result<String, String> {
                 }
             }
             let name = name.ok_or("tokens create needs --name")?;
-            let token = auth::create_token(dir, &name, permissions)?;
+            let token = auth::create_token_in(dir, &name, permissions, &namespace)?;
             log("token create", &name)?;
             Ok(format!(
                 "{token}\n# Token `{name}`: keep it secret, it is not stored and will not be shown again.\n"
@@ -345,7 +351,12 @@ fn tokens(args: &[String]) -> Result<String, String> {
             let mut out = String::new();
             for token in auth::list_tokens(dir)? {
                 let permissions: Vec<&str> = token.permissions.iter().map(|p| p.as_str()).collect();
-                out.push_str(&format!("{}  {}\n", token.name, permissions.join(",")));
+                out.push_str(&format!(
+                    "{}  {}  {}\n",
+                    token.name,
+                    token.namespace,
+                    permissions.join(",")
+                ));
             }
             Ok(out)
         }

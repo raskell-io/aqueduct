@@ -25,14 +25,21 @@ gives the HTTP/JSON form of each call.
   - `DEADLINE_EXCEEDED` / 504: a wait or an update timed out;
   - `FAILED_PRECONDITION` / 422: an update was rejected, or a resolution does not match its schema;
   - `UNAVAILABLE` / 503: the server is at a limit or stopping; retry later (`retry-after`);
-  - `RESOURCE_EXHAUSTED` / 429: the caller is over its rate limit; retry after `retry-after` seconds;
+  - `RESOURCE_EXHAUSTED` / 429: the caller or its namespace is over its rate limit; retry after `retry-after` seconds;
   - `UNAUTHENTICATED` / 401: no token, or one the server does not know;
-  - `PERMISSION_DENIED` / 403: the token lacks the permission.
+  - `PERMISSION_DENIED` / 403: the token lacks the permission, or a namespace is not one it may name.
 - **Authentication** (ADR 0041). If the server's data directory has tokens, every request carries one:
   `authorization: Bearer <token>`, as an HTTP header or gRPC metadata. The permissions are `read` (wait,
   describe, list, query, list escalations), `start`, `signal` (signals, awakeables, updates), `cancel`,
   `resolve`, `work` (step and workflow workers) and `admin` (everything). Calling an object's handler needs
   `signal`; reading its state, `read`.
+- **Namespaces** (ADR 0046). A token is bound to a namespace, or to `*`. Keys, run ids and escalation ids are
+  in the caller's namespace: another's are `NOT_FOUND`. A request may name its namespace in an
+  `aqueduct-namespace` header or metadata. A bound token may name only its own (otherwise, or for an invalid
+  name, `PERMISSION_DENIED`); a `*` token, or any caller of a server without tokens, chooses, and without the
+  header is in `default`. A worker serves its token's namespace, or the one it names; a `*` token that names
+  none serves all. Results and decisions for runs outside that are dropped. Workers see a run's stored id
+  (`$ns/<namespace>/<key>`, `<key>` in `default`), not the client's key.
 
 ## 2. Ingress (`aqueduct.v1.Ingress`)
 
@@ -102,6 +109,8 @@ Each finished invocation returns one unit of credit implicitly. A `credit` messa
   as a polled invocation, and an `aqueduct-idempotency-key` header. It answers `200` with
   `{"completed": <any JSON>}`, `{"failed": "..."}` or `{"retry": "..."}`. Any other status, a timeout,
   or an answer of another shape is a retryable failure.
+- **Namespaces.** An endpoint's `"namespace"` is the one it serves, or `"*"` for all. Without it, it serves
+  `default`.
 
 ### 3.4 Delivery
 
@@ -137,7 +146,7 @@ journal as it does for local logic.
 ## 5. Not in this draft yet
 - **Push endpoints:** the server calls an HTTP endpoint per invocation, for serverless platforms.
 - **Named task queues** and deployments across workers.
-- **OIDC/JWT, mTLS and namespaces.** The server has TLS (ADR 0042), and binds to loopback by default;
+- **OIDC/JWT and mTLS.** The server has TLS (ADR 0042), and binds to loopback by default;
   beyond loopback it needs tokens and a certificate.
 - **Version management** over the network (register, propose, prove, approve): for now through
   `aqueduct versions` on the server's data directory, and the MCP server.

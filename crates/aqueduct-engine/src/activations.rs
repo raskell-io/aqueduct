@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use aqueduct_core::Env;
 
+use crate::namespaces::Scope;
+
 /// An activation for a worker: decide run `run` at the first `at` entries of its history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Activation {
@@ -129,6 +131,18 @@ impl ActivationQueue {
         max: usize,
         now_ms: u64,
     ) -> Vec<Activation> {
+        self.take_in(&Scope::All, worker, workflows, max, now_ms)
+    }
+
+    /// [`ActivationQueue::take`], of runs in `scope` only.
+    pub fn take_in(
+        &self,
+        scope: &Scope,
+        worker: &str,
+        workflows: &[String],
+        max: usize,
+        now_ms: u64,
+    ) -> Vec<Activation> {
         let mut inner = self.lock();
         // Leases that have run out are offered again.
         let mut expired = Vec::new();
@@ -152,7 +166,7 @@ impl ActivationQueue {
             if entry.lease.is_some() {
                 continue;
             }
-            if taken.len() >= max || !workflows.contains(&entry.workflow) {
+            if taken.len() >= max || !workflows.contains(&entry.workflow) || !scope.contains(&run) {
                 kept.push_back(run);
                 continue;
             }
@@ -183,9 +197,21 @@ impl ActivationQueue {
         max: usize,
         wait: Duration,
     ) -> Vec<Activation> {
+        self.wait_take_in(&Scope::All, worker, workflows, max, wait)
+    }
+
+    /// [`ActivationQueue::wait_take`], of runs in `scope` only.
+    pub fn wait_take_in(
+        &self,
+        scope: &Scope,
+        worker: &str,
+        workflows: &[String],
+        max: usize,
+        wait: Duration,
+    ) -> Vec<Activation> {
         let deadline = Instant::now() + wait;
         loop {
-            let taken = self.take(worker, workflows, max, self.now_ms());
+            let taken = self.take_in(scope, worker, workflows, max, self.now_ms());
             let left = deadline.saturating_duration_since(Instant::now());
             if !taken.is_empty() || left.is_zero() || max == 0 {
                 return taken;
@@ -201,7 +227,16 @@ impl ActivationQueue {
     /// handed out. The run's pending activation is done if it is the one decided; a decision for an
     /// older one is still returned (the partition drops it as stale).
     pub fn complete(&self, id: &str) -> Option<(String, usize)> {
+        self.complete_in(&Scope::All, id)
+    }
+
+    /// [`ActivationQueue::complete`], for a worker that serves `scope`: a decision for a run outside
+    /// it is not taken. Activation ids are not secrets.
+    pub fn complete_in(&self, scope: &Scope, id: &str) -> Option<(String, usize)> {
         let mut inner = self.lock();
+        if !scope.contains(&inner.issued.get(id)?.0) {
+            return None;
+        }
         let (run, at) = inner.issued.remove(id)?;
         if inner.entries.get(&run).is_some_and(|e| e.at == at) {
             inner.entries.remove(&run);

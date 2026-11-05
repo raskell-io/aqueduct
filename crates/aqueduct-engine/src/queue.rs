@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use aqueduct_core::{CommandIndex, IdempotencyKey, Payload};
 
+use crate::namespaces::{Scope, namespace_of};
+
 /// A step for a worker to execute: one attempt of one command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
@@ -62,6 +64,12 @@ struct Inner {
     waiting: VecDeque<(String, CommandIndex)>,
     /// Invocation ids handed out, to the step they belong to.
     issued: BTreeMap<String, (String, CommandIndex)>,
+    /// Stride scheduling between namespaces: the next to be served is the one with work waiting and the
+    /// lowest pass, which rises by 1/weight each time it is served. A namespace coming back from idle
+    /// starts at the lowest pass of those with work waiting, so idling earns no credit.
+    pass: BTreeMap<String, f64>,
+    /// The namespaces with work waiting at the last take across namespaces.
+    backlogged: std::collections::BTreeSet<String>,
 }
 
 /// Steps for remote workers, with leases. Shared between the engine and the transports.
@@ -73,6 +81,8 @@ pub struct StepQueue {
     clock: Instant,
     /// Steps routed to named task queues (ADR 0040), by step name.
     routes: BTreeMap<String, String>,
+    /// Namespaces' shares of a shared worker pool (ADR 0046); 1 by default.
+    weights: BTreeMap<String, f64>,
 }
 
 impl StepQueue {
@@ -90,7 +100,14 @@ impl StepQueue {
             lease_ms: u64::try_from(lease.as_millis()).unwrap_or(u64::MAX).max(1),
             clock: Instant::now(),
             routes,
+            weights: BTreeMap::new(),
         }
+    }
+
+    /// Sets namespaces' shares of workers that serve several namespaces. Others have a weight of 1.
+    pub fn with_weights(mut self, weights: BTreeMap<String, f64>) -> StepQueue {
+        self.weights = weights;
+        self
     }
 
     /// The queue a step waits in.
@@ -156,26 +173,79 @@ impl StepQueue {
         max: usize,
         now_ms: u64,
     ) -> Vec<Invocation> {
+        self.take_in(&Scope::All, worker, queues, max, now_ms)
+    }
+
+    /// [`StepQueue::take`], of the steps of runs in `scope` only. Among several namespaces, steps are
+    /// taken by weighted fair queueing, so a namespace with many steps waiting cannot starve the others;
+    /// within a namespace, in the order offered.
+    pub fn take_in(
+        &self,
+        scope: &Scope,
+        worker: &str,
+        queues: &[String],
+        max: usize,
+        now_ms: u64,
+    ) -> Vec<Invocation> {
         let mut inner = self.lock();
         Self::expire_locked(&mut inner, now_ms);
-        let mut taken = Vec::new();
+        let inner = &mut *inner;
+        // What can be taken, by namespace, in the order offered; a duplicate or a step answered is
+        // dropped from the waiting list.
+        let mut candidates: BTreeMap<String, VecDeque<(String, CommandIndex)>> = BTreeMap::new();
         let mut kept = VecDeque::new();
-        while let Some(target) = inner.waiting.pop_front() {
-            let wanted = taken.len() < max
-                && inner
-                    .entries
-                    .get(&target)
-                    .is_some_and(|e| e.lease.is_none() && queues.contains(&e.queue));
-            if !wanted {
-                if inner
-                    .entries
-                    .get(&target)
-                    .is_some_and(|e| e.lease.is_none())
-                {
-                    kept.push_back(target);
-                }
+        let mut seen = std::collections::BTreeSet::new();
+        for target in inner.waiting.drain(..) {
+            let Some(entry) = inner.entries.get(&target) else {
+                continue;
+            };
+            if entry.lease.is_some() || !seen.insert(target.clone()) {
                 continue;
             }
+            if queues.contains(&entry.queue) && scope.contains(&target.0) {
+                candidates
+                    .entry(namespace_of(&target.0).to_owned())
+                    .or_default()
+                    .push_back(target.clone());
+            }
+            kept.push_back(target);
+        }
+        inner.waiting = kept;
+        // Those coming back from idle catch up. (A worker of one namespace has no one to be fair to.)
+        if *scope == Scope::All {
+            let floor = candidates
+                .keys()
+                .filter(|namespace| inner.backlogged.contains(*namespace))
+                .filter_map(|namespace| inner.pass.get(namespace))
+                .copied()
+                .min_by(f64::total_cmp);
+            if let Some(floor) = floor {
+                for namespace in candidates.keys() {
+                    if !inner.backlogged.contains(namespace) {
+                        let pass = inner.pass.entry(namespace.clone()).or_default();
+                        *pass = pass.max(floor);
+                    }
+                }
+            }
+        }
+        let mut taken = Vec::new();
+        while taken.len() < max {
+            let next = candidates
+                .iter()
+                .filter(|(_, waiting)| !waiting.is_empty())
+                .map(|(namespace, _)| {
+                    let pass = inner.pass.get(namespace).copied().unwrap_or(0.0);
+                    (namespace.clone(), pass)
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            let Some((namespace, pass)) = next else {
+                break;
+            };
+            let Some(target) = candidates.get_mut(&namespace).and_then(VecDeque::pop_front) else {
+                break;
+            };
+            let weight = self.weights.get(&namespace).copied().unwrap_or(1.0);
+            inner.pass.insert(namespace, pass + 1.0 / weight);
             let Some(entry) = inner.entries.get_mut(&target) else {
                 continue;
             };
@@ -195,9 +265,16 @@ impl StepQueue {
                 attempt: entry.attempts,
                 lease_ms: self.lease_ms,
             });
+            inner.waiting.retain(|waiting| *waiting != target);
             inner.issued.insert(id, target);
         }
-        inner.waiting = kept;
+        if *scope == Scope::All {
+            inner.backlogged = candidates
+                .into_iter()
+                .filter(|(_, waiting)| !waiting.is_empty())
+                .map(|(namespace, _)| namespace)
+                .collect();
+        }
         taken
     }
 
@@ -209,9 +286,21 @@ impl StepQueue {
         max: usize,
         wait: Duration,
     ) -> Vec<Invocation> {
+        self.wait_take_in(&Scope::All, worker, queues, max, wait)
+    }
+
+    /// [`StepQueue::wait_take`], of the steps of runs in `scope` only.
+    pub fn wait_take_in(
+        &self,
+        scope: &Scope,
+        worker: &str,
+        queues: &[String],
+        max: usize,
+        wait: Duration,
+    ) -> Vec<Invocation> {
         let deadline = Instant::now() + wait;
         loop {
-            let taken = self.take(worker, queues, max, self.now_ms());
+            let taken = self.take_in(scope, worker, queues, max, self.now_ms());
             let left = deadline.saturating_duration_since(Instant::now());
             if !taken.is_empty() || left.is_zero() || max == 0 {
                 return taken;
@@ -228,7 +317,16 @@ impl StepQueue {
     /// step (whether the lease is current or has run out, the first result counts). `None` for a
     /// result the queue no longer needs: a duplicate, or one for a step already answered.
     pub fn complete(&self, id: &str) -> Option<(String, CommandIndex)> {
+        self.complete_in(&Scope::All, id)
+    }
+
+    /// [`StepQueue::complete`], for a worker that serves `scope`: a result for a step outside it is
+    /// not one the queue needs. Invocation ids are not secrets.
+    pub fn complete_in(&self, scope: &Scope, id: &str) -> Option<(String, CommandIndex)> {
         let mut inner = self.lock();
+        if !scope.contains(&inner.issued.get(id)?.0) {
+            return None;
+        }
         let target = inner.issued.remove(id)?;
         inner.entries.remove(&target)?;
         inner.issued.retain(|_, t| *t != target);
@@ -356,6 +454,107 @@ mod tests {
         assert_eq!(billing[0].step, "charge");
         // Unrouted steps keep the queue of their own name.
         assert_eq!(q.take("w", &names(&["ship"]), 10, 0).len(), 1);
+    }
+
+    #[test]
+    fn workers_get_only_their_namespaces_steps() {
+        let q = queue();
+        q.offer(
+            "$ns/acme/r",
+            CommandIndex(0),
+            "s",
+            Payload::new(*b"1"),
+            1,
+            0,
+        );
+        q.offer(
+            "$ns/globex/r",
+            CommandIndex(0),
+            "s",
+            Payload::new(*b"2"),
+            1,
+            0,
+        );
+        q.offer("r", CommandIndex(0), "s", Payload::new(*b"3"), 1, 0);
+        let one = |n: &str| Scope::One(n.to_owned());
+        let acme = q.take_in(&one("acme"), "w", &names(&["s"]), 10, 0);
+        assert_eq!(acme.len(), 1);
+        assert_eq!(acme[0].run, "$ns/acme/r");
+        assert_eq!(
+            q.take_in(&one("default"), "w", &names(&["s"]), 10, 0)[0].run,
+            "r"
+        );
+        assert_eq!(
+            q.take_in(&Scope::All, "w", &names(&["s"]), 10, 0)[0].run,
+            "$ns/globex/r"
+        );
+    }
+
+    /// Takes every step one at a time: which namespace each came from.
+    fn order(q: &StepQueue) -> Vec<String> {
+        std::iter::from_fn(|| q.take("w", &names(&["s"]), 1, 0).into_iter().next())
+            .map(|i| namespace_of(&i.run).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_noisy_namespace_cannot_starve_the_others() {
+        let q = queue();
+        for i in 0..1_000 {
+            q.offer(
+                "$ns/noisy/r",
+                CommandIndex(i),
+                "s",
+                Payload::new(*b"1"),
+                1,
+                0,
+            );
+        }
+        for i in 0..10 {
+            q.offer(
+                "$ns/quiet/r",
+                CommandIndex(i),
+                "s",
+                Payload::new(*b"1"),
+                1,
+                0,
+            );
+        }
+        let order = order(&q);
+        assert_eq!(order.len(), 1_010);
+        // Despite arriving last, the quiet namespace is done within its share: every other step.
+        let last = order.iter().rposition(|n| n == "quiet").unwrap();
+        assert!(last <= 21, "the quiet namespace waited until step {last}");
+    }
+
+    #[test]
+    fn weights_set_shares_and_idling_earns_no_credit() {
+        let weights = [("big".to_owned(), 3.0)].into();
+        let q = queue().with_weights(weights);
+        let offer =
+            |run: &str, i: u32| q.offer(run, CommandIndex(i), "s", Payload::new(*b"1"), 1, 0);
+        for i in 0..40 {
+            offer("$ns/big/r", i);
+            offer("$ns/small/r", i);
+        }
+        let first: Vec<String> = order(&q).into_iter().take(40).collect();
+        let big = first.iter().filter(|n| *n == "big").count();
+        assert!((29..=31).contains(&big), "{big}: {first:?}");
+
+        // A namespace idle while another worked does not then monopolise the workers.
+        let q = queue();
+        for i in 0..100 {
+            q.offer("$ns/a/r", CommandIndex(i), "s", Payload::new(*b"1"), 1, 0);
+        }
+        for _ in 0..50 {
+            q.take("w", &names(&["s"]), 1, 0);
+        }
+        for i in 0..50 {
+            q.offer("$ns/b/r", CommandIndex(i), "s", Payload::new(*b"1"), 1, 0);
+        }
+        let next: Vec<String> = order(&q).into_iter().take(20).collect();
+        let b = next.iter().filter(|n| *n == "b").count();
+        assert!((9..=11).contains(&b), "{next:?}");
     }
 
     #[test]

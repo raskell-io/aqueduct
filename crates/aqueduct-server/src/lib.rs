@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use aqueduct_core::{CommandKind, Payload, RunState, Status, StepOutcome};
 use aqueduct_engine::embedded::{Engine, EngineError, RunSummary};
+use aqueduct_engine::namespaces::{self, Scope};
 use aqueduct_engine::{ReusePolicy, StartOptions};
 use aqueduct_protocol::v1;
 use axum::extract::{Path, Query, State};
@@ -223,6 +224,85 @@ impl Security {
 tokio::task_local! {
     /// Who made the request being handled.
     static PRINCIPAL: Principal;
+    /// What the request being handled may reach.
+    static CALLER: Caller;
+}
+
+/// What a request may reach (ADR 0046).
+#[derive(Clone, Debug)]
+struct Caller {
+    /// The namespace its keys are in.
+    namespace: String,
+    /// The namespaces it serves, if it is a worker.
+    workers: Scope,
+}
+
+/// The namespace of the request being handled.
+fn namespace() -> String {
+    CALLER
+        .try_with(|caller| caller.namespace.clone())
+        .unwrap_or_else(|_| namespaces::DEFAULT.to_owned())
+}
+
+/// The namespaces the worker making this request serves.
+pub(crate) fn worker_scope() -> Scope {
+    CALLER
+        .try_with(|caller| caller.workers.clone())
+        .unwrap_or(Scope::All)
+}
+
+/// What a request may reach, from its token's namespace and the header naming one. A token bound to a
+/// namespace cannot name another; only a `*` token, or a server without tokens, can choose.
+fn caller(token: Option<&str>, header: Option<&str>) -> Result<Caller, String> {
+    if let Some(name) = header
+        && !namespaces::valid_namespace(name)
+    {
+        return Err(format!("`{name}` is not a namespace"));
+    }
+    match (token, header) {
+        (None | Some("*"), Some(name)) => Ok(Caller {
+            namespace: name.to_owned(),
+            workers: Scope::One(name.to_owned()),
+        }),
+        (None | Some("*"), None) => Ok(Caller {
+            namespace: namespaces::DEFAULT.to_owned(),
+            workers: Scope::All,
+        }),
+        (Some(bound), Some(name)) if bound != name => Err(format!(
+            "this token works in namespace `{bound}`, not `{name}`"
+        )),
+        (Some(bound), _) => Ok(Caller {
+            namespace: bound.to_owned(),
+            workers: Scope::One(bound.to_owned()),
+        }),
+    }
+}
+
+/// A key from a client, as stored: in its namespace, whatever it says. A key that names another
+/// namespace, or an internal run outside this one, is answered as what it is to this caller: no run.
+fn run_key(key: &str) -> Result<String, Failure> {
+    let namespace = namespace();
+    let internal = key.starts_with("$ns/") || aqueduct_engine::objects::is_reserved_key(key);
+    if internal && namespaces::namespace_of(key) == namespace {
+        return Ok(key.to_owned());
+    }
+    if internal || namespaces::names_namespace(key) {
+        return Err(Failure {
+            kind: Kind::NotFound,
+            message: format!("no run `{key}`"),
+        });
+    }
+    Ok(namespaces::scoped(&namespace, key))
+}
+
+/// A part of an object call's address from a client: it must not name a namespace.
+fn object_part<'a>(what: &str, part: &'a str) -> Result<&'a str, Failure> {
+    if namespaces::names_namespace(part) {
+        return Err(Failure::invalid(format!(
+            "this {what} cannot be used: `{part}`"
+        )));
+    }
+    Ok(part)
 }
 
 /// The permission a route needs, and its name in the audit log. A route not listed needs `admin`, so a
@@ -296,7 +376,42 @@ async fn authorize(
             return respond(Failure { kind, message }, grpc, None);
         }
     };
+    // What it may reach: a token bound to a namespace cannot name another.
+    let token_namespace = match &principal {
+        // A token whose namespace cannot be told reaches nothing: it must never mean all of them.
+        Principal::Token(name) => match api.security.auth.token_namespace(name) {
+            Some(namespace) => Some(namespace),
+            None => {
+                let message = "this token's namespace cannot be read".to_owned();
+                refused(&api, principal.name(), action, path, &message).await;
+                let kind = Kind::Unauthenticated;
+                return respond(Failure { kind, message }, grpc, None);
+            }
+        },
+        Principal::Anyone => None,
+    };
+    let named = request
+        .headers()
+        .get("aqueduct-namespace")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let context = match caller(token_namespace.as_deref(), named.as_deref()) {
+        Ok(context) => context,
+        Err(message) => {
+            refused(&api, principal.name(), action, path, &message).await;
+            let kind = Kind::Forbidden;
+            return respond(Failure { kind, message }, grpc, None);
+        }
+    };
     let limiter = &api.security.limiter;
+    if needed != Permission::Work
+        && let Err(wait) = limiter.admit_namespace(&context.namespace)
+    {
+        let message = format!("namespace `{}` is over its rate limit", context.namespace);
+        refused(&api, principal.name(), action, path, &message).await;
+        let kind = Kind::RateLimited;
+        return respond(Failure { kind, message }, grpc, Some(wait));
+    }
     // Workers are limited by their capacity: a rate limit would only delay finished work.
     if needed != Permission::Work
         && let Err(wait) = limiter.admit(principal.name())
@@ -313,7 +428,8 @@ async fn authorize(
         let kind = Kind::Unavailable;
         return respond(Failure { kind, message }, grpc, Some(RETRY_SOON));
     };
-    PRINCIPAL.scope(principal, next.run(request)).await
+    let scope = CALLER.scope(context, PRINCIPAL.scope(principal, next.run(request)));
+    scope.await
 }
 
 /// The retry hint when nothing says how long the wait will be.
@@ -449,6 +565,11 @@ impl Api {
         let who = PRINCIPAL
             .try_with(|principal| principal.name().to_owned())
             .unwrap_or_else(|_| "anyone".to_owned());
+        // The log says which namespace each action was in.
+        let target = match namespace().as_str() {
+            namespaces::DEFAULT => target,
+            namespace => format!("{namespace}: {target}"),
+        };
         let security = Arc::clone(&self.security);
         // Lines are synced to disk: not on the async threads.
         let _ = tokio::task::spawn_blocking(move || {
@@ -505,20 +626,22 @@ impl Api {
             budget_tokens: (start.budget_tokens > 0).then_some(start.budget_tokens),
             version: (!start.version.is_empty()).then_some(start.version),
         };
-        let key = start.key;
+        let key = run_key(&start.key)?;
+        let namespace = namespace();
         self.call(move |engine| {
             engine.start_with(&key, &start.workflow, input, options)?;
             engine.describe(&key)
         })
         .await
         .map(|(run_id, state)| v1::StartResponse {
-            run_id,
+            run_id: namespaces::unscoped(&namespace, &run_id).to_owned(),
             version: state.version().unwrap_or_default().to_owned(),
         })
     }
 
     async fn wait(&self, key: String, timeout_ms: u64) -> Result<v1::RunResult, Failure> {
         let timeout = timeout(timeout_ms);
+        let key = run_key(&key)?;
         let result = self.call(move |engine| engine.wait(&key, timeout)).await?;
         Ok(v1::RunResult {
             status: status(result.status) as i32,
@@ -529,11 +652,17 @@ impl Api {
     }
 
     async fn describe(&self, key: String) -> Result<v1::RunDescription, Failure> {
+        let key = run_key(&key)?;
+        let namespace = namespace();
         let (run_id, state) = self.call(move |engine| engine.describe(&key)).await?;
-        Ok(description(run_id, &state))
+        Ok(description(
+            namespaces::unscoped(&namespace, &run_id).to_owned(),
+            &state,
+        ))
     }
 
     async fn list(&self, filter: v1::ListRunsRequest) -> Result<v1::ListRunsResponse, Failure> {
+        let namespace = namespace();
         let runs = self.call(Engine::runs).await?;
         let limit = if filter.limit == 0 {
             usize::MAX
@@ -542,11 +671,12 @@ impl Api {
         };
         let runs = runs
             .into_iter()
+            .filter(|run| namespaces::namespace_of(&run.run_id) == namespace)
             .filter(|run| filter.workflow.is_empty() || run.workflow == filter.workflow)
             .filter(|run| filter.status == 0 || status(run.status) as i32 == filter.status)
             .take(limit)
             .map(|run: RunSummary| v1::RunSummary {
-                run_id: run.run_id,
+                run_id: namespaces::unscoped(&namespace, &run.run_id).to_owned(),
                 workflow: run.workflow,
                 status: status(run.status) as i32,
                 entries: run.entries as u64,
@@ -563,7 +693,8 @@ impl Api {
 
     async fn do_signal(&self, signal: v1::SignalRequest) -> Result<v1::Ack, Failure> {
         let payload = json_payload("the payload", signal.payload)?;
-        self.call(move |engine| engine.signal(&signal.key, &signal.name, &signal.id, payload))
+        let key = run_key(&signal.key)?;
+        self.call(move |engine| engine.signal(&key, &signal.name, &signal.id, payload))
             .await?;
         Ok(v1::Ack {})
     }
@@ -580,6 +711,7 @@ impl Api {
         payload: Vec<u8>,
     ) -> Result<v1::Ack, Failure> {
         let payload = json_payload("the payload", payload)?;
+        let id = run_key(&id)?;
         self.call(move |engine| engine.complete_awakeable(&id, payload))
             .await?;
         Ok(v1::Ack {})
@@ -597,12 +729,14 @@ impl Api {
         } else {
             reason
         };
+        let key = run_key(&key)?;
         self.call(move |engine| engine.cancel(&key, &reason))
             .await?;
         Ok(v1::Ack {})
     }
 
     async fn query(&self, key: String, name: String) -> Result<v1::QueryResponse, Failure> {
+        let key = run_key(&key)?;
         let value = self.call(move |engine| engine.query(&key, &name)).await?;
         Ok(v1::QueryResponse { value: value.0 })
     }
@@ -624,10 +758,9 @@ impl Api {
     async fn do_update(&self, update: v1::UpdateRequest) -> Result<v1::UpdateResponse, Failure> {
         let payload = json_payload("the payload", update.payload)?;
         let timeout = timeout(update.timeout_ms);
+        let key = run_key(&update.key)?;
         let answer = self
-            .call(move |engine| {
-                engine.update(&update.key, &update.name, &update.id, payload, timeout)
-            })
+            .call(move |engine| engine.update(&key, &update.name, &update.id, payload, timeout))
             .await;
         let answer = match answer {
             Ok(result) => v1::update_response::Answer::Result(result.0),
@@ -657,16 +790,13 @@ impl Api {
     ) -> Result<v1::CallObjectResponse, Failure> {
         let args = json_payload("the arguments", call.args)?;
         let timeout = timeout(call.timeout_ms);
+        object_part("object", &call.object)?;
+        object_part("handler", &call.handler)?;
+        object_part("id", &call.id)?;
+        let key = namespaces::scoped(&namespace(), object_part("key", &call.key)?);
         let output = self
             .call(move |engine| {
-                engine.call_object(
-                    &call.object,
-                    &call.key,
-                    &call.handler,
-                    &call.id,
-                    &args,
-                    timeout,
-                )
+                engine.call_object(&call.object, &key, &call.handler, &call.id, &args, timeout)
             })
             .await?;
         Ok(v1::CallObjectResponse { output: output.0 })
@@ -677,6 +807,8 @@ impl Api {
         object: String,
         key: String,
     ) -> Result<v1::GetObjectStateResponse, Failure> {
+        object_part("object", &object)?;
+        let key = namespaces::scoped(&namespace(), object_part("key", &key)?);
         let state = self
             .call(move |engine| engine.object_state(&object, &key))
             .await?;
@@ -684,13 +816,15 @@ impl Api {
     }
 
     async fn escalations(&self) -> Result<v1::ListEscalationsResponse, Failure> {
+        let namespace = namespace();
         let open = self.call(Engine::escalations).await?;
         Ok(v1::ListEscalationsResponse {
             escalations: open
                 .into_iter()
+                .filter(|e| namespaces::namespace_of(&e.key) == namespace)
                 .map(|e| v1::Escalation {
-                    id: e.id,
-                    key: e.key,
+                    id: namespaces::unscoped(&namespace, &e.id).to_owned(),
+                    key: namespaces::unscoped(&namespace, &e.key).to_owned(),
                     reason: e.reason,
                     payload: e.payload.0,
                 })
@@ -706,6 +840,7 @@ impl Api {
 
     async fn do_resolve(&self, id: String, outcome: Vec<u8>) -> Result<v1::Ack, Failure> {
         let outcome = json_payload("the outcome", outcome)?;
+        let id = run_key(&id)?;
         self.call(move |engine| engine.resolve_escalation(&id, outcome))
             .await?;
         Ok(v1::Ack {})
