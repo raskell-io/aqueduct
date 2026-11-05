@@ -59,5 +59,6 @@ Configured under `"limits"` in the server's configuration:
 refusing a request before reading its body reset the HTTP/2 stream, which could fail that request with a
 transport error, and after enough resets, the connection. Refusals now read a small body first (at most 64 KiB,
 for at most 20 ms). With 16 times as many clients as places, a server keeps starting 12,000 to 13,800 runs per
-second, with no errors. With `max_running_runs` set, 100,000 parked runs halve start throughput, because the
-count is recomputed by scanning every run after each flush; this is not fixed yet.
+second, with no errors. With `max_running_runs` set, 100,000 parked runs halved start throughput, because the
+count was recomputed from every run after each flush. The partition now keeps the count up to date as runs
+start and end, and the same load reaches 18,184 to 18,688 starts per second.

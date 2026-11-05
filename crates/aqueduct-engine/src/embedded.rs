@@ -1367,17 +1367,8 @@ impl Processor {
             .map_err(|e| format!("storage failed: {e}"))?;
         self.deliver(outbound);
         if self.max_running.is_some() || !self.namespace_max.is_empty() {
-            self.running = 0;
-            self.namespace_count.clear();
-            for (key, run) in self.partition.runs() {
-                if !run.state().status().is_terminal() && !key.starts_with("$object/") {
-                    self.running += 1;
-                    *self
-                        .namespace_count
-                        .entry(crate::namespaces::namespace_of(key).to_owned())
-                        .or_default() += 1;
-                }
-            }
+            self.namespace_count.clone_from(self.partition.running());
+            self.running = self.namespace_count.values().sum();
         }
         self.answer_waiters();
         self.answer_updates().map_err(|e| e.to_string())?;

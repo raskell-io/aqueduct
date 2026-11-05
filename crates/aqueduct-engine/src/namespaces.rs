@@ -88,9 +88,14 @@ pub enum Scope {
 impl Scope {
     /// Whether a stored run key is in scope.
     pub fn contains(&self, run: &str) -> bool {
+        self.includes(namespace_of(run))
+    }
+
+    /// Whether a namespace is in scope.
+    pub fn includes(&self, namespace: &str) -> bool {
         match self {
             Scope::All => true,
-            Scope::One(namespace) => namespace_of(run) == namespace,
+            Scope::One(one) => one == namespace,
         }
     }
 }

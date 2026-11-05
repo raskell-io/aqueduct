@@ -9,7 +9,7 @@
 //! Every method that depends on time takes the clock (`now_ms`), so the queue can be driven by a
 //! simulated clock in tests.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,9 @@ pub struct Invocation {
     pub lease_ms: u64,
 }
 
+/// A step: its run and command.
+type Target = (String, CommandIndex);
+
 /// Where a step is: waiting for a worker, or leased to one until a deadline.
 #[derive(Debug)]
 struct Entry {
@@ -48,6 +51,10 @@ struct Entry {
     /// Attempts offered so far.
     attempts: u32,
     lease: Option<Lease>,
+    /// Its place in its waiting list, while it has no lease. Another place in the list is out of date.
+    place: u64,
+    /// The invocation ids handed out for it: a result under any of them counts.
+    ids: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -59,17 +66,72 @@ struct Lease {
 #[derive(Debug, Default)]
 struct Inner {
     /// Every step not yet answered, by its run and command.
-    entries: BTreeMap<(String, CommandIndex), Entry>,
-    /// The order in which waiting steps are offered.
-    waiting: VecDeque<(String, CommandIndex)>,
+    entries: BTreeMap<Target, Entry>,
+    /// The order in which waiting steps are offered, by namespace and queue. Places are in offer order
+    /// across queues. A step answered or leased leaves its place behind, dropped when it is reached, so
+    /// that nothing here costs more as the backlog grows.
+    waiting: BTreeMap<String, BTreeMap<String, VecDeque<(u64, Target)>>>,
+    next_place: u64,
+    /// The steps under a lease, by when it runs out.
+    leases: BTreeSet<(u64, Target)>,
     /// Invocation ids handed out, to the step they belong to.
-    issued: BTreeMap<String, (String, CommandIndex)>,
+    issued: BTreeMap<String, Target>,
     /// Stride scheduling between namespaces: the next to be served is the one with work waiting and the
     /// lowest pass, which rises by 1/weight each time it is served. A namespace coming back from idle
     /// starts at the lowest pass of those with work waiting, so idling earns no credit.
     pass: BTreeMap<String, f64>,
     /// The namespaces with work waiting at the last take across namespaces.
-    backlogged: std::collections::BTreeSet<String>,
+    backlogged: BTreeSet<String>,
+}
+
+impl Inner {
+    /// Gives a step without a lease a place at the end of its waiting list.
+    fn enqueue(&mut self, target: Target) {
+        let place = self.next_place;
+        self.next_place += 1;
+        let Some(entry) = self.entries.get_mut(&target) else {
+            return;
+        };
+        entry.place = place;
+        self.waiting
+            .entry(namespace_of(&target.0).to_owned())
+            .or_default()
+            .entry(entry.queue.clone())
+            .or_default()
+            .push_back((place, target));
+    }
+
+    /// The next place in a namespace's named queues, in offer order, dropping those out of date.
+    fn next_in(&mut self, namespace: &str, queues: &[String]) -> Option<(u64, String)> {
+        let lists = self.waiting.get_mut(namespace)?;
+        let mut next: Option<(u64, String)> = None;
+        for queue in queues {
+            let Some(list) = lists.get_mut(queue) else {
+                continue;
+            };
+            while let Some((place, target)) = list.front() {
+                let current = self
+                    .entries
+                    .get(target)
+                    .is_some_and(|entry| entry.lease.is_none() && entry.place == *place);
+                if current {
+                    break;
+                }
+                list.pop_front();
+            }
+            if let Some((place, _)) = list.front()
+                && next.as_ref().is_none_or(|(first, _)| place < first)
+            {
+                next = Some((*place, queue.clone()));
+            }
+        }
+        next
+    }
+
+    fn pop(&mut self, namespace: &str, queue: &str) -> Option<Target> {
+        let list = self.waiting.get_mut(namespace)?.get_mut(queue)?;
+        list.pop_front().map(|(_, target)| target)
+    }
 }
 
 /// Steps for remote workers, with leases. Shared between the engine and the transports.
@@ -144,7 +206,10 @@ impl StepQueue {
             match &entry.lease {
                 None => return,
                 Some(lease) if lease.until_ms > now_ms => return,
-                Some(_) => {}
+                Some(lease) => {
+                    let until = lease.until_ms;
+                    inner.leases.remove(&(until, target.clone()));
+                }
             }
         }
         let queue = self.queue_of(step).to_owned();
@@ -154,11 +219,13 @@ impl StepQueue {
             input,
             attempts: 0,
             lease: None,
+            place: 0,
+            ids: Vec::new(),
         });
         entry.lease = None;
         // Never below what the run has recorded.
         entry.attempts = entry.attempts.max(attempt.saturating_sub(1));
-        inner.waiting.push_back(target);
+        inner.enqueue(target);
         drop(inner);
         self.ready.notify_all();
     }
@@ -190,37 +257,27 @@ impl StepQueue {
         let mut inner = self.lock();
         Self::expire_locked(&mut inner, now_ms);
         let inner = &mut *inner;
-        // What can be taken, by namespace, in the order offered; a duplicate or a step answered is
-        // dropped from the waiting list.
-        let mut candidates: BTreeMap<String, VecDeque<(String, CommandIndex)>> = BTreeMap::new();
-        let mut kept = VecDeque::new();
-        let mut seen = std::collections::BTreeSet::new();
-        for target in inner.waiting.drain(..) {
-            let Some(entry) = inner.entries.get(&target) else {
-                continue;
-            };
-            if entry.lease.is_some() || !seen.insert(target.clone()) {
-                continue;
-            }
-            if queues.contains(&entry.queue) && scope.contains(&target.0) {
-                candidates
-                    .entry(namespace_of(&target.0).to_owned())
-                    .or_default()
-                    .push_back(target.clone());
-            }
-            kept.push_back(target);
-        }
-        inner.waiting = kept;
+        // The namespaces with something to take.
+        let namespaces: Vec<String> = inner
+            .waiting
+            .keys()
+            .filter(|namespace| scope.includes(namespace))
+            .cloned()
+            .collect();
+        let candidates: Vec<String> = namespaces
+            .into_iter()
+            .filter(|namespace| inner.next_in(namespace, queues).is_some())
+            .collect();
         // Those coming back from idle catch up. (A worker of one namespace has no one to be fair to.)
         if *scope == Scope::All {
             let floor = candidates
-                .keys()
+                .iter()
                 .filter(|namespace| inner.backlogged.contains(*namespace))
                 .filter_map(|namespace| inner.pass.get(namespace))
                 .copied()
                 .min_by(f64::total_cmp);
             if let Some(floor) = floor {
-                for namespace in candidates.keys() {
+                for namespace in &candidates {
                     if !inner.backlogged.contains(namespace) {
                         let pass = inner.pass.entry(namespace.clone()).or_default();
                         *pass = pass.max(floor);
@@ -230,18 +287,21 @@ impl StepQueue {
         }
         let mut taken = Vec::new();
         while taken.len() < max {
-            let next = candidates
-                .iter()
-                .filter(|(_, waiting)| !waiting.is_empty())
-                .map(|(namespace, _)| {
-                    let pass = inner.pass.get(namespace).copied().unwrap_or(0.0);
-                    (namespace.clone(), pass)
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            let Some((namespace, pass)) = next else {
+            // The lowest pass with something to take, the first of equals.
+            let mut next: Option<(String, String, f64)> = None;
+            for namespace in &candidates {
+                let pass = inner.pass.get(namespace).copied().unwrap_or(0.0);
+                if next.as_ref().is_some_and(|(_, _, lowest)| pass >= *lowest) {
+                    continue;
+                }
+                if let Some((_, queue)) = inner.next_in(namespace, queues) {
+                    next = Some((namespace.clone(), queue, pass));
+                }
+            }
+            let Some((namespace, queue, pass)) = next else {
                 break;
             };
-            let Some(target) = candidates.get_mut(&namespace).and_then(VecDeque::pop_front) else {
+            let Some(target) = inner.pop(&namespace, &queue) else {
                 break;
             };
             let weight = self.weights.get(&namespace).copied().unwrap_or(1.0);
@@ -251,10 +311,12 @@ impl StepQueue {
             };
             entry.attempts += 1;
             let id = format!("{}#{}.{}", target.0, target.1, entry.attempts);
+            let until_ms = now_ms.saturating_add(self.lease_ms);
             entry.lease = Some(Lease {
                 worker: worker.to_owned(),
-                until_ms: now_ms.saturating_add(self.lease_ms),
+                until_ms,
             });
+            entry.ids.push(id.clone());
             taken.push(Invocation {
                 id: id.clone(),
                 run: target.0.clone(),
@@ -265,14 +327,13 @@ impl StepQueue {
                 attempt: entry.attempts,
                 lease_ms: self.lease_ms,
             });
-            inner.waiting.retain(|waiting| *waiting != target);
+            inner.leases.insert((until_ms, target.clone()));
             inner.issued.insert(id, target);
         }
         if *scope == Scope::All {
             inner.backlogged = candidates
                 .into_iter()
-                .filter(|(_, waiting)| !waiting.is_empty())
-                .map(|(namespace, _)| namespace)
+                .filter(|namespace| inner.next_in(namespace, queues).is_some())
                 .collect();
         }
         taken
@@ -328,9 +389,13 @@ impl StepQueue {
             return None;
         }
         let target = inner.issued.remove(id)?;
-        inner.entries.remove(&target)?;
-        inner.issued.retain(|_, t| *t != target);
-        inner.waiting.retain(|t| *t != target);
+        let entry = inner.entries.remove(&target)?;
+        for id in &entry.ids {
+            inner.issued.remove(id);
+        }
+        if let Some(lease) = &entry.lease {
+            inner.leases.remove(&(lease.until_ms, target.clone()));
+        }
         Some(target)
     }
 
@@ -339,13 +404,15 @@ impl StepQueue {
         let mut inner = self.lock();
         let mut released = Vec::new();
         for (target, entry) in &mut inner.entries {
-            if entry.lease.as_ref().is_some_and(|l| l.worker == worker) {
-                entry.lease = None;
-                released.push(target.clone());
+            if let Some(lease) = entry.lease.take_if(|lease| lease.worker == worker) {
+                released.push((lease.until_ms, target.clone()));
             }
         }
         let any = !released.is_empty();
-        inner.waiting.extend(released);
+        for (until, target) in released {
+            inner.leases.remove(&(until, target.clone()));
+            inner.enqueue(target);
+        }
         drop(inner);
         if any {
             self.ready.notify_all();
@@ -354,13 +421,22 @@ impl StepQueue {
 
     fn expire_locked(inner: &mut Inner, now_ms: u64) {
         let mut expired = Vec::new();
-        for (target, entry) in &mut inner.entries {
-            if entry.lease.as_ref().is_some_and(|l| l.until_ms <= now_ms) {
-                entry.lease = None;
-                expired.push(target.clone());
+        while let Some((until, _)) = inner.leases.first() {
+            if *until > now_ms {
+                break;
+            }
+            if let Some((_, target)) = inner.leases.pop_first() {
+                if let Some(entry) = inner.entries.get_mut(&target) {
+                    entry.lease = None;
+                }
+                expired.push(target);
             }
         }
-        inner.waiting.extend(expired);
+        // In a fixed order, whatever order the leases ran out in.
+        expired.sort();
+        for target in expired {
+            inner.enqueue(target);
+        }
     }
 
     /// Steps not yet answered: waiting or leased.

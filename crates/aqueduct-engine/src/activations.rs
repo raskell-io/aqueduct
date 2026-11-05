@@ -9,13 +9,13 @@
 //!
 //! Every method that depends on time takes the clock (`now_ms`), so the queue can be simulated.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use aqueduct_core::Env;
 
-use crate::namespaces::Scope;
+use crate::namespaces::{Scope, namespace_of};
 
 /// An activation for a worker: decide run `run` at the first `at` entries of its history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,15 +45,68 @@ struct Entry {
     offers: u64,
     /// The worker holding it, and until when.
     lease: Option<(String, u64)>,
+    /// Its place in the waiting list, while it has no lease. Another place in the list is out of date.
+    place: u64,
+    /// The activation ids handed out for the run.
+    ids: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
     /// The pending activation of each run.
     entries: BTreeMap<String, Entry>,
-    waiting: VecDeque<String>,
+    /// The order in which waiting activations are offered, by namespace and workflow. Places are in
+    /// offer order. A run leased or decided leaves its place behind, dropped when it is reached, so that
+    /// nothing here costs more as the backlog grows.
+    waiting: BTreeMap<(String, String), VecDeque<(u64, String)>>,
+    next_place: u64,
+    /// The runs under a lease, by when it runs out.
+    leases: BTreeSet<(u64, String)>,
     /// Activation ids handed out, to the run and history length they are for.
     issued: BTreeMap<String, (String, usize)>,
+}
+
+impl Inner {
+    /// Gives a run's activation a place at the end of the waiting list.
+    fn enqueue(&mut self, run: String) {
+        let place = self.next_place;
+        self.next_place += 1;
+        let Some(entry) = self.entries.get_mut(&run) else {
+            return;
+        };
+        entry.place = place;
+        let list = (namespace_of(&run).to_owned(), entry.workflow.clone());
+        self.waiting
+            .entry(list)
+            .or_default()
+            .push_back((place, run));
+    }
+
+    /// The first waiting activation for these workflows in scope, by offer order: its list.
+    fn next_in(&mut self, scope: &Scope, workflows: &[String]) -> Option<(String, String)> {
+        let mut next: Option<(u64, (String, String))> = None;
+        for (list, waiting) in &mut self.waiting {
+            if !scope.includes(&list.0) || !workflows.contains(&list.1) {
+                continue;
+            }
+            while let Some((place, run)) = waiting.front() {
+                let current = self
+                    .entries
+                    .get(run)
+                    .is_some_and(|entry| entry.lease.is_none() && entry.place == *place);
+                if current {
+                    break;
+                }
+                waiting.pop_front();
+            }
+            if let Some((place, _)) = waiting.front()
+                && next.as_ref().is_none_or(|(first, _)| place < first)
+            {
+                next = Some((*place, list.clone()));
+            }
+        }
+        next.map(|(_, list)| list)
+    }
 }
 
 /// Activations for remote workflow workers, with leases.
@@ -106,7 +159,18 @@ impl ActivationQueue {
                 return;
             }
         }
-        let offers = inner.entries.get(run).map_or(0, |e| e.offers);
+        let previous = inner.entries.remove(run);
+        let (offers, ids, waiting) = match previous {
+            Some(previous) => {
+                if let Some((_, until)) = &previous.lease {
+                    inner.leases.remove(&(*until, run.to_owned()));
+                }
+                // One already waiting keeps its place.
+                let waiting = previous.lease.is_none().then_some(previous.place);
+                (previous.offers, previous.ids, waiting)
+            }
+            None => (0, Vec::new(), None),
+        };
         inner.entries.insert(
             run.to_owned(),
             Entry {
@@ -116,9 +180,13 @@ impl ActivationQueue {
                 env,
                 offers,
                 lease: None,
+                place: waiting.unwrap_or(0),
+                ids,
             },
         );
-        inner.waiting.push_back(run.to_owned());
+        if waiting.is_none() {
+            inner.enqueue(run.to_owned());
+        }
         drop(inner);
         self.ready.notify_all();
     }
@@ -144,35 +212,39 @@ impl ActivationQueue {
         now_ms: u64,
     ) -> Vec<Activation> {
         let mut inner = self.lock();
-        // Leases that have run out are offered again.
+        // Leases that have run out are offered again, in a fixed order.
         let mut expired = Vec::new();
-        for (run, entry) in &mut inner.entries {
-            if entry
-                .lease
-                .as_ref()
-                .is_some_and(|(_, until)| *until <= now_ms)
-            {
-                entry.lease = None;
-                expired.push(run.clone());
+        while let Some((until, _)) = inner.leases.first() {
+            if *until > now_ms {
+                break;
+            }
+            if let Some((_, run)) = inner.leases.pop_first() {
+                if let Some(entry) = inner.entries.get_mut(&run) {
+                    entry.lease = None;
+                }
+                expired.push(run);
             }
         }
-        inner.waiting.extend(expired);
+        expired.sort();
+        for run in expired {
+            inner.enqueue(run);
+        }
         let mut taken = Vec::new();
-        let mut kept = VecDeque::new();
-        while let Some(run) = inner.waiting.pop_front() {
+        while taken.len() < max {
+            let Some(list) = inner.next_in(scope, workflows) else {
+                break;
+            };
+            let Some((_, run)) = inner.waiting.get_mut(&list).and_then(VecDeque::pop_front) else {
+                break;
+            };
             let Some(entry) = inner.entries.get_mut(&run) else {
                 continue;
             };
-            if entry.lease.is_some() {
-                continue;
-            }
-            if taken.len() >= max || !workflows.contains(&entry.workflow) || !scope.contains(&run) {
-                kept.push_back(run);
-                continue;
-            }
             entry.offers += 1;
-            entry.lease = Some((worker.to_owned(), now_ms.saturating_add(self.lease_ms)));
+            let until = now_ms.saturating_add(self.lease_ms);
+            entry.lease = Some((worker.to_owned(), until));
             let id = format!("{run}@{}.{}", entry.at, entry.offers);
+            entry.ids.push(id.clone());
             taken.push(Activation {
                 id: id.clone(),
                 run: run.clone(),
@@ -183,9 +255,9 @@ impl ActivationQueue {
                 lease_ms: self.lease_ms,
             });
             let at = entry.at;
+            inner.leases.insert((until, run.clone()));
             inner.issued.insert(id, (run, at));
         }
-        inner.waiting = kept;
         taken
     }
 
@@ -238,10 +310,15 @@ impl ActivationQueue {
             return None;
         }
         let (run, at) = inner.issued.remove(id)?;
-        if inner.entries.get(&run).is_some_and(|e| e.at == at) {
-            inner.entries.remove(&run);
-            inner.issued.retain(|_, (r, _)| *r != run);
-            inner.waiting.retain(|r| *r != run);
+        if inner.entries.get(&run).is_some_and(|e| e.at == at)
+            && let Some(entry) = inner.entries.remove(&run)
+        {
+            for id in &entry.ids {
+                inner.issued.remove(id);
+            }
+            if let Some((_, until)) = &entry.lease {
+                inner.leases.remove(&(*until, run.clone()));
+            }
         }
         Some((run, at))
     }
@@ -251,13 +328,15 @@ impl ActivationQueue {
         let mut inner = self.lock();
         let mut released = Vec::new();
         for (run, entry) in &mut inner.entries {
-            if entry.lease.as_ref().is_some_and(|(w, _)| w == worker) {
-                entry.lease = None;
-                released.push(run.clone());
+            if let Some((_, until)) = entry.lease.take_if(|(holder, _)| holder == worker) {
+                released.push((until, run.clone()));
             }
         }
         let any = !released.is_empty();
-        inner.waiting.extend(released);
+        for (until, run) in released {
+            inner.leases.remove(&(until, run.clone()));
+            inner.enqueue(run);
+        }
         drop(inner);
         if any {
             self.ready.notify_all();
