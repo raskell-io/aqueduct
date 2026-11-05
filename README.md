@@ -6,16 +6,19 @@
 </h1>
 
 <p align="center">
-  <strong>A deterministic engine for procedures that agents write and people approve.</strong><br>
-  It starts as a library inside your binary, grows into a replicated cluster without changing your code,
-  and every run leaves a history you can replay and audit.
+  <strong>A durable execution engine for procedures that agents write and people approve.</strong><br>
+  It runs inside your program as a library, or as a server that workers in any language connect to.
+  Every run leaves a history you can replay and audit.
 </p>
 
-> **Status: phase 1.** An embedded engine you can try, not yet one to depend on: APIs and the history
-> format will still change. It runs [Starlark procedures](docs/adr/0008-procedure-language-starlark.md)
-> and [Rust workflows](docs/adr/0014-rust-sdk.md) with durable timers, exactly-once signals, journaled
-> retries and checkpoints, survives `kill -9`, and is tested by a deterministic simulator on every change.
-> See the [build brief](BRIEF.md), the [decision records](docs/adr/) and the [FAQ](docs/faq.md).
+> **Status: single server, nearly complete (phase 3 of the [build brief](BRIEF.md)).** The embedded engine,
+> procedures, agent steps and the version registry are built. So is a server with workers in Rust, Python and
+> TypeScript, tokens, TLS, an audit log, namespaces and overload protection. Deployments across workers and
+> per-run priorities are the two items left in this phase. A replicated cluster is planned and not started.
+>
+> You can try it, but do not depend on it yet: the APIs and the history format will still change, and nothing
+> is published on crates.io. See [what is not done](#what-is-not-done), the [docs](docs/README.md) and the
+> [FAQ](docs/faq.md).
 
 ## The idea
 
@@ -34,7 +37,20 @@ record anyone can check afterwards. Aqueduct is built for the hand-over between 
 Engineers who need full expressive power write **code workflows** in Rust instead; both share one engine,
 one journal format and one set of guarantees.
 
-## Quick start
+## Where it runs
+
+| mode | what runs | who it suits | state |
+|---|---|---|---|
+| **Embedded** | the engine, inside your program (`aqueduct` crate) | CLIs, desktop apps, single binary services, tests | built |
+| **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built, two items left |
+| **Cluster** | several servers, replicated | production platforms | planned |
+
+An embedded directory and a server's are the same format, and
+`aqueduct migrate --from ./data --to https://server` moves one to a running server
+([ADR 0047](docs/adr/0047-migrate.md)). It does not need a server to start with:
+[it is closer to SQLite than to Tokio](docs/faq.md#can-i-use-aqueduct-as-a-library-like-tokio).
+
+## Quick start: a library
 
 Aqueduct is not on crates.io yet; depend on the repository (and on `serde_json`, which the example uses
 to read and write step payloads):
@@ -77,6 +93,9 @@ again: the run continues where it stopped, and the sleep ends at its original ti
 cargo run    # in a clone of this repository: cargo run -p aqueduct --example quickstart
 ```
 
+The `aqueduct` command, used below, inspects and manages a data directory:
+`cargo install --git https://github.com/raskell-io/aqueduct aqueduct-cli`.
+
 Waiting for people works the same way. [`approval.rs`](crates/aqueduct/examples/approval.rs) asks for
 approval through an **awakeable**, an id that anyone outside the engine can complete, and gives up after
 a day with `select` ([ADR 0016](docs/adr/0016-select-and-awakeables.md)):
@@ -115,6 +134,8 @@ match shipped {
 directory) makes whatever it is waiting for fail with `WorkflowError::Cancelled`, so the same saga undoes
 the work and the run fails with the reason ([ADR 0018](docs/adr/0018-cancellation.md)).
 
+## Procedures
+
 The same engine runs **procedures**: hermetic Starlark scripts that an agent can write and a person can
 review ([ADR 0008](docs/adr/0008-procedure-language-starlark.md)):
 
@@ -138,6 +159,8 @@ with `engine.escalations()` or `aqueduct escalations`, and resolve them with `re
 reference pipeline with all of it: concurrent steps, a review through an awakeable with a deadline, and
 an escalation when nobody reviews in time.
 
+## From agents to procedures
+
 Two examples show the path from agents to procedures, with a stand-in model so they need no API key:
 
 - [`crystallise.rs`](crates/aqueduct/examples/crystallise.rs): an agent triages claims; then, through
@@ -148,164 +171,169 @@ Two examples show the path from agents to procedures, with a stand-in model so t
   and an output schema; a run whose budget is too small escalates for more, an answer that does not
   match the schema goes to a person, and a restart makes no model call again.
 
-## Guarantees
+A version moves through a lifecycle before it runs: registered with its provenance, proposed, proven by replay
+against past runs, approved under a policy (four eyes by default, and signed with an Ed25519 key if the policy says
+so), activated, drained and retired, in a hash-chained log (`aqueduct versions ...`;
+[ADR 0030](docs/adr/0030-version-registry.md), [ADR 0033](docs/adr/0033-signed-approvals.md)). Agents take part
+through `aqueduct mcp <dir> --as <agent>`, which serves the Model Context Protocol: they validate, replay and propose
+versions, start and inspect runs, and resolve escalations. Approval stays with people
+([ADR 0032](docs/adr/0032-mcp-server.md)).
 
-What holds today, for the embedded engine, and how it is checked:
+## Quick start: a server
 
-- **Acknowledged work is never lost.** A start, a signal or a step result is acknowledged only after it is
-  durable. Checked by the simulator (crashes, torn writes, failed fsyncs) and by killing the engine with
-  `kill -9` at random moments, including during its first start.
-- **A step's result is recorded exactly once**, although a step may run more than once (at least once
-  execution), so steps with side effects should be idempotent.
-- **Starts are idempotent per key:** a retried start returns the same run; starting a used key with
-  another workflow or input is refused ([ADR 0019](docs/adr/0019-run-key-reuse.md)). A run can
-  **continue as new** (`return Err(ctx.continue_as_new(&next))`) to keep long-lived processes' journals
-  short, and a key can be reused after its run ended; each run is a generation of its key
-  ([ADR 0022](docs/adr/0022-generations-and-continue-as-new.md)).
-- **Determinism:** procedures are deterministic by construction; Rust workflows are checked by replay, and
-  a run whose code changed under it is parked, never silently corrupted. The time, random numbers and
-  UUIDs come from the context (`ctx.now()`, `ctx.random()`, `ctx.uuid()`): recorded the first time,
-  read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)).
-- **Version pinning:** every run is pinned to the version it started on (a procedure's version is the
-  SHA-256 of its source). New runs start on the active version, and old runs finish on theirs
-  ([ADR 0029](docs/adr/0029-version-pinning.md)).
-- **A version lifecycle:** procedure versions are registered with their provenance, proven by replay
-  against past runs, approved under a policy (four eyes by default), activated, drained and retired, in
-  a hash-chained registry log (`aqueduct versions ...`; [ADR 0030](docs/adr/0030-version-registry.md)).
-- **Signed approvals:** an approval can be signed with the approver's Ed25519 key over the version's
-  source hash and the replay report approved, checked against who holds which keys; a policy can require
-  it, and deployment checks it again ([ADR 0033](docs/adr/0033-signed-approvals.md)).
-- **Per-version metrics:** runs, escalation and timeout rates, cost and replay divergence for every
-  version (`aqueduct metrics`), and the version on every live run metric
-  ([ADR 0031](docs/adr/0031-per-version-metrics.md)).
-- **For agents:** `aqueduct mcp <dir> --as <agent>` serves the Model Context Protocol, so agents
-  validate, replay and propose procedure versions, start and inspect runs, and resolve escalations.
-  Approval stays with people ([ADR 0032](docs/adr/0032-mcp-server.md)).
-- **Counterfactual replay:** a new procedure version is replayed against past runs, answered with their
-  recorded results, and the runs it would decide differently are reported with where they diverge
-  ([ADR 0028](docs/adr/0028-counterfactual-replay.md)).
-- **Child runs:** procedures and code workflows call each other (`call("payment", input)` in a
-  procedure, `ctx.child("payment", &input)` in Rust) as durable child runs; cancelling a parent cancels
-  its children ([ADR 0034](docs/adr/0034-child-runs.md)).
-- **Changing code under running runs:** `if ctx.patched("add-review") { ... }` (or `patched(...)` in a
-  procedure) keeps runs that already passed that point on the old code and sends every other run down
-  the new one; `aqueduct_engine::replay::check` replays a corpus of journals against new code to prove
-  it ([ADR 0035](docs/adr/0035-patched.md)).
-- **Virtual objects:** keyed, durable state whose handlers run one at a time per key
-  (`Builder::object_handler`, `Engine::call_object`); a handler's state changes commit atomically with
-  its completion, and a failed handler commits nothing
-  ([ADR 0043](docs/adr/0043-virtual-objects.md)). A handler's messages to other objects commit with its
-  writes and arrive exactly once, so no hand-written outbox tables
-  ([ADR 0044](docs/adr/0044-outboxes.md)).
-- **Queries and updates:** a run publishes state (`publish("address", address)`, `ctx.publish(...)`)
-  that queries read without journaling anything (`aqueduct query`, `Engine::query`); an update is a
-  request whose sender waits for the run's answer (`wait(update("change"))`, then `respond` or
-  `reject`; `Engine::update`, `aqueduct update`), journaled, deduplicated by id, and validated: an
-  update rejected on receipt leaves no trace ([ADR 0036](docs/adr/0036-queries-and-updates.md)).
-- **Timers never fire early**, and keep their wake time across restarts. **Signals are recorded exactly
-  once per signal id.** **Retries** follow a policy with journaled backoff.
-- **Agent steps:** a model call is a step whose answer, model identity and token cost are journaled, so
-  replay never calls the model again, under a hard token budget
-  ([ADR 0023](docs/adr/0023-agent-steps.md)). A run can have a budget of its own, and escalates to a
-  person instead of overspending it ([ADR 0024](docs/adr/0024-run-budgets.md)); answers are checked
-  against their output schema ([ADR 0025](docs/adr/0025-output-schemas.md)) When a model or prompt changes,
-  model-drift replay asks past runs' calls again and reports which answers changed
-  ([ADR 0027](docs/adr/0027-model-drift-replay.md)). `aqueduct-ai` runs them on Claude or any OpenAI-compatible
-  endpoint, Ollama and vLLM included ([ADR 0026](docs/adr/0026-provider-adapters.md)).
-- **Observable:** `aqueduct-otel` turns runs into OpenTelemetry traces (one trace per run, across
-  restarts) and metrics ([ADR 0021](docs/adr/0021-opentelemetry.md)); the CLI shows any run's journal
-  without setup.
-- **Histories are tamper-evident** (a SHA-256 chain per run), exportable, and specified independently of the
-  code ([history format](docs/history-format.md)).
+A procedure has to be approved before a server will run it. `greet.star`:
 
-**A server (phase 3, in progress):** `aqueduct server <dir>` serves a data directory's approved
-procedures over gRPC and HTTP/JSON on `127.0.0.1:7470` ([protocol v1, draft](docs/protocol.md);
-[ADR 0038](docs/adr/0038-server-and-protocol.md)):
+```python
+def run(name):
+    return step("greet", name)
+```
 
 ```sh
-aqueduct server ./data &
-curl -s localhost:7470/v1/runs -d '{"key": "claim-7", "workflow": "claims", "input": {"amount": 400}}'
-curl -s 'localhost:7470/v1/runs/claim-7/result?timeout_ms=10000'
+aqueduct check greet.star
+aqueduct versions register ./data greet greet.star --by ada     # prints the version id; a prefix of it will do
+aqueduct versions propose  ./data greet <version> --by ada
+aqueduct versions prove    ./data greet <version> --by ada      # replays past runs: this one has none
+aqueduct versions approve  ./data greet <version> --by grace    # four eyes: not the author
+aqueduct versions activate ./data greet <version> --by grace
+aqueduct server ./data                                          # 127.0.0.1:7470, gRPC and HTTP/JSON
 ```
 
-**Tokens** turn authentication on: `aqueduct tokens create ./data --name billing-worker --permissions
-work` prints a secret once and stores only its hash; every route then needs its permission, and a
-hash-chained audit log records who did what, and every refused request (`aqueduct audit ./data`;
-[ADR 0041](docs/adr/0041-authentication.md)). With `--tls-cert` and `--tls-key` it serves over TLS; it
-listens beyond loopback only with tokens and a certificate
-([ADR 0042](docs/adr/0042-server-tls.md)). Under load it refuses work with a retry hint rather than
-queueing it without bound, and a flood of refused requests cannot grow the audit log
-([ADR 0045](docs/adr/0045-overload-protection.md)). **Namespaces** keep tenants of one server apart:
-`aqueduct tokens create ./data --name acme --namespace acme --permissions start,read` binds a token to a
-namespace, whose keys, runs, objects and steps no other tenant can see or reach, with its own rate, cap on
-running runs, and share of a shared worker pool
-([ADR 0046](docs/adr/0046-namespaces.md)). `aqueduct migrate --from ./data --to https://server` moves an
-embedded directory's runs, histories, versions and object state to a server, verified, without a run ever going on
-in two places, and applies them when the server next starts
-([ADR 0047](docs/adr/0047-migrate.md)). A procedure's steps run
-on **step workers**: processes in any language that connect to the server, say which steps they
-implement, and run what they are sent, over a gRPC stream or HTTP long polling. A worker holds each
-step under a lease; if it crashes or its result is lost, the step goes to another worker, and the run
-records its result once. In Rust, [`aqueduct-worker`](crates/aqueduct-worker/src/lib.rs):
+Steps run on **workers**: processes in any language that say which steps they implement and run what they are
+sent. In Python, with [`sdks/python`](sdks/python/README.md) from this repository on `PYTHONPATH`:
 
-```rust
-Worker::new("billing")
-    .step("charge", |invocation| Outcome::Completed(charge(&invocation.input)))
-    .run("http://127.0.0.1:7470")
-    .await?;
+```python
+from aqueduct_worker import Worker
+
+worker = Worker("greeter", url="http://127.0.0.1:7470")
+
+@worker.step("greet")
+def greet(name, invocation):
+    return f"hello {name}"
+
+worker.run()
 ```
 
-Code workflows can run in a worker too: register the workflow as remote on the server
-(`.remote_workflow("order")`) and serve its logic with `Worker::workflow("order", Arc::new(workflow(order)))`.
-The server sends each activation the run's verified history and records the commands the workflow
-issues ([ADR 0039](docs/adr/0039-workflow-workers.md)).
+```sh
+curl -s localhost:7470/v1/runs -d '{"key": "greet-1", "workflow": "greet", "input": "Ada"}'
+curl -s 'localhost:7470/v1/runs/greet-1/result?timeout_ms=10000'
+# {"error":"","output":"hello Ada","status":"completed","version":"c98c962e..."}
+```
 
-For serverless platforms, a queue's steps can be **pushed** instead: the server posts each invocation
-to an HTTP endpoint and records the answer (`aqueduct server --config server.json`, with
-`{"queues": {"billing": ["charge"]}, "push": [{"queue": "billing", "url": "https://..."}]}`;
-[ADR 0040](docs/adr/0040-task-queues-and-push.md)).
+A worker holds each step under a lease. If it crashes or its result is lost, the step goes to another worker, and the
+run records one result.
 
-Step-worker libraries for [Python](sdks/python/README.md) (3.9+, standard library only) and
-[TypeScript](sdks/typescript/README.md) (Node 22.18+, no dependencies) do the same over HTTP. Every
-worker library passes the [conformance suite](conformance/README.md) (`mise run conformance`), polling
-and as a push endpoint (`worker.handle_push(body)` / `worker.handlePush(body)` in a function, or
-`serve_push(port)` / `servePush(port)`).
+### What the server has
 
-Planned: the same semantics in a replicated cluster. The full design and phased plan are in [BRIEF.md](BRIEF.md).
+| | | |
+|---|---|---|
+| **Protocol** | gRPC and HTTP/JSON, draft | [protocol](docs/protocol.md), [ADR 0038](docs/adr/0038-server-and-protocol.md) |
+| **Step workers** | [Rust](crates/aqueduct-worker/src/lib.rs), [Python](sdks/python/README.md) (standard library only), [TypeScript](sdks/typescript/README.md) (no dependencies), all held to a [conformance suite](conformance/README.md) | [ADR 0038](docs/adr/0038-server-and-protocol.md) |
+| **Workflow workers** | Rust workflows' logic in another process; the server sends each activation the run's verified history | [ADR 0039](docs/adr/0039-workflow-workers.md) |
+| **Task queues, push endpoints** | steps grouped into named queues, or posted to an HTTP endpoint for serverless platforms | [ADR 0040](docs/adr/0040-task-queues-and-push.md) |
+| **Tokens, audit log** | `aqueduct tokens create`; each route needs a permission; a hash-chained log of who did what, and of every refusal | [ADR 0041](docs/adr/0041-authentication.md) |
+| **TLS** | `--tls-cert`, `--tls-key`; beyond loopback it needs tokens and a certificate | [ADR 0042](docs/adr/0042-server-tls.md) |
+| **Overload protection** | rate limits, shedding, connection deadlines, a cap on running runs; refusals carry a retry hint | [ADR 0045](docs/adr/0045-overload-protection.md) |
+| **Namespaces** | a token bound to a namespace reaches only its keys, runs, objects and steps, with its own quotas and share of a shared worker pool | [ADR 0046](docs/adr/0046-namespaces.md) |
+| **Migration** | an embedded directory's runs, histories, versions and object state move to a server | [ADR 0047](docs/adr/0047-migrate.md) |
+
+### How fast
+
+On an Apple M4 with `F_FULLFSYNC` on every commit, on a machine that was not idle, with clients on the same machine
+and steps that do nothing ([measurements](docs/measurements/2026-11-05-server-m4.md), which say how far to trust them):
+
+| | |
+|---|---|
+| run starts per second over gRPC, 256 clients, no tokens | 12,500 to 16,700 (target: 10,000) |
+| the same, with tokens and the audit log | 8,300 to 9,400 (**below the target**) |
+| the same, one client | about 200, or 120 with tokens: each waits for one flush, or two |
+| start to first step at a worker, p50, one client | about 4.5 ms |
+
+The embedded engine's numbers are in [its own measurements](docs/measurements/2026-10-31-engine-m4.md). Linux and TLS
+are not measured.
+
+## Guarantees
+
+What holds today, and what checks it. The simulator runs 16,000 seeds on every change; the crash harness sends real
+`kill -9`s to the log and to the embedded engine.
+
+| guarantee | checked by |
+|---|---|
+| **Acknowledged work is never lost.** A start, signal or step result is acknowledged only once durable. | simulator (crashes, torn writes, failed fsyncs); crash harness, including during first start |
+| **A step's result is recorded exactly once,** though a step may run more than once, so steps with side effects should be idempotent. | simulator; conformance suite for workers |
+| **Starts are idempotent per key.** A retried start returns the same run; a used key with another workflow or input is refused ([ADR 0019](docs/adr/0019-run-key-reuse.md)). | simulator, crash harness |
+| **Determinism.** Procedures are deterministic by construction. Rust workflows are checked by replay, and a run whose code changed under it is parked, never silently corrupted. | 1,000+ seeds per workload; replay tests |
+| **Timers never fire early,** and keep their wake time across restarts. | simulator (`timers` workload) |
+| **Signals are recorded once per signal id.** | simulator, tests |
+| **Runs are pinned to their version.** New runs start on the active version, and old runs finish on theirs ([ADR 0029](docs/adr/0029-version-pinning.md)). | tests |
+| **Histories are tamper-evident:** a SHA-256 chain per run, specified independently of the code ([history format](docs/history-format.md)). | property tests; every load verifies |
+| **A recorded model call is never made again.** Replay reads the answer, model and cost from the journal ([ADR 0023](docs/adr/0023-agent-steps.md)). | simulator, tests |
+| **An audit line is synced before its request is answered,** and a changed line breaks the chain ([ADR 0041](docs/adr/0041-authentication.md)). | tests |
+
+The simulator's workloads do not yet cover updates, child runs or objects, and the crash harness runs against the
+embedded engine, not the server. Those have tests of their own, which are narrower.
+
+## What the engine does
+
+| | |
+|---|---|
+| **Durable waits** | timers, signals, awakeables with `select`, escalations to a person ([ADR 0016](docs/adr/0016-select-and-awakeables.md), [ADR 0020](docs/adr/0020-escalations.md)) |
+| **Long-lived runs** | continue-as-new, and keys reused as generations ([ADR 0022](docs/adr/0022-generations-and-continue-as-new.md)) |
+| **Recorded values** | `ctx.now()`, `ctx.random()`, `ctx.uuid()`: recorded once, read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)) |
+| **Child runs** | `call("payment", input)`, `ctx.child("payment", &input)`; cancelling a parent cancels its children ([ADR 0034](docs/adr/0034-child-runs.md)) |
+| **Virtual objects** | keyed state, handlers run one at a time per key, state changes commit with completion ([ADR 0043](docs/adr/0043-virtual-objects.md)); messages between objects commit with the writes and arrive once ([ADR 0044](docs/adr/0044-outboxes.md)) |
+| **Queries and updates** | read a run's published state without journaling; a request whose sender waits for the run's answer ([ADR 0036](docs/adr/0036-queries-and-updates.md)) |
+| **Changing code under running runs** | `ctx.patched("add-review")` keeps runs that passed that point on the old code ([ADR 0035](docs/adr/0035-patched.md)) |
+| **Agent steps** | a hard token budget per call and per run, output schemas, escalation instead of overspending ([ADR 0023](docs/adr/0023-agent-steps.md), [ADR 0024](docs/adr/0024-run-budgets.md), [ADR 0025](docs/adr/0025-output-schemas.md)); Claude or any OpenAI-compatible endpoint ([ADR 0026](docs/adr/0026-provider-adapters.md)) |
+| **Replay against the past** | counterfactual replay of a new version over past runs ([ADR 0028](docs/adr/0028-counterfactual-replay.md)); model-drift replay when a model changes ([ADR 0027](docs/adr/0027-model-drift-replay.md)) |
+| **Observability** | OpenTelemetry traces and metrics ([ADR 0021](docs/adr/0021-opentelemetry.md)); per-version runs, escalations, timeouts, cost and replay (`aqueduct metrics`; [ADR 0031](docs/adr/0031-per-version-metrics.md)) |
+
+## What is not done
+
+- **Deployments across workers, and per-run priorities:** the rest of phase 3.
+- **A cluster:** no replication. A single server does not survive losing its disk.
+- **Stable formats:** the protocol and the history format are drafts until phase 5.
+- **Packages:** nothing on crates.io, PyPI or npm. Depend on the repository.
+- **Identity beyond static tokens:** no OIDC or JWT, and no mutual TLS.
+- **Version management over the network:** `aqueduct versions` works on the server's data directory, and a change
+  takes effect when the server next starts.
+- **Isolation of code and disk between tenants:** namespaces separate runs and data, not workflow definitions, and
+  they share one partition ([ADR 0046](docs/adr/0046-namespaces.md)).
+- **Workflow workers** have no HTTP long polling or push, and do not answer queries.
+- **Measurements:** none on Linux for the server, with TLS, with real payloads, or with long runs.
 
 ## Testing it yourself
 
 ```sh
+mise run ci                                      # everything CI checks, one after the other
 cargo xtask sim --seeds 10000                    # deterministic simulation: crashes, torn writes, fsync failures, lossy networks
 cargo xtask sim --seeds 2000 --workload timers   # workloads: native, starlark, timers, rust
 cargo xtask sim --seed 42 --workload rust        # reproduce one seed exactly
 cargo xtask crash --kills 1000                   # SIGKILL a log writer; no acknowledged record may be lost
 cargo xtask crash-engine --kills 200             # SIGKILL the engine mid-run; every acknowledged run must end correctly
 cargo xtask crash-engine --startup --kills 300   # SIGKILL brand-new engines while they create their files
+mise run conformance                             # worker libraries: Rust, Python and TypeScript, polling and push
+mise run bench:server                            # the server under load
 cargo xtask fsync                                # fsync latency and group commit throughput on this machine
 ```
 
 ## Inspecting a data directory
 
-With the engine stopped, the `aqueduct` command line reads its data directory:
+With the engine or server stopped (`aqueduct help` lists everything):
 
 ```sh
-cargo run -p aqueduct-cli -- runs ./quickstart-data                   # every run: workflow, status, journal length
-cargo run -p aqueduct-cli -- describe ./quickstart-data onboard:ada   # status, input, output, each command and its attempts
-cargo run -p aqueduct-cli -- journal ./quickstart-data onboard:ada    # the journal, entry by entry
-cargo run -p aqueduct-cli -- verify ./quickstart-data                 # check every hash chain, print each run's head
-cargo run -p aqueduct-cli -- export ./quickstart-data onboard:ada     # the journal as JSON Lines
-cargo run -p aqueduct-cli -- replay ./data claim-7 claims-v2.star     # would this procedure version diverge from the run?
-cargo run -p aqueduct-cli -- counterfactual ./data claims-v3.star --workflow claims
-                                                                      # how would a new version have decided past runs?
-cargo run -p aqueduct-cli -- metrics ./data claims                     # per version: runs, escalations, timeouts, cost, replay
-cargo run -p aqueduct-cli -- versions list ./data                      # procedure versions: state, approvals, replay, runs on them
-cargo run -p aqueduct-cli -- keys generate grace.key --name grace      # a signing key; its public key goes into registry/identities.json
-cargo run -p aqueduct-cli -- versions approve ./data claims 3f2a --by grace --key grace.key
-                                                                      # a signed approval
-cargo run -p aqueduct-cli -- mcp ./data --as agent/claims-explorer      # MCP on stdio, for an agent (claude mcp add aqueduct -- aqueduct mcp ...)
-cargo run -p aqueduct-cli -- drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
-                                                                      # ask past agent calls again: same answers?
+aqueduct runs ./data                              # every run: workflow, status, journal length
+aqueduct describe ./data greet-1                  # status, input, output, each command and its attempts
+aqueduct journal ./data greet-1                   # the journal, entry by entry
+aqueduct verify ./data                            # check every hash chain, print each run's head
+aqueduct export ./data greet-1                    # the journal as JSON Lines
+aqueduct replay ./data greet-1 greet-v2.star      # would this version diverge from the run?
+aqueduct counterfactual ./data greet-v3.star --workflow greet
+                                                  # how would a new version have decided past runs?
+aqueduct metrics ./data greet                     # per version: runs, escalations, timeouts, cost, replay
+aqueduct versions list ./data                     # versions: state, approvals, replay, runs on them
+aqueduct audit ./data                             # verify the audit log and print it
+aqueduct drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
+                                                  # ask past agent calls again: same answers?
 ```
 
 ## The name and the mark
