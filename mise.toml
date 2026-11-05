@@ -126,6 +126,10 @@ cargo xtask crash-engine --startup --kills 200
 description = "End-to-end engine benchmark against ADR 0003's targets (results: docs/measurements/)"
 run = "cargo run --release -p aqueduct-bench-engine"
 
+[tasks."bench:server"]
+description = "End-to-end single-server benchmark: starts, tokens and audit, limits, workers (results: docs/measurements/)"
+run = "cargo run --release -p aqueduct-bench-server"
+
 [tasks."bench:storage"]
 description = "Storage benchmark: plain log, redb and fjall (ADR 0009)"
 run = "cargo run --release -p aqueduct-bench-storage"
