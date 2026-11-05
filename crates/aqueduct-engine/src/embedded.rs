@@ -194,6 +194,9 @@ pub enum EngineError {
     /// decided remotely).
     #[error("{0}")]
     Unsupported(String),
+    /// The engine is running as many runs as it was told to; try again later.
+    #[error("{0}")]
+    Overloaded(String),
     /// An object's handler failed; it committed nothing.
     #[error("handler failed: {0}")]
     HandlerFailed(String),
@@ -239,6 +242,7 @@ pub struct Builder {
     remote_workflows: Option<Duration>,
     /// Remote steps routed to named task queues, by step name.
     routes: BTreeMap<String, String>,
+    max_running: Option<usize>,
 }
 
 impl Builder {
@@ -275,6 +279,14 @@ impl Builder {
             crate::objects::loop_workflow(object),
             Arc::new(crate::objects::ObjectLoop::new(object)),
         );
+        self
+    }
+
+    /// Refuses starts of new keys and new object calls with [`EngineError::Overloaded`] while this many
+    /// runs are running. Retried starts are not refused, nor what runs already do (child runs,
+    /// continue-as-new, messages). An object key's own loop does not count; its calls do.
+    pub fn max_running_runs(mut self, limit: usize) -> Self {
+        self.max_running = Some(limit);
         self
     }
 
@@ -490,6 +502,8 @@ impl Builder {
             deferred: Vec::new(),
             remote: queue.clone().map(|queue| (queue, local)),
             activations: activation_queue.clone(),
+            max_running: self.max_running,
+            running: 0,
         };
         let redispatch = self.redispatch;
         let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
@@ -586,6 +600,7 @@ impl Engine {
             remote: None,
             remote_workflows: None,
             routes: BTreeMap::new(),
+            max_running: None,
         }
     }
 
@@ -996,6 +1011,10 @@ struct Processor {
     )>,
     /// With remote workflows: their activations.
     activations: Option<Arc<crate::activations::ActivationQueue>>,
+    /// The cap on running runs, and how many there are: counted after each flush, and kept up by the
+    /// starts admitted since.
+    max_running: Option<usize>,
+    running: usize,
 }
 
 /// Where the answer to an update or a query goes.
@@ -1063,25 +1082,31 @@ impl Processor {
                 input,
                 options,
                 reply,
-            } => match self.partition.start_with(&key, &workflow, input, options) {
-                Ok(()) => self.starts.entry(key).or_default().push(reply),
-                Err(PartitionError::UnknownWorkflow(name)) => {
-                    let _ = reply.send(Err(EngineError::UnknownWorkflow(name)));
+            } => {
+                if self.overloaded(&key)? {
+                    let _ = reply.send(Err(overloaded()));
+                    return Ok(true);
                 }
-                Err(PartitionError::UnknownVersion { workflow, version }) => {
-                    let _ = reply.send(Err(EngineError::UnknownVersion { workflow, version }));
+                match self.partition.start_with(&key, &workflow, input, options) {
+                    Ok(()) => self.starts.entry(key).or_default().push(reply),
+                    Err(PartitionError::UnknownWorkflow(name)) => {
+                        let _ = reply.send(Err(EngineError::UnknownWorkflow(name)));
+                    }
+                    Err(PartitionError::UnknownVersion { workflow, version }) => {
+                        let _ = reply.send(Err(EngineError::UnknownVersion { workflow, version }));
+                    }
+                    Err(PartitionError::KeyConflict(key)) => {
+                        let _ = reply.send(Err(EngineError::KeyConflict(key)));
+                    }
+                    Err(PartitionError::AlreadyStarted(key)) => {
+                        let _ = reply.send(Err(EngineError::AlreadyStarted(key)));
+                    }
+                    Err(PartitionError::InvalidKey(key)) => {
+                        let _ = reply.send(Err(EngineError::InvalidKey(key)));
+                    }
+                    Err(error) => return Err(error.to_string()),
                 }
-                Err(PartitionError::KeyConflict(key)) => {
-                    let _ = reply.send(Err(EngineError::KeyConflict(key)));
-                }
-                Err(PartitionError::AlreadyStarted(key)) => {
-                    let _ = reply.send(Err(EngineError::AlreadyStarted(key)));
-                }
-                Err(PartitionError::InvalidKey(key)) => {
-                    let _ = reply.send(Err(EngineError::InvalidKey(key)));
-                }
-                Err(error) => return Err(error.to_string()),
-            },
+            }
             Request::Wait { key, reply } => {
                 // The key's latest run; one that continues as new is followed to its successor.
                 let Some(id) = self.partition.latest(&key).map_err(|e| e.to_string())? else {
@@ -1190,6 +1215,17 @@ impl Processor {
                     Err(error) => return Err(error.to_string()),
                 };
                 self.answers.push((reply, answer));
+            }
+            Request::CallObject {
+                object,
+                key,
+                handler,
+                id,
+                args,
+                reply,
+            } if self.overloaded(&crate::objects::call_key(&object, &key, &id))? => {
+                let _ = (object, key, handler, id, args);
+                let _ = reply.send(Err(overloaded()));
             }
             Request::CallObject {
                 object,
@@ -1309,9 +1345,40 @@ impl Processor {
             .flush()
             .map_err(|e| format!("storage failed: {e}"))?;
         self.deliver(outbound);
+        if self.max_running.is_some() {
+            self.running = self
+                .partition
+                .runs()
+                .iter()
+                .filter(|(key, run)| {
+                    !run.state().status().is_terminal() && !key.starts_with("$object/")
+                })
+                .count();
+        }
         self.answer_waiters();
         self.answer_updates().map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Whether a request that would create a run under `key` must be refused: the cap is reached and the
+    /// key has no run. Otherwise, it is counted.
+    fn overloaded(&mut self, key: &str) -> Result<bool, String> {
+        let Some(limit) = self.max_running else {
+            return Ok(false);
+        };
+        if self
+            .partition
+            .latest(key)
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        if self.running >= limit {
+            return Ok(true);
+        }
+        self.running += 1;
+        Ok(false)
     }
 
     /// The attempt a dispatch of `cmd` is: the run's recorded failed attempts of it, plus one.
@@ -1496,6 +1563,10 @@ impl Processor {
             }
         }
     }
+}
+
+fn overloaded() -> EngineError {
+    EngineError::Overloaded("the engine is at its limit of running runs; try again later".into())
 }
 
 /// The answer to the update received by the wait `cmd`, once there is one: the logic's response, or a

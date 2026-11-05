@@ -13,6 +13,7 @@ use http_body_util::{BodyExt, Full};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::Limits;
 use crate::workers::record;
 
 /// The server's configuration of remote steps: named task queues, and push endpoints.
@@ -24,7 +25,7 @@ use crate::workers::record;
 ///             "timeout_ms": 30000, "headers": {"authorization": "Bearer ..."}}]
 /// }
 /// ```
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Named task queues and the steps routed to each. A step in no queue waits in the queue of its
@@ -41,6 +42,9 @@ pub struct Config {
     /// Workflows that workflow workers run (ADR 0039).
     #[serde(default)]
     pub remote_workflows: Vec<String>,
+    /// What the server accepts under load (ADR 0045).
+    #[serde(default)]
+    pub limits: Limits,
 }
 
 /// An HTTP endpoint a queue's steps are pushed to.
@@ -84,6 +88,7 @@ impl Config {
     /// Checks that no step is in two queues, and that every push endpoint has a usable URL.
     pub fn check(&self) -> Result<(), String> {
         self.routes()?;
+        self.limits.check()?;
         for endpoint in &self.push {
             if !(endpoint.url.starts_with("http://") || endpoint.url.starts_with("https://")) {
                 return Err(format!(
@@ -126,6 +131,9 @@ impl Config {
         }
         for object in &self.objects {
             builder = builder.object(object);
+        }
+        if let Some(limit) = self.limits.max_running_runs {
+            builder = builder.max_running_runs(limit);
         }
         Ok(builder)
     }

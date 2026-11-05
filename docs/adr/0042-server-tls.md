@@ -34,8 +34,6 @@ This also corrects the audit log: a refused request now names who was refused (t
 - **Replacing a certificate needs a restart.** It is read when the server starts.
 - **Push endpoints are as safe as their URLs:** an `http://` endpoint receives its headers and payloads
   in the clear. The configuration does not refuse one.
-- **Known limit: refused requests are not rate-limited.** Anyone who can reach the server can send
-  unauthenticated requests, and each one writes and syncs an audit line, so a flood grows the log and
-  slows the server. Connections are not limited either. The limits work later in phase 3 should cover
-  this; until then, put a network limit in front of a server exposed to untrusted clients.
+- **Known limit, since closed by ADR 0045: refused requests were not rate-limited.** Each one wrote and
+  synced an audit line, so a flood grew the log and slowed the server, and connections were not limited.
 - **mTLS** (client certificates, and between nodes) is not done; workers authenticate with tokens.

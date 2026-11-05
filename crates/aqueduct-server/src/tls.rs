@@ -73,17 +73,37 @@ impl Tls {
     }
 }
 
-/// Serves `router` over TLS until `shutdown` completes, then lets connections finish for a while.
+/// What a connection may hold on to, while it is doing nothing useful.
+#[derive(Clone)]
+pub(crate) struct Connections {
+    /// Places: over them, new connections wait in the operating system's queue.
+    pub(crate) places: Arc<tokio::sync::Semaphore>,
+    /// How long a client has for a request's headers: from connecting to its first byte, and from there
+    /// to the end of the headers on HTTP/1.1.
+    pub(crate) header_timeout: Duration,
+}
+
+/// Serves `router` until `shutdown` completes, over TLS if given, then lets connections finish for a
+/// while. A place is held from accepting a connection until it closes, so without deadlines a silent
+/// client could keep one for ever, and enough of them would lock everyone else out.
 pub(crate) async fn serve(
     router: Router,
     listener: tokio::net::TcpListener,
-    tls: Tls,
+    tls: Option<Tls>,
+    connections: Connections,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls.config);
+    let acceptor = tls.map(|tls| tokio_rustls::TlsAcceptor::from(tls.config));
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
+        let permit = tokio::select! {
+            permit = Arc::clone(&connections.places).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+            () = &mut shutdown => break,
+        };
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
@@ -97,22 +117,58 @@ pub(crate) async fn serve(
         };
         let (acceptor, router) = (acceptor.clone(), router.clone());
         let watcher = graceful.watcher();
-        // A task per connection: a slow handshake must not hold up the others.
+        let timeout = connections.header_timeout;
+        // A task per connection: a slow one must not hold up the others.
         tokio::spawn(async move {
-            let Ok(Ok(stream)) =
-                tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
-            else {
-                return;
-            };
-            let builder =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-            let connection = builder.serve_connection_with_upgrades(
-                hyper_util::rt::TokioIo::new(stream),
-                hyper_util::service::TowerToHyperService::new(router),
-            );
-            let _ = watcher.watch(connection.into_owned()).await;
+            let _permit = permit;
+            match acceptor {
+                Some(acceptor) => {
+                    let Ok(Ok(stream)) =
+                        tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                    else {
+                        return;
+                    };
+                    connection(stream, router, watcher, timeout).await;
+                }
+                None => connection(stream, router, watcher, timeout).await,
+            }
         });
     }
     let _ = tokio::time::timeout(DRAIN_TIMEOUT, graceful.shutdown()).await;
     Ok(())
+}
+
+/// Serves one connection, HTTP/1.1 or HTTP/2, once its client has said something in time.
+async fn connection<S>(
+    stream: S,
+    router: Router,
+    watcher: hyper_util::server::graceful::Watcher,
+    header_timeout: Duration,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut stream = tokio::io::BufReader::new(stream);
+    match tokio::time::timeout(header_timeout, stream.fill_buf()).await {
+        Ok(Ok(bytes)) if !bytes.is_empty() => {}
+        _ => return,
+    }
+    let timer = hyper_util::rt::TokioTimer::new;
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder
+        .http1()
+        .timer(timer())
+        .header_read_timeout(header_timeout);
+    // Finds dead peers, such as workers on a machine that went away.
+    builder
+        .http2()
+        .timer(timer())
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(20));
+    let connection = builder.serve_connection_with_upgrades(
+        hyper_util::rt::TokioIo::new(stream),
+        hyper_util::service::TowerToHyperService::new(router),
+    );
+    let _ = watcher.watch(connection.into_owned()).await;
 }

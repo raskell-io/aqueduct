@@ -87,3 +87,66 @@ async fn only_a_client_that_trusts_the_certificate_is_served() {
     assert_eq!(result.output.unwrap().as_bytes(), b"7");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Over the TLS listener's connection limit, a new connection waits until a place is free.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connection_limit_holds_over_tls() {
+    let dir = std::env::temp_dir().join(format!("aqueduct-tls-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine = Arc::new(
+        Engine::builder(&dir)
+            .workflow(
+                "flow",
+                Arc::new(Procedure::compile("flow.star", FLOW).unwrap()),
+            )
+            .remote_steps(Duration::from_secs(30))
+            .open()
+            .unwrap(),
+    );
+    let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+    let certificate = issued.cert.pem();
+    let tls = Tls::from_pem(&certificate, &issued.signing_key.serialize_pem()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = Config::default();
+    config.limits.max_connections = 1;
+    {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            aqueduct_server::serve_tls(
+                engine,
+                listener,
+                &config,
+                Security::none(),
+                tls,
+                std::future::pending(),
+            )
+            .await
+        });
+    }
+    let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let url = format!("https://{addr}");
+    let worker = echo("waiting").ca_certificate(&certificate);
+    let running = tokio::spawn(async move { worker.run(&url).await });
+    let waiting = Arc::clone(&engine);
+    let result = tokio::task::spawn_blocking(move || {
+        waiting
+            .start("l-1", "flow", aqueduct_core::Payload::new(*b"1"))
+            .unwrap();
+        waiting.wait("l-1", Duration::from_millis(500))
+    })
+    .await
+    .unwrap();
+    assert!(result.is_err(), "served over the limit: {result:?}");
+    // A place comes free: the worker's connection is taken, and the step runs.
+    drop(idle);
+    let waiting = Arc::clone(&engine);
+    let result = tokio::task::spawn_blocking(move || waiting.wait("l-1", Duration::from_secs(20)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.output.unwrap().as_bytes(), b"1");
+    running.abort();
+    let _ = std::fs::remove_dir_all(dir);
+}
