@@ -239,7 +239,10 @@ queueing it without bound, and a flood of refused requests cannot grow the audit
 `aqueduct tokens create ./data --name acme --namespace acme --permissions start,read` binds a token to a
 namespace, whose keys, runs, objects and steps no other tenant can see or reach, with its own rate, cap on
 running runs, and share of a shared worker pool
-([ADR 0046](docs/adr/0046-namespaces.md)). A procedure's steps run
+([ADR 0046](docs/adr/0046-namespaces.md)). `aqueduct migrate --from ./data --to https://server` moves an
+embedded directory's runs, histories, versions and object state to a server, verified, without a run ever going on
+in two places, and applies them when the server next starts
+([ADR 0047](docs/adr/0047-migrate.md)). A procedure's steps run
 on **step workers**: processes in any language that connect to the server, say which steps they
 implement, and run what they are sent, over a gRPC stream or HTTP long polling. A worker holds each
 step under a lease; if it crashes or its result is lost, the step goes to another worker, and the run

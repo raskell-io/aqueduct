@@ -23,11 +23,14 @@ aqueduct-codec.workspace = true
 aqueduct-core.workspace = true
 aqueduct-engine.workspace = true
 aqueduct-procedure.workspace = true
+aqueduct-protocol.workspace = true
 aqueduct-registry.workspace = true
 aqueduct-server.workspace = true
 aqueduct-storage.workspace = true
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "sync"] }
+tokio-stream = { version = "0.1", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring", "tls-native-roots"] }
 
 [dev-dependencies]
 aqueduct-sdk.workspace = true

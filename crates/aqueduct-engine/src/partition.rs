@@ -1678,6 +1678,75 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         &self.runs
     }
 
+    /// A run's journal, whether it is in memory or only in the last checkpoint.
+    pub fn history(&mut self, key: &str) -> Result<Option<Vec<Entry>>, PartitionError> {
+        if let Some(run) = self.runs.get(key) {
+            return Ok(Some(run.journal.clone()));
+        }
+        let Some(records) = self.state.load_run(key)? else {
+            return Ok(None);
+        };
+        let verified = verify_chain(key, records.iter().map(Vec::as_slice)).map_err(|e| {
+            PartitionError::Corrupt(format!("run {key}: hash chain does not verify: {e}"))
+        })?;
+        Ok(Some(verified.entries))
+    }
+
+    /// Adds a run's history from an import (ADR 0047), or the part of it this partition does not have.
+    /// Performs no effects: the caller has not resumed the partition yet. Returns whether anything was
+    /// added.
+    pub(crate) fn import_run(
+        &mut self,
+        key: &str,
+        records: &[Vec<u8>],
+    ) -> Result<bool, PartitionError> {
+        const FLUSH_EVERY: usize = 4096;
+        let have = self.runs.get(key).map_or(0, |run| run.journal.len());
+        if have >= records.len() {
+            return Ok(false);
+        }
+        let verified = verify_chain(key, records.iter().map(Vec::as_slice)).map_err(|e| {
+            PartitionError::Corrupt(format!("run {key}: hash chain does not verify: {e}"))
+        })?;
+        let state = RunState::from_journal(&verified.entries)
+            .map_err(|e| PartitionError::Corrupt(format!("run {key}: journal is invalid: {e}")))?;
+        for record in &records[have..] {
+            self.batch.push(encode_log_record(key, record));
+        }
+        let was_running = self
+            .runs
+            .get(key)
+            .is_some_and(|run| !run.state.status().is_terminal());
+        let is_running = !state.status().is_terminal();
+        self.runs.insert(
+            key.to_owned(),
+            PartitionRun {
+                state,
+                journal: verified.entries,
+                chain: ChainWriter::resume(verified.head),
+            },
+        );
+        if counts_as_running(key) && was_running != is_running {
+            let namespace = crate::namespaces::namespace_of(key).to_owned();
+            if is_running {
+                *self.running.entry(namespace).or_default() += 1;
+            } else if let Some(count) = self.running.get_mut(&namespace) {
+                *count -= 1;
+                if *count == 0 {
+                    self.running.remove(&namespace);
+                }
+            }
+        }
+        self.dirty.insert(key.to_owned());
+        self.refresh_timers(key);
+        self.index_children(key);
+        if self.batch.len() >= FLUSH_EVERY {
+            self.flush()
+                .map_err(|e| PartitionError::Internal(e.to_string()))?;
+        }
+        Ok(true)
+    }
+
     /// How many runs are running in each namespace, not counting object loops. Kept up to date as runs
     /// start and end: reading it costs nothing however many runs there are.
     pub fn running(&self) -> &BTreeMap<String, usize> {

@@ -143,7 +143,18 @@ journal as it does for local logic.
 - **A worker that cannot decide** returns its credit instead of a decision.
 - **Not yet:** queries on remotely decided workflows, and validation of updates on receipt.
 
-## 5. Not in this draft yet
+## 5. Imports (`aqueduct.v1.Imports`, ADR 0047)
+
+`aqueduct migrate` uses this; there is no HTTP/JSON form. `Upload` is one client stream, and needs `admin` in the
+default namespace: an `ImportBegin`, then runs (a run's history in the history format, which may be split, the last
+part saying so), sources and registry files, then an `ImportCommit` with the counts sent. It is staged, and applied
+when the server next starts; a stream without its commit leaves nothing. Refusals: `INVALID_ARGUMENT` for a history
+that does not verify, a key outside the default namespace or counts that do not match; `FAILED_PRECONDITION` if a key
+has another run, if an import is already waiting for a restart, or if another is being uploaded; `ABORTED` if the
+stream ended without its commit. A run the server already has, as it was or gone on from there, is counted in
+`already_there`, so an import can be repeated.
+
+## 6. Not in this draft yet
 - **Push endpoints:** the server calls an HTTP endpoint per invocation, for serverless platforms.
 - **Named task queues** and deployments across workers.
 - **OIDC/JWT and mTLS.** The server has TLS (ADR 0042), and binds to loopback by default;

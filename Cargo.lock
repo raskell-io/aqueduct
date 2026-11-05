@@ -157,12 +157,15 @@ dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
+ "aqueduct-protocol",
  "aqueduct-registry",
  "aqueduct-sdk",
  "aqueduct-server",
  "aqueduct-storage",
  "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -279,6 +282,7 @@ dependencies = [
 name = "aqueduct-server"
 version = "0.0.0"
 dependencies = [
+ "aqueduct-codec",
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",

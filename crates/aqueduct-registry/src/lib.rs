@@ -186,6 +186,37 @@ impl Action {
     }
 }
 
+/// Whether a version's replay report satisfies a policy.
+fn replay_meets(policy: &Policy, version: &Version) -> Result<(), RegistryError> {
+    if policy.require_replay {
+        let replay = version
+            .replay
+            .as_ref()
+            .ok_or_else(|| RegistryError::Denied("the version has no replay report".into()))?;
+        if replay.runs < policy.min_runs {
+            return Err(RegistryError::Denied(format!(
+                "its replay covers {} past runs (at least {})",
+                replay.runs, policy.min_runs
+            )));
+        }
+        if replay.unresolved > policy.max_unresolved {
+            return Err(RegistryError::Denied(format!(
+                "its replay left {} runs unresolved (at most {})",
+                replay.unresolved, policy.max_unresolved
+            )));
+        }
+        if let Some(max) = policy.max_different
+            && replay.different > max
+        {
+            return Err(RegistryError::Denied(format!(
+                "its replay decides {} runs differently (at most {max})",
+                replay.different
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One line of the registry's log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
@@ -344,7 +375,7 @@ fn io(error: impl std::fmt::Display) -> RegistryError {
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A data directory's version registry.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Registry {
     dir: PathBuf,
     events: Vec<Event>,
@@ -657,32 +688,7 @@ impl Registry {
             }
             None => {}
         }
-        if policy.require_replay {
-            let replay = version
-                .replay
-                .as_ref()
-                .ok_or_else(|| RegistryError::Denied("the version has no replay report".into()))?;
-            if replay.runs < policy.min_runs {
-                return Err(RegistryError::Denied(format!(
-                    "its replay covers {} past runs (at least {})",
-                    replay.runs, policy.min_runs
-                )));
-            }
-            if replay.unresolved > policy.max_unresolved {
-                return Err(RegistryError::Denied(format!(
-                    "its replay left {} runs unresolved (at most {})",
-                    replay.unresolved, policy.max_unresolved
-                )));
-            }
-            if let Some(max) = policy.max_different
-                && replay.different > max
-            {
-                return Err(RegistryError::Denied(format!(
-                    "its replay decides {} runs differently (at most {max})",
-                    replay.different
-                )));
-            }
-        }
+        replay_meets(&policy, &version)?;
         self.append(
             by,
             workflow,
@@ -820,6 +826,11 @@ impl Registry {
             action,
             hash: String::new(),
         };
+        self.append_event(event)
+    }
+
+    /// Chains an event to the log, writes it durably, and folds it into the versions.
+    fn append_event(&mut self, event: Event) -> Result<(), RegistryError> {
         let body = event_json(&event).to_string();
         let prev = self.events.last().map_or(GENESIS, |e| e.hash.as_str());
         let hash = chain_hash(prev, &body);
@@ -833,6 +844,136 @@ impl Registry {
         let event = Event { hash, ..event };
         self.apply(&event)?;
         self.events.push(event);
+        Ok(())
+    }
+
+    /// Takes on another registry's workflows, with their whole history: who did what, and when (ADR 0047).
+    /// The events are chained again in this log, so a source's own chain is not kept; approvals' signatures
+    /// are over the version and its report, and still verify. Nothing changes in the log if a workflow has
+    /// other events here, or if a deployed version would not pass this registry's policy, which applies
+    /// whatever policy approved it. Taking on the same registry again does nothing. Returns notes for the
+    /// operator.
+    pub fn merge(&mut self, from: &Registry) -> Result<Vec<String>, RegistryError> {
+        let mut notes = Vec::new();
+        // What each workflow still needs.
+        let same = |a: &Event, b: &Event| {
+            a.at_ms == b.at_ms && a.by == b.by && a.version == b.version && a.action == b.action
+        };
+        let mut have: BTreeMap<&str, usize> = BTreeMap::new();
+        for event in &from.events {
+            if have.contains_key(event.workflow.as_str()) {
+                continue;
+            }
+            let mine: Vec<&Event> = self
+                .events
+                .iter()
+                .filter(|e| e.workflow == event.workflow)
+                .collect();
+            let theirs: Vec<&Event> = from
+                .events
+                .iter()
+                .filter(|e| e.workflow == event.workflow)
+                .collect();
+            let common = mine.len().min(theirs.len());
+            if mine.len() > theirs.len()
+                || !mine[..common]
+                    .iter()
+                    .zip(&theirs[..common])
+                    .all(|(a, b)| same(a, b))
+            {
+                return Err(RegistryError::Invalid(format!(
+                    "workflow `{}` already has other versions or events here",
+                    event.workflow
+                )));
+            }
+            have.insert(&event.workflow, mine.len());
+        }
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut needed = Vec::new();
+        for event in &from.events {
+            let count = seen.entry(&event.workflow).or_default();
+            *count += 1;
+            if *count > have.get(event.workflow.as_str()).copied().unwrap_or(0) {
+                needed.push(event);
+            }
+        }
+        // This directory's policy and identities stay, if it has them.
+        for (name, what) in [("policy.json", "policy"), ("identities.json", "identities")] {
+            let (ours, theirs) = (self.dir.join(name), from.dir.join(name));
+            if !theirs.exists() {
+                continue;
+            }
+            if ours.exists() {
+                if std::fs::read(&ours).map_err(io)? != std::fs::read(&theirs).map_err(io)? {
+                    notes.push(format!("kept this server's {what}: the source's differs"));
+                }
+            } else {
+                std::fs::copy(&theirs, &ours).map_err(io)?;
+                std::fs::File::open(&ours)
+                    .and_then(|f| f.sync_all())
+                    .map_err(io)?;
+                notes.push(format!("took the source's {what}"));
+            }
+        }
+        self.load_policy()?;
+        self.identities = Identities::read(&self.dir.join("identities.json"))?;
+        // Whether it all holds, before anything is written.
+        let mut trial = self.clone();
+        for event in &needed {
+            trial.apply(event)?;
+        }
+        let incoming = trial
+            .versions
+            .values()
+            .filter(|v| v.state.is_deployed() && have.contains_key(v.workflow.as_str()));
+        for version in incoming {
+            trial.check_signed(version)?;
+            trial.passes_policy(version)?;
+        }
+        for version in from.versions.values() {
+            let text = from.source(version)?;
+            let path = self.source_path(&version.id);
+            if !path.exists() {
+                let mut file = std::fs::File::create(&path).map_err(io)?;
+                file.write_all(text.as_bytes()).map_err(io)?;
+                file.sync_all().map_err(io)?;
+            }
+        }
+        for event in needed {
+            self.append_event(Event {
+                seq: u64::try_from(self.events.len()).unwrap_or(u64::MAX),
+                hash: String::new(),
+                ..event.clone()
+            })?;
+        }
+        Ok(notes)
+    }
+
+    /// Whether a version approved elsewhere would have been approved here: replaying events does not ask,
+    /// and an import must not be a way around this directory's policy.
+    fn passes_policy(&self, version: &Version) -> Result<(), RegistryError> {
+        let policy = self.policy(&version.workflow);
+        let denied = |why: String| {
+            RegistryError::Denied(format!(
+                "{} version {} would not be approved here: {why}",
+                version.workflow, version.id
+            ))
+        };
+        if policy.require_replay {
+            replay_meets(policy, version).map_err(|e| denied(e.to_string()))?;
+        }
+        let valid = self
+            .valid_approvals(version)
+            .iter()
+            .filter(|a| policy.author_may_approve || a.by != version.provenance.author)
+            .filter(|a| policy.approvers.is_empty() || policy.approvers.contains(&a.by))
+            .count();
+        if valid < policy.approvals {
+            return Err(denied(format!(
+                "it has {valid} approvals that count, of {} needed",
+                policy.approvals
+            )));
+        }
         Ok(())
     }
 
@@ -1099,6 +1240,94 @@ pub fn diff(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn merge_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aqueduct-merge-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn activated(dir: &Path, workflow: &str, source: &str) -> String {
+        let mut registry = Registry::open(dir).unwrap();
+        let id = registry
+            .register(
+                workflow,
+                source,
+                Provenance {
+                    author: "ada".into(),
+                    ..Provenance::default()
+                },
+            )
+            .unwrap();
+        registry.propose(workflow, &id, "ada").unwrap();
+        registry
+            .prove(workflow, &id, "ada", ReplayEvidence::default())
+            .unwrap();
+        registry.approve(workflow, &id, "grace", None).unwrap();
+        registry.activate(workflow, &id, "grace").unwrap();
+        id
+    }
+
+    #[test]
+    fn merging_takes_on_workflows_with_their_history() {
+        let (from, to) = (merge_dir("from"), merge_dir("to"));
+        let id = activated(&from, "a", "def run(x):\n    return x\n");
+        activated(&to, "b", "def run(x):\n    return 1\n");
+        let source = Registry::open(&from).unwrap();
+        let mut target = Registry::open(&to).unwrap();
+        target.merge(&source).unwrap();
+        // It survives being read back: the log's chain holds, and so does the source's hash.
+        let reopened = Registry::open(&to).unwrap();
+        let version = reopened.version("a", &id).unwrap();
+        assert_eq!(version.state, State::Active);
+        assert_eq!(version.approvals[0].by, "grace");
+        reopened.source(version).unwrap();
+        assert!(reopened.active("b").is_some(), "what it had stays");
+        let event = reopened
+            .events()
+            .iter()
+            .find(|e| e.workflow == "a")
+            .unwrap();
+        let original = source.events().iter().find(|e| e.workflow == "a").unwrap();
+        assert_eq!(event.at_ms, original.at_ms, "when, as it happened");
+        // Merging again changes nothing.
+        let before = reopened.events().len();
+        Registry::open(&to).unwrap().merge(&source).unwrap();
+        assert_eq!(Registry::open(&to).unwrap().events().len(), before);
+        let _ = (std::fs::remove_dir_all(&from), std::fs::remove_dir_all(&to));
+    }
+
+    #[test]
+    fn merging_refuses_a_workflow_with_another_history_and_changes_nothing() {
+        let (from, to) = (merge_dir("from2"), merge_dir("to2"));
+        activated(&from, "a", "def run(x):\n    return x\n");
+        activated(&from, "c", "def run(x):\n    return 3\n");
+        activated(&to, "a", "def run(x):\n    return 2\n");
+        let before = Registry::open(&to).unwrap().events().len();
+        let source = Registry::open(&from).unwrap();
+        let refused = Registry::open(&to).unwrap().merge(&source).unwrap_err();
+        assert!(refused.to_string().contains("`a`"), "{refused}");
+        assert_eq!(Registry::open(&to).unwrap().events().len(), before);
+        let _ = (std::fs::remove_dir_all(&from), std::fs::remove_dir_all(&to));
+    }
+
+    #[test]
+    fn merging_refuses_what_this_directorys_policy_would_not_pass() {
+        let (from, to) = (merge_dir("from3"), merge_dir("to3"));
+        activated(&from, "a", "def run(x):\n    return x\n");
+        std::fs::create_dir_all(to.join("registry")).unwrap();
+        std::fs::write(
+            to.join("registry/policy.json"),
+            r#"{"default": {"approvals": 2}}"#,
+        )
+        .unwrap();
+        let source = Registry::open(&from).unwrap();
+        assert!(Registry::open(&to).unwrap().merge(&source).is_err());
+        assert_eq!(Registry::open(&to).unwrap().events().len(), 0);
+        let _ = (std::fs::remove_dir_all(&from), std::fs::remove_dir_all(&to));
+    }
 
     const V1: &str = "def run(claim):\n    return step(\"score\", claim)\n";
     const V2: &str = "def run(claim):\n    score = step(\"score\", claim)\n    return score\n";

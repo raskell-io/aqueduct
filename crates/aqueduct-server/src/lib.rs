@@ -18,6 +18,7 @@
 
 pub mod audit;
 pub mod auth;
+mod imports;
 mod limits;
 mod push;
 mod tls;
@@ -141,6 +142,10 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
     let grpc = tonic::service::Routes::new(v1::ingress_server::IngressServer::new(api.clone()))
         .add_service(v1::workers_server::WorkersServer::new(api.clone()))
         .add_service(v1::workflows_server::WorkflowsServer::new(api.clone()))
+        .add_service(
+            v1::imports_server::ImportsServer::new(api.clone())
+                .max_decoding_message_size(imports::MOST_IN_A_MESSAGE),
+        )
         .into_axum_router();
     let http = Router::new()
         .route("/v1/runs", post(http_start).get(http_list))
@@ -323,6 +328,9 @@ fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static st
             }
             _ => (Permission::Admin, "unknown call"),
         };
+    }
+    if path == "/aqueduct.v1.Imports/Upload" {
+        return (Permission::Admin, "import");
     }
     if path == "/aqueduct.v1.Workers/Work" || path == "/aqueduct.v1.Workflows/Serve" {
         return (Permission::Work, "work");
