@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aqueduct_engine::embedded::{Attempt, Builder, Engine};
+use aqueduct_engine::namespaces::Scope;
 use aqueduct_engine::queue::{Invocation, StepQueue};
 use axum::body::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -65,6 +66,10 @@ pub struct PushEndpoint {
     /// Headers sent with every request (for example `authorization`).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// The namespace whose steps it receives, or `*` for all (ADR 0046). Default: the default namespace,
+    /// so that no tenant's payloads reach an endpoint that did not ask for them.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 fn default_concurrency() -> usize {
@@ -132,6 +137,9 @@ impl Config {
         for object in &self.objects {
             builder = builder.object(object);
         }
+        for (name, namespace) in &self.limits.namespaces {
+            builder = builder.namespace(name, namespace.max_running_runs, namespace.weight);
+        }
         if let Some(limit) = self.limits.max_running_runs {
             builder = builder.max_running_runs(limit);
         }
@@ -195,6 +203,11 @@ async fn pusher(
     endpoint: PushEndpoint,
 ) {
     let name = format!("push:{}", endpoint.url);
+    let scope = Arc::new(match endpoint.namespace.as_deref() {
+        Some("*") => Scope::All,
+        Some(namespace) => Scope::One(namespace.to_owned()),
+        None => Scope::One(aqueduct_engine::namespaces::DEFAULT.to_owned()),
+    });
     let queues = Arc::new(vec![endpoint.queue.clone()]);
     let endpoint = Arc::new(endpoint);
     let permits = Arc::new(tokio::sync::Semaphore::new(endpoint.concurrency));
@@ -202,9 +215,14 @@ async fn pusher(
         let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
             return;
         };
-        let (taking, names, worker) = (Arc::clone(&queue), Arc::clone(&queues), name.clone());
+        let (taking, names, worker, scope) = (
+            Arc::clone(&queue),
+            Arc::clone(&queues),
+            name.clone(),
+            Arc::clone(&scope),
+        );
         let taken = tokio::task::spawn_blocking(move || {
-            taking.wait_take(&worker, &names, 1, Duration::from_millis(500))
+            taking.wait_take_in(&scope, &worker, &names, 1, Duration::from_millis(500))
         })
         .await
         .unwrap_or_default();
@@ -221,7 +239,7 @@ async fn pusher(
             let _permit = permit;
             let id = invocation.id.clone();
             let attempt = deliver(&client, &endpoint, invocation).await;
-            let _ = record(&engine, &queue, &id, attempt);
+            let _ = record(&engine, &queue, &Scope::All, &id, attempt);
         });
     }
 }

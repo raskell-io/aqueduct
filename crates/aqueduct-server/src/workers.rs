@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aqueduct_engine::embedded::{Attempt, Engine};
+use aqueduct_engine::namespaces::Scope;
 use aqueduct_engine::queue::{Invocation, StepQueue};
 use aqueduct_protocol::v1;
 use axum::extract::State;
@@ -39,10 +40,11 @@ impl Api {
 pub(crate) fn record(
     engine: &Engine,
     queue: &StepQueue,
+    scope: &Scope,
     id: &str,
     attempt: Attempt,
 ) -> Result<(), Failure> {
-    if let Some((run, cmd)) = queue.complete(id) {
+    if let Some((run, cmd)) = queue.complete_in(scope, id) {
         engine.step_result(&run, cmd, attempt)?;
     }
     Ok(())
@@ -84,6 +86,7 @@ impl v1::workers_server::Workers for Api {
         request: tonic::Request<tonic::Streaming<v1::WorkerMessage>>,
     ) -> Result<tonic::Response<WorkStream>, tonic::Status> {
         let queue = self.queue()?;
+        let scope = crate::worker_scope();
         let mut inbound = request.into_inner();
         let hello = match inbound.message().await? {
             Some(v1::WorkerMessage {
@@ -113,7 +116,7 @@ impl v1::workers_server::Workers for Api {
         {
             let (engine, queue) = (Arc::clone(&self.engine), Arc::clone(&queue));
             let (credit, closed, changed) = (credit.clone(), closed.clone(), changed.clone());
-            let (session, gone) = (session.clone(), out.clone());
+            let (session, gone, scope) = (session.clone(), out.clone(), scope.clone());
             tokio::spawn(async move {
                 loop {
                     // The session ends when the worker's stream ends, or it stops reading ours.
@@ -127,7 +130,8 @@ impl v1::workers_server::Workers for Api {
                     match message.message {
                         Some(v1::worker_message::Message::Result(result)) => {
                             if let Ok(outcome) = attempt(result.outcome) {
-                                let _ = record(&engine, &queue, &result.invocation_id, outcome);
+                                let _ =
+                                    record(&engine, &queue, &scope, &result.invocation_id, outcome);
                             }
                             credit.fetch_add(1, Ordering::SeqCst);
                         }
@@ -147,7 +151,7 @@ impl v1::workers_server::Workers for Api {
 
         // Invocations to the worker, never more than its credit.
         tokio::spawn(async move {
-            serve_invocations(queue, session, steps, credit, closed, changed, out).await;
+            serve_invocations(queue, scope, session, steps, credit, closed, changed, out).await;
         });
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(stream),
@@ -157,8 +161,10 @@ impl v1::workers_server::Workers for Api {
 
 /// Sends a session invocations while it has credit. When the session ends, whatever a take in flight
 /// leased to it is released too.
+#[allow(clippy::too_many_arguments)]
 async fn serve_invocations(
     queue: Arc<StepQueue>,
+    scope: Scope,
     session: String,
     steps: Arc<Vec<String>>,
     credit: Arc<AtomicU32>,
@@ -173,9 +179,14 @@ async fn serve_invocations(
                 changed.notified().await;
                 continue;
             }
-            let (queue, steps, name) = (Arc::clone(&queue), Arc::clone(&steps), session.clone());
+            let (queue, steps, name, scope) = (
+                Arc::clone(&queue),
+                Arc::clone(&steps),
+                session.clone(),
+                scope.clone(),
+            );
             let taken = tokio::task::spawn_blocking(move || {
-                queue.wait_take(&name, &steps, available as usize, TAKE_WAIT)
+                queue.wait_take_in(&scope, &name, &steps, available as usize, TAKE_WAIT)
             })
             .await
             .unwrap_or_default();
@@ -218,10 +229,12 @@ async fn http_poll(State(api): State<Api>, Body(poll): Body<Poll>) -> Result<Jso
     let wait = Duration::from_millis(poll.wait_ms).min(MAX_POLL_WAIT);
     let mut queues = poll.steps;
     queues.extend(poll.queues);
-    let taken =
-        tokio::task::spawn_blocking(move || queue.wait_take(&poll.worker, &queues, poll.max, wait))
-            .await
-            .unwrap_or_default();
+    let scope = crate::worker_scope();
+    let taken = tokio::task::spawn_blocking(move || {
+        queue.wait_take_in(&scope, &poll.worker, &queues, poll.max, wait)
+    })
+    .await
+    .unwrap_or_default();
     let invocations: Vec<Value> = taken
         .into_iter()
         .map(|i| {
@@ -252,6 +265,7 @@ async fn http_results(
     Body(results): Body<Results>,
 ) -> Result<Json<Value>, Failure> {
     let queue = api.queue()?;
+    let scope = crate::worker_scope();
     for result in results.results {
         let text = |field: &str| result.get(field).map(|v| v.as_str().map(str::to_owned));
         let outcome = match (result.get("completed"), text("failed"), text("retry")) {
@@ -269,7 +283,7 @@ async fn http_results(
         let Some(id) = result.get("invocation_id").and_then(Value::as_str) else {
             return Err(Failure::invalid("a result needs its invocation_id"));
         };
-        record(&api.engine, &queue, id, outcome)?;
+        record(&api.engine, &queue, &scope, id, outcome)?;
     }
     Ok(Json(json!({})))
 }

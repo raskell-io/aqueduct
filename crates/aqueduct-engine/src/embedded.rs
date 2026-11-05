@@ -243,6 +243,8 @@ pub struct Builder {
     /// Remote steps routed to named task queues, by step name.
     routes: BTreeMap<String, String>,
     max_running: Option<usize>,
+    namespace_running: BTreeMap<String, usize>,
+    weights: BTreeMap<String, f64>,
 }
 
 impl Builder {
@@ -287,6 +289,17 @@ impl Builder {
     /// continue-as-new, messages). An object key's own loop does not count; its calls do.
     pub fn max_running_runs(mut self, limit: usize) -> Self {
         self.max_running = Some(limit);
+        self
+    }
+
+    /// Sets a namespace's quota and its share of workers that serve several namespaces (ADR 0046).
+    /// `max_running` applies as [`Builder::max_running_runs`] does, to that namespace's runs. `weight` is
+    /// relative to other namespaces, which have 1.
+    pub fn namespace(mut self, namespace: &str, max_running: Option<usize>, weight: f64) -> Self {
+        if let Some(limit) = max_running {
+            self.namespace_running.insert(namespace.to_owned(), limit);
+        }
+        self.weights.insert(namespace.to_owned(), weight);
         self
     }
 
@@ -463,9 +476,10 @@ impl Builder {
         let job_inbox = Arc::new(Mutex::new(job_inbox));
         let local: std::collections::BTreeSet<String> = self.steps.keys().cloned().collect();
         let routes = std::mem::take(&mut self.routes);
-        let queue = self
-            .remote
-            .map(|lease| Arc::new(crate::queue::StepQueue::with_routes(lease, routes)));
+        let weights = std::mem::take(&mut self.weights);
+        let queue = self.remote.map(|lease| {
+            Arc::new(crate::queue::StepQueue::with_routes(lease, routes).with_weights(weights))
+        });
         let activation_queue = self
             .remote_workflows
             .map(|lease| Arc::new(crate::activations::ActivationQueue::new(lease)));
@@ -504,6 +518,8 @@ impl Builder {
             activations: activation_queue.clone(),
             max_running: self.max_running,
             running: 0,
+            namespace_max: self.namespace_running,
+            namespace_count: BTreeMap::new(),
         };
         let redispatch = self.redispatch;
         let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
@@ -601,6 +617,8 @@ impl Engine {
             remote_workflows: None,
             routes: BTreeMap::new(),
             max_running: None,
+            namespace_running: BTreeMap::new(),
+            weights: BTreeMap::new(),
         }
     }
 
@@ -1015,6 +1033,9 @@ struct Processor {
     /// starts admitted since.
     max_running: Option<usize>,
     running: usize,
+    /// The same, per namespace.
+    namespace_max: BTreeMap<String, usize>,
+    namespace_count: BTreeMap<String, usize>,
 }
 
 /// Where the answer to an update or a query goes.
@@ -1345,15 +1366,18 @@ impl Processor {
             .flush()
             .map_err(|e| format!("storage failed: {e}"))?;
         self.deliver(outbound);
-        if self.max_running.is_some() {
-            self.running = self
-                .partition
-                .runs()
-                .iter()
-                .filter(|(key, run)| {
-                    !run.state().status().is_terminal() && !key.starts_with("$object/")
-                })
-                .count();
+        if self.max_running.is_some() || !self.namespace_max.is_empty() {
+            self.running = 0;
+            self.namespace_count.clear();
+            for (key, run) in self.partition.runs() {
+                if !run.state().status().is_terminal() && !key.starts_with("$object/") {
+                    self.running += 1;
+                    *self
+                        .namespace_count
+                        .entry(crate::namespaces::namespace_of(key).to_owned())
+                        .or_default() += 1;
+                }
+            }
         }
         self.answer_waiters();
         self.answer_updates().map_err(|e| e.to_string())?;
@@ -1363,9 +1387,11 @@ impl Processor {
     /// Whether a request that would create a run under `key` must be refused: the cap is reached and the
     /// key has no run. Otherwise, it is counted.
     fn overloaded(&mut self, key: &str) -> Result<bool, String> {
-        let Some(limit) = self.max_running else {
+        let namespace = crate::namespaces::namespace_of(key);
+        let namespace_limit = self.namespace_max.get(namespace).copied();
+        if self.max_running.is_none() && namespace_limit.is_none() {
             return Ok(false);
-        };
+        }
         if self
             .partition
             .latest(key)
@@ -1374,10 +1400,17 @@ impl Processor {
         {
             return Ok(false);
         }
-        if self.running >= limit {
+        let in_namespace = self.namespace_count.get(namespace).copied().unwrap_or(0);
+        if self.max_running.is_some_and(|limit| self.running >= limit)
+            || namespace_limit.is_some_and(|limit| in_namespace >= limit)
+        {
             return Ok(true);
         }
         self.running += 1;
+        *self
+            .namespace_count
+            .entry(namespace.to_owned())
+            .or_default() += 1;
         Ok(false)
     }
 

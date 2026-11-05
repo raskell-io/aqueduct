@@ -695,10 +695,14 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             .iter()
             .zip(0u32..)
             .filter(|(step, _)| step.kind == CommandKind::Child && step.outcome.is_none())
-            .map(|(step, index)| {
+            .filter_map(|(step, index)| {
                 let cmd = CommandIndex(index);
-                let child = step.child_key.clone().unwrap_or_else(|| child_key(id, cmd));
-                (child, cmd)
+                let child = match &step.child_key {
+                    // A key logic may not choose failed when it was started.
+                    Some(key) => crate::namespaces::chosen_key(id, key)?,
+                    None => child_key(id, cmd),
+                };
+                Some((child, cmd))
             })
             .collect();
         for (child, cmd) in waiting {
@@ -719,7 +723,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         input: Payload,
         key: Option<String>,
     ) -> Result<(), PartitionError> {
-        let child = key.unwrap_or_else(|| child_key(parent, cmd));
+        let child = match key {
+            None => child_key(parent, cmd),
+            Some(key) => match crate::namespaces::chosen_key(parent, &key) {
+                Some(child) => child,
+                None => {
+                    let error = format!("a child run cannot have the key `{key}`");
+                    return self.deliver_child(parent, cmd, StepOutcome::Failed(error));
+                }
+            },
+        };
         self.children
             .entry(child.clone())
             .or_default()
@@ -814,10 +827,13 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         else {
             return Ok(());
         };
-        let child = step
-            .child_key
-            .clone()
-            .unwrap_or_else(|| child_key(parent, cmd));
+        let child = match &step.child_key {
+            Some(key) => match crate::namespaces::chosen_key(parent, key) {
+                Some(child) => child,
+                None => return Ok(()),
+            },
+            None => child_key(parent, cmd),
+        };
         self.forget_child(&child, parent, cmd);
         if self.children.contains_key(&child) {
             return Ok(());
@@ -1866,6 +1882,10 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     handler,
                     args,
                 } => {
+                    // A key logic may not name goes nowhere; the sender gets no answer either way.
+                    let Some(target) = crate::namespaces::chosen_key(key, &target) else {
+                        continue;
+                    };
                     let id = child_key(key, cmd);
                     let args = serde_json::from_slice(args.as_bytes()).unwrap_or_default();
                     match self.call_object(&object, &target, &handler, &id, &args) {

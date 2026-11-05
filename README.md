@@ -235,7 +235,11 @@ hash-chained audit log records who did what, and every refused request (`aqueduc
 listens beyond loopback only with tokens and a certificate
 ([ADR 0042](docs/adr/0042-server-tls.md)). Under load it refuses work with a retry hint rather than
 queueing it without bound, and a flood of refused requests cannot grow the audit log
-([ADR 0045](docs/adr/0045-overload-protection.md)). A procedure's steps run
+([ADR 0045](docs/adr/0045-overload-protection.md)). **Namespaces** keep tenants of one server apart:
+`aqueduct tokens create ./data --name acme --namespace acme --permissions start,read` binds a token to a
+namespace, whose keys, runs, objects and steps no other tenant can see or reach, with its own rate, cap on
+running runs, and share of a shared worker pool
+([ADR 0046](docs/adr/0046-namespaces.md)). A procedure's steps run
 on **step workers**: processes in any language that connect to the server, say which steps they
 implement, and run what they are sent, over a gRPC stream or HTTP long polling. A worker holds each
 step under a lease; if it crashes or its result is lost, the step goes to another worker, and the run

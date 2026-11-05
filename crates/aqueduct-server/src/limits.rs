@@ -37,6 +37,33 @@ pub struct Limits {
     /// Running runs. Above it, starts of new keys and new object calls are refused with a retry hint;
     /// retried starts, and what runs already do, are not. Default: no limit.
     pub max_running_runs: Option<usize>,
+    /// Quotas and shares per namespace (ADR 0046).
+    pub namespaces: BTreeMap<String, NamespaceLimits>,
+}
+
+/// A namespace's quotas, and its share of workers that serve several namespaces.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct NamespaceLimits {
+    /// Requests a second across the namespace's callers. Workers are exempt. Default: no limit.
+    pub requests_per_second: Option<f64>,
+    /// How many requests it may make at once above that rate. Default: one second's worth.
+    pub burst: Option<f64>,
+    /// Its running runs, as [`Limits::max_running_runs`]. Default: no limit.
+    pub max_running_runs: Option<usize>,
+    /// Its share of workers that serve several namespaces, relative to others. Default 1.
+    pub weight: f64,
+}
+
+impl Default for NamespaceLimits {
+    fn default() -> NamespaceLimits {
+        NamespaceLimits {
+            requests_per_second: None,
+            burst: None,
+            max_running_runs: None,
+            weight: 1.0,
+        }
+    }
 }
 
 impl Default for Limits {
@@ -49,6 +76,7 @@ impl Default for Limits {
             header_timeout_ms: 10_000,
             audited_refusals_per_second: 10.0,
             max_running_runs: None,
+            namespaces: BTreeMap::new(),
         }
     }
 }
@@ -88,6 +116,22 @@ impl Limits {
         }
         if self.max_running_runs == Some(0) {
             return Err("limits: max_running_runs must be at least 1".into());
+        }
+        for (name, namespace) in &self.namespaces {
+            if !aqueduct_engine::namespaces::valid_namespace(name) {
+                return Err(format!("limits: `{name}` is not a namespace"));
+            }
+            positive(
+                "a namespace's requests_per_second",
+                namespace.requests_per_second,
+            )?;
+            positive("a namespace's burst", namespace.burst)?;
+            positive("a namespace's weight", Some(namespace.weight))?;
+            if namespace.max_running_runs == Some(0) {
+                return Err(format!(
+                    "limits: `{name}`'s max_running_runs must be at least 1"
+                ));
+            }
         }
         Ok(())
     }
@@ -161,6 +205,24 @@ impl Limiter {
         let mut callers = self.callers.lock().unwrap_or_else(|e| e.into_inner());
         callers
             .entry(caller.to_owned())
+            .or_insert_with(|| Bucket::new(rate, capacity, now))
+            .take(now)
+    }
+
+    /// Whether a namespace may make a request now; otherwise, how long until it may.
+    pub(crate) fn admit_namespace(&self, namespace: &str) -> Result<(), Duration> {
+        let Some(limits) = self.limits.namespaces.get(namespace) else {
+            return Ok(());
+        };
+        let Some(rate) = limits.requests_per_second else {
+            return Ok(());
+        };
+        let now = self.started.elapsed();
+        let capacity = limits.burst.unwrap_or(rate).max(1.0);
+        let mut callers = self.callers.lock().unwrap_or_else(|e| e.into_inner());
+        callers
+            // Tokens' names cannot hold this mark as namespaces do not: it cannot clash with a caller.
+            .entry(format!("$ns/{namespace}"))
             .or_insert_with(|| Bucket::new(rate, capacity, now))
             .take(now)
     }

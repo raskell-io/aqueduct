@@ -84,6 +84,14 @@ pub struct Token {
     pub permissions: BTreeSet<Permission>,
     /// When it was created (milliseconds since the Unix epoch).
     pub created_ms: u64,
+    /// The namespace it works in (ADR 0046), or `*` for all of them: its requests then name one, with
+    /// the `aqueduct-namespace` header, and as a worker it serves all.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+fn default_namespace() -> String {
+    aqueduct_engine::namespaces::DEFAULT.to_owned()
 }
 
 impl Token {
@@ -147,6 +155,21 @@ pub fn create_token(
     name: &str,
     permissions: BTreeSet<Permission>,
 ) -> Result<String, String> {
+    create_token_in(dir, name, permissions, aqueduct_engine::namespaces::DEFAULT)
+}
+
+/// [`create_token`], for a token that works in `namespace`, or in all of them (`*`).
+pub fn create_token_in(
+    dir: &Path,
+    name: &str,
+    permissions: BTreeSet<Permission>,
+    namespace: &str,
+) -> Result<String, String> {
+    if namespace != "*" && !aqueduct_engine::namespaces::valid_namespace(namespace) {
+        return Err(format!(
+            "`{namespace}` is not a namespace: letters, digits, - and _, or * for all"
+        ));
+    }
     if name.is_empty() {
         return Err("a token needs a name".into());
     }
@@ -176,6 +199,7 @@ pub fn create_token(
         sha256: sha256_hex(&token),
         permissions,
         created_ms: now_ms(),
+        namespace: namespace.to_owned(),
     });
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     write_file(&path, &file)?;
@@ -300,6 +324,16 @@ impl Authenticator {
         let tokens = read_file(path)?.tokens;
         *cached = Some((modified, metadata.len(), tokens.clone()));
         Ok(tokens)
+    }
+
+    /// The namespace of the named token: `*` for all.
+    pub fn token_namespace(&self, name: &str) -> Option<String> {
+        let path = self.path.as_ref()?;
+        let tokens = self.tokens(path).ok()?;
+        tokens
+            .into_iter()
+            .find(|token| token.name == name)
+            .map(|token| token.namespace)
     }
 
     /// Checks a request's `authorization` header for `needed`.
