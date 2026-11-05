@@ -18,6 +18,7 @@
 
 pub mod audit;
 pub mod auth;
+mod limits;
 mod push;
 mod tls;
 mod workers;
@@ -25,6 +26,7 @@ mod workflows;
 
 pub use audit::Audit;
 pub use auth::{Authenticator, Permission, Principal, Refusal};
+pub use limits::Limits;
 pub use push::{Config, PushEndpoint};
 pub use tls::Tls;
 
@@ -82,9 +84,19 @@ pub async fn serve_with(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     push::start(&engine, config).map_err(std::io::Error::other)?;
-    axum::serve(listener, router_secured(engine, security))
-        .with_graceful_shutdown(shutdown)
-        .await
+    let connections = tls::Connections {
+        places: Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections)),
+        header_timeout: Duration::from_millis(config.limits.header_timeout_ms),
+    };
+    let security = security.with_limits(config.limits.clone());
+    tls::serve(
+        router_secured(engine, security),
+        listener,
+        None,
+        connections,
+        shutdown,
+    )
+    .await
 }
 
 /// [`serve_with`], over TLS (ADR 0042).
@@ -97,7 +109,19 @@ pub async fn serve_tls(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     push::start(&engine, config).map_err(std::io::Error::other)?;
-    tls::serve(router_secured(engine, security), listener, tls, shutdown).await
+    let connections = tls::Connections {
+        places: Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections)),
+        header_timeout: Duration::from_millis(config.limits.header_timeout_ms),
+    };
+    let security = security.with_limits(config.limits.clone());
+    tls::serve(
+        router_secured(engine, security),
+        listener,
+        Some(tls),
+        connections,
+        shutdown,
+    )
+    .await
 }
 
 /// The routes, gRPC and HTTP/JSON, for serving with axum or another tower server.
@@ -157,6 +181,7 @@ enum Kind {
     Internal,
     Unauthenticated,
     Forbidden,
+    RateLimited,
 }
 
 /// The server's authentication and audit log (ADR 0041).
@@ -166,6 +191,7 @@ pub struct Security {
     pub auth: Authenticator,
     /// What was done.
     pub audit: Audit,
+    limiter: limits::Limiter,
 }
 
 impl Security {
@@ -174,6 +200,7 @@ impl Security {
         Ok(Security {
             auth: Authenticator::for_dir(dir),
             audit: Audit::open(dir)?,
+            limiter: limits::Limiter::new(Limits::default()),
         })
     }
 
@@ -182,7 +209,14 @@ impl Security {
         Security {
             auth: Authenticator::none(),
             audit: Audit::none(),
+            limiter: limits::Limiter::new(Limits::none()),
         }
+    }
+
+    /// Applies these limits.
+    pub fn with_limits(mut self, limits: Limits) -> Security {
+        self.limiter = limits::Limiter::new(limits);
+        self
     }
 }
 
@@ -242,35 +276,81 @@ async fn authorize(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let refusal = match api.security.auth.check(header, needed) {
-        Ok(principal) => return PRINCIPAL.scope(principal, next.run(request)).await,
-        Err(refusal) => refusal,
-    };
     let path = request.uri().path().to_owned();
     let grpc = request
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("application/grpc"));
-    // No handler runs, so no principal is set: the log is told who was refused. A caller without a
-    // valid token is `unauthenticated`, whatever it claimed.
-    let (kind, who, message) = match refusal {
-        Refusal::Unauthenticated(message) => {
-            (Kind::Unauthenticated, "unauthenticated".to_owned(), message)
+    let principal = match api.security.auth.check(header, needed) {
+        Ok(principal) => principal,
+        // A caller without a valid token is `unauthenticated`, whatever it claimed.
+        Err(Refusal::Unauthenticated(message)) => {
+            refused(&api, "unauthenticated", action, path, &message).await;
+            let kind = Kind::Unauthenticated;
+            return respond(Failure { kind, message }, grpc, None);
         }
-        Refusal::Forbidden(who, message) => (Kind::Forbidden, who, message),
+        Err(Refusal::Forbidden(who, message)) => {
+            refused(&api, &who, action, path, &message).await;
+            let kind = Kind::Forbidden;
+            return respond(Failure { kind, message }, grpc, None);
+        }
+    };
+    let limiter = &api.security.limiter;
+    // Workers are limited by their capacity: a rate limit would only delay finished work.
+    if needed != Permission::Work
+        && let Err(wait) = limiter.admit(principal.name())
+    {
+        let message = format!("`{}` is over its rate limit", principal.name());
+        refused(&api, principal.name(), action, path, &message).await;
+        let kind = Kind::RateLimited;
+        return respond(Failure { kind, message }, grpc, Some(wait));
+    }
+    // Held until the answer: a stream's permit goes back when its headers are sent.
+    let Ok(_permit) = Arc::clone(&limiter.requests).try_acquire_owned() else {
+        let message = "the server is at its limit of concurrent requests".to_owned();
+        refused(&api, principal.name(), action, path, &message).await;
+        let kind = Kind::Unavailable;
+        return respond(Failure { kind, message }, grpc, Some(RETRY_SOON));
+    };
+    PRINCIPAL.scope(principal, next.run(request)).await
+}
+
+/// The retry hint when nothing says how long the wait will be.
+const RETRY_SOON: Duration = Duration::from_secs(1);
+
+/// Records a refused request, unless too many are arriving to record them all.
+async fn refused(api: &Api, who: &str, action: &'static str, path: String, message: &str) {
+    let Some(unrecorded) = api.security.limiter.record_refusal() else {
+        return;
+    };
+    let outcome = if unrecorded == 0 {
+        format!("refused: {message}")
+    } else {
+        format!("refused: {message} ({unrecorded} earlier refusals were not recorded)")
     };
     PRINCIPAL
         .scope(
-            Principal::Token(who),
-            api.audit(action, path, format!("refused: {message}")),
+            Principal::Token(who.to_owned()),
+            api.audit(action, path, outcome),
         )
         .await;
-    let failure = Failure { kind, message };
-    if grpc {
-        return tonic::Status::from(failure).into_http();
+}
+
+/// A refusal in its transport's form, with a retry hint if there is one.
+fn respond(failure: Failure, grpc: bool, retry: Option<Duration>) -> Response {
+    let seconds = retry.map(|retry| retry.as_secs_f64().ceil().max(1.0) as u64);
+    let mut response = if grpc {
+        tonic::Status::from(failure).into_http()
+    } else {
+        failure.into_response()
+    };
+    if let Some(seconds) = seconds {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, seconds.into());
     }
-    failure.into_response()
+    response
 }
 
 impl Failure {
@@ -299,7 +379,7 @@ impl From<EngineError> for Failure {
             | EngineError::HandlerFailed(_)
             | EngineError::Unsupported(_) => Kind::Rejected,
             EngineError::InvalidPayload(_) => Kind::Invalid,
-            EngineError::Stopped(_) => Kind::Unavailable,
+            EngineError::Stopped(_) | EngineError::Overloaded(_) => Kind::Unavailable,
             EngineError::Open(_) => Kind::Internal,
         };
         let message = match error {
@@ -322,6 +402,7 @@ impl From<Failure> for tonic::Status {
             Kind::Internal => tonic::Code::Internal,
             Kind::Unauthenticated => tonic::Code::Unauthenticated,
             Kind::Forbidden => tonic::Code::PermissionDenied,
+            Kind::RateLimited => tonic::Code::ResourceExhausted,
         };
         tonic::Status::new(code, failure.message)
     }
@@ -329,6 +410,7 @@ impl From<Failure> for tonic::Status {
 
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
+        let retry = self.kind == Kind::Unavailable;
         let status = match self.kind {
             Kind::NotFound => StatusCode::NOT_FOUND,
             Kind::Conflict => StatusCode::CONFLICT,
@@ -339,8 +421,15 @@ impl IntoResponse for Failure {
             Kind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Kind::Unauthenticated => StatusCode::UNAUTHORIZED,
             Kind::Forbidden => StatusCode::FORBIDDEN,
+            Kind::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         };
-        (status, Json(json!({ "error": self.message }))).into_response()
+        let mut response = (status, Json(json!({ "error": self.message }))).into_response();
+        if retry {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, 1.into());
+        }
+        response
     }
 }
 

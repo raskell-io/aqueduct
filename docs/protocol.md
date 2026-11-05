@@ -24,7 +24,8 @@ gives the HTTP/JSON form of each call.
   - `INVALID_ARGUMENT` / 400: a payload is not JSON, or a key is invalid;
   - `DEADLINE_EXCEEDED` / 504: a wait or an update timed out;
   - `FAILED_PRECONDITION` / 422: an update was rejected, or a resolution does not match its schema;
-  - `UNAVAILABLE` / 503: the server is overloaded or stopping; retry later;
+  - `UNAVAILABLE` / 503: the server is at a limit or stopping; retry later (`retry-after`);
+  - `RESOURCE_EXHAUSTED` / 429: the caller is over its rate limit; retry after `retry-after` seconds;
   - `UNAUTHENTICATED` / 401: no token, or one the server does not know;
   - `PERMISSION_DENIED` / 403: the token lacks the permission.
 - **Authentication** (ADR 0041). If the server's data directory has tokens, every request carries one:
