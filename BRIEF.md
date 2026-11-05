@@ -576,7 +576,7 @@ tens of millions of pending timers per cluster without memory growth.
 
 | Mode | What runs | Storage | Availability | Use |
 |---|---|---|---|---|
-| **Embedded** | engine inside the application process | local file (redb or fjall) | the process | CLIs, desktop, single binary services, tests |
+| **Embedded** | engine inside the application process | local files (our log, redb for checkpoints; ADR 0009) | the process | CLIs, desktop, single binary services, tests |
 | **Single server** | `aqueduct server` + workers or push endpoints | local file | the server | small teams, departments, staging, edge sites |
 | **Cluster** | 3+ `aqueduct server` nodes | local per node, Raft replicated, snapshots to object storage | minority node loss tolerated | production platforms |
 
@@ -625,7 +625,7 @@ must be derived from that measurement, and throughput targets depend on group co
 | Embedded: three-step workflows completed per second | 5,000+ |
 | Embedded: start to first step dispatched, p99, fsync on | under 15 ms on macOS (ADR 0003); Linux to be measured |
 | Embedded: start to first step dispatched, p99, `Durability::Os` | under 5 ms |
-| Procedure interpreter: decisions per second per core | set in phase 2 |
+| Procedure interpreter: decisions per second per core | not set: not measured yet |
 | Single server: run starts per second over gRPC | 10,000+ |
 | Cluster: throughput scaling from 3 to 9 nodes | at least 2.5x |
 | Recovery: leader failover to first new dispatch, p99 | under 3 s |
