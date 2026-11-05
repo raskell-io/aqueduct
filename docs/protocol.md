@@ -1,7 +1,7 @@
 # Aqueduct service protocol, version 1 (draft)
 
-Status: **draft** (ADR 0038). `aqueduct server` serves the ingress (section 2) and step workers
-(section 3); `aqueduct-worker` is a Rust library for writing a step worker. Messages and routes may change until the format and protocol freeze in
+Status: **draft** (ADR 0038). `aqueduct server` serves all of it: the ingress (section 2), step workers
+(section 3), workflow workers (section 4) and imports (section 5). Messages and routes may change until the format and protocol freeze in
 phase 5; after that, changes within v1 are additive. The protobuf definitions in
 [`proto/aqueduct/v1`](../proto/aqueduct/v1) are the source of truth; this document explains them and
 gives the HTTP/JSON form of each call.
@@ -31,8 +31,8 @@ gives the HTTP/JSON form of each call.
 - **Authentication** (ADR 0041). If the server's data directory has tokens, every request carries one:
   `authorization: Bearer <token>`, as an HTTP header or gRPC metadata. The permissions are `read` (wait,
   describe, list, query, list escalations), `start`, `signal` (signals, awakeables, updates), `cancel`,
-  `resolve`, `work` (step and workflow workers) and `admin` (everything). Calling an object's handler needs
-  `signal`; reading its state, `read`.
+  `resolve`, `work` (step and workflow workers) and `admin` (everything, and imports). Calling an object's handler
+  needs `signal`; reading its state, `read`. Every refusal, and every change, is in the audit log.
 - **Namespaces** (ADR 0046). A token is bound to a namespace, or to `*`. Keys, run ids and escalation ids are
   in the caller's namespace: another's are `NOT_FOUND`. A request may name its namespace in an
   `aqueduct-namespace` header or metadata. A bound token may name only its own (otherwise, or for an invalid
@@ -81,6 +81,7 @@ The worker opens the `Work` stream and sends a `Hello` with:
 - its name;
 - the step names it implements;
 - its capacity: how many invocations it runs at once.
+- optionally, named task queues to take from as well (section 3.3).
 
 Then it receives `StepInvocation`s, never more than its outstanding credit. For each, it answers with
 a `StepResult` holding the invocation's `invocation_id` and one of:
@@ -95,7 +96,7 @@ Each finished invocation returns one unit of credit implicitly. A `credit` messa
 
 | call | body | answer |
 |---|---|---|
-| `POST /v1/workers/poll` | `{"worker", "steps": [...], "max", "wait_ms"}` | `{"invocations": [...]}`, empty after `wait_ms` |
+| `POST /v1/workers/poll` | `{"worker", "steps": [...], "queues"?: [...], "max", "wait_ms"}` | `{"invocations": [...]}`, empty after `wait_ms` |
 | `POST /v1/workers/results` | `{"results": [{"invocation_id", "completed" \| "failed" \| "retry"}]}` | `{}` |
 
 ### 3.3 Named task queues and push endpoints (ADR 0040)
@@ -155,9 +156,11 @@ stream ended without its commit. A run the server already has, as it was or gone
 `already_there`, so an import can be repeated.
 
 ## 6. Not in this draft yet
-- **Push endpoints:** the server calls an HTTP endpoint per invocation, for serverless platforms.
-- **Named task queues** and deployments across workers.
-- **OIDC/JWT and mTLS.** The server has TLS (ADR 0042), and binds to loopback by default;
+
+- **Deployments across workers:** version pinning and draining for worker code.
+- **Per-run priorities.**
+- **OIDC/JWT and mTLS.** The server has static tokens (ADR 0041) and TLS (ADR 0042). It binds to loopback by default;
   beyond loopback it needs tokens and a certificate.
-- **Version management** over the network (register, propose, prove, approve): for now through
-  `aqueduct versions` on the server's data directory, and the MCP server.
+- **Version management** over the network (register, propose, prove, approve): for now through `aqueduct versions` on
+  the server's data directory and the MCP server. A change takes effect when the server next starts.
+- **For workflow workers:** HTTP long polling, push endpoints, and queries.

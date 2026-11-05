@@ -8,8 +8,8 @@ the gates below are how the project holds it.
 
 ## Where the project is
 
-Aqueduct is in phase 1 of the [build brief](BRIEF.md): an embedded engine you can try, not yet one to
-depend on. Read the brief's principles (section 3) and the [decision records](docs/adr/) before proposing a
+Aqueduct is near the end of phase 3 of the [build brief](BRIEF.md): an embedded engine and a single server you can
+try, not yet ones to depend on. Read the brief's principles (section 3) and the [decision records](docs/adr/) before proposing a
 change. Discussing a change in an issue before implementing it is always welcome, and for anything that
 touches the journal, the guarantees or the public API, it is expected.
 

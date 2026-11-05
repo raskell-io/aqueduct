@@ -13,10 +13,17 @@ How Aqueduct is put together, and where new code belongs. The why is in the ADRs
 | `aqueduct-procedure` | Starlark procedures as deciders: hermetic, replayed by re-execution, budgeted. | core |
 | `aqueduct-sdk` | Rust workflows as `async fn`s: `WorkflowContext`, `join`, `select`, sagas. Each activation re-runs the function against the journal. | core |
 | `aqueduct-otel` | OpenTelemetry traces and metrics through the engine's `Observer`. | engine |
-| `aqueduct-cli` | The `aqueduct` command: inspect, verify, export, replay, signal, cancel, resolve, on a stopped engine's data directory. | engine, procedure |
+| `aqueduct-registry` | Procedure versions: provenance, evidence, approvals, the lifecycle, and the hash-chained log. | engine, procedure |
+| `aqueduct-ai` | Agent steps on Claude and OpenAI-compatible endpoints. | engine |
+| `aqueduct-protocol` | The protobuf service protocol, and commands to and from it. | core |
+| `aqueduct-server` | The ingress, step and workflow workers, imports, tokens, TLS, audit, limits, namespaces. | engine, protocol |
+| `aqueduct-worker` | A Rust library for step and workflow workers. | protocol, sdk |
+| `aqueduct-cli` | The `aqueduct` command: inspect, verify, export, replay, versions, `server`, `migrate`, `tokens`, `mcp`. Most commands work on a stopped engine's directory. | all of the above |
 | `aqueduct-sim` | The deterministic simulator: the real `Partition` on a simulated disk, network, clock and workers, with crashes, torn writes, failed syncs, lost and duplicated messages. | engine, sdk, procedure |
 | `aqueduct` | The facade users depend on, with the runnable examples. | all of the above |
-| `benches/*` | Storage and end-to-end engine benchmarks. Results go to `docs/measurements/`. | |
+| `benches/*` | Storage, embedded engine and server benchmarks. Results go to `docs/measurements/`. | |
+| `conformance` | The suite every worker library passes, polling and as a push endpoint. | |
+| `sdks/*` | Step-worker libraries for Python and TypeScript, with no dependencies. | |
 | `xtask` | `cargo xtask sim`, `crash`, `crash-engine`, `fsync`. | |
 
 ## How a run flows
