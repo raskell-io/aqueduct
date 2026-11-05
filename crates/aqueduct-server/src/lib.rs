@@ -362,34 +362,21 @@ async fn authorize(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("application/grpc"));
-    let principal = match api.security.auth.check(header, needed) {
-        Ok(principal) => principal,
+    let (principal, token_namespace) = match api.security.auth.check_in(header, needed) {
+        Ok(checked) => checked,
         // A caller without a valid token is `unauthenticated`, whatever it claimed.
         Err(Refusal::Unauthenticated(message)) => {
             refused(&api, "unauthenticated", action, path, &message).await;
             let kind = Kind::Unauthenticated;
-            return respond(Failure { kind, message }, grpc, None);
+            return refuse(request, respond(Failure { kind, message }, grpc, None)).await;
         }
         Err(Refusal::Forbidden(who, message)) => {
             refused(&api, &who, action, path, &message).await;
             let kind = Kind::Forbidden;
-            return respond(Failure { kind, message }, grpc, None);
+            return refuse(request, respond(Failure { kind, message }, grpc, None)).await;
         }
     };
     // What it may reach: a token bound to a namespace cannot name another.
-    let token_namespace = match &principal {
-        // A token whose namespace cannot be told reaches nothing: it must never mean all of them.
-        Principal::Token(name) => match api.security.auth.token_namespace(name) {
-            Some(namespace) => Some(namespace),
-            None => {
-                let message = "this token's namespace cannot be read".to_owned();
-                refused(&api, principal.name(), action, path, &message).await;
-                let kind = Kind::Unauthenticated;
-                return respond(Failure { kind, message }, grpc, None);
-            }
-        },
-        Principal::Anyone => None,
-    };
     let named = request
         .headers()
         .get("aqueduct-namespace")
@@ -400,7 +387,7 @@ async fn authorize(
         Err(message) => {
             refused(&api, principal.name(), action, path, &message).await;
             let kind = Kind::Forbidden;
-            return respond(Failure { kind, message }, grpc, None);
+            return refuse(request, respond(Failure { kind, message }, grpc, None)).await;
         }
     };
     let limiter = &api.security.limiter;
@@ -410,7 +397,11 @@ async fn authorize(
         let message = format!("namespace `{}` is over its rate limit", context.namespace);
         refused(&api, principal.name(), action, path, &message).await;
         let kind = Kind::RateLimited;
-        return respond(Failure { kind, message }, grpc, Some(wait));
+        return refuse(
+            request,
+            respond(Failure { kind, message }, grpc, Some(wait)),
+        )
+        .await;
     }
     // Workers are limited by their capacity: a rate limit would only delay finished work.
     if needed != Permission::Work
@@ -419,17 +410,36 @@ async fn authorize(
         let message = format!("`{}` is over its rate limit", principal.name());
         refused(&api, principal.name(), action, path, &message).await;
         let kind = Kind::RateLimited;
-        return respond(Failure { kind, message }, grpc, Some(wait));
+        return refuse(
+            request,
+            respond(Failure { kind, message }, grpc, Some(wait)),
+        )
+        .await;
     }
     // Held until the answer: a stream's permit goes back when its headers are sent.
     let Ok(_permit) = Arc::clone(&limiter.requests).try_acquire_owned() else {
         let message = "the server is at its limit of concurrent requests".to_owned();
         refused(&api, principal.name(), action, path, &message).await;
         let kind = Kind::Unavailable;
-        return respond(Failure { kind, message }, grpc, Some(RETRY_SOON));
+        return refuse(
+            request,
+            respond(Failure { kind, message }, grpc, Some(RETRY_SOON)),
+        )
+        .await;
     };
     let scope = CALLER.scope(context, PRINCIPAL.scope(principal, next.run(request)));
     scope.await
+}
+
+/// Answers a request it refused. An HTTP/2 answer sent before the request's body has been read must reset
+/// the stream, and a client still sending fails that request with a transport error rather than this
+/// answer, however retryable the answer was; h2 also closes a connection after enough resets, which fails
+/// every other request on it. So a small body is read first, without waiting long for one that never ends.
+async fn refuse(request: axum::extract::Request, response: Response) -> Response {
+    const MOST: usize = 64 * 1024;
+    let body = axum::body::to_bytes(request.into_body(), MOST);
+    let _ = tokio::time::timeout(Duration::from_millis(20), body).await;
+    response
 }
 
 /// The retry hint when nothing says how long the wait will be.

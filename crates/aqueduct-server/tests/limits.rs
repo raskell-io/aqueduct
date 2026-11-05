@@ -402,3 +402,75 @@ fn limits_in_a_configuration_are_checked() {
     assert!(serde_json::from_value::<Config>(json!({"limits": {"max_conections": 5}})).is_err());
     assert_eq!(Config::default().limits, Limits::default());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shedding_answers_every_request_and_keeps_the_connection() {
+    let (server, _) = serve("shed", json!({"max_concurrent_requests": 1}), &[]).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", server.addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    // A waiting call holds the one place.
+    let mut client = IngressClient::new(channel.clone());
+    client
+        .start(v1::StartRequest {
+            key: "k".into(),
+            workflow: "waits".into(),
+            input: b"1".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let held = tokio::spawn({
+        let mut client = client.clone();
+        async move {
+            client
+                .wait(v1::WaitRequest {
+                    key: "k".into(),
+                    timeout_ms: 8_000,
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Many more refusals on this connection than h2 allows resets (1,024), from many callers at once:
+    // each gets the retryable answer, none a transport error.
+    let tasks: Vec<_> = (0..512)
+        .map(|task| {
+            let mut client = client.clone();
+            tokio::spawn(async move {
+                let mut codes = std::collections::BTreeMap::new();
+                for i in 0..20 {
+                    let answer = client
+                        .start(v1::StartRequest {
+                            key: format!("t{task}-{i}"),
+                            workflow: "waits".into(),
+                            input: b"1".to_vec(),
+                            ..Default::default()
+                        })
+                        .await;
+                    let code = answer.err().map_or(tonic::Code::Ok, |status| status.code());
+                    *codes.entry(format!("{code:?}")).or_insert(0) += 1;
+                }
+                codes
+            })
+        })
+        .collect();
+    let mut codes = std::collections::BTreeMap::new();
+    for task in tasks {
+        for (code, count) in task.await.unwrap() {
+            *codes.entry(code).or_insert(0) += count;
+        }
+    }
+    // (A slow machine may outlast the waiting call, and a few of the last then start: that is fine.)
+    let shed = codes.remove("Unavailable").unwrap_or(0);
+    codes.remove("Ok");
+    assert!(codes.is_empty(), "transport errors: {codes:?}");
+    assert!(shed > 1024, "only {shed} requests were shed");
+    // The call on the same connection got its own answer: it did not fail with the connection.
+    let waited = held.await.unwrap().unwrap_err();
+    assert_eq!(waited.code(), tonic::Code::DeadlineExceeded, "{waited}");
+    let _ = std::fs::remove_dir_all(&server.dir);
+}

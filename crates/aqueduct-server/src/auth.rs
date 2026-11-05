@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -255,6 +255,9 @@ pub enum Refusal {
     Forbidden(String, String),
 }
 
+/// The tokens file as last read: its modification time, size and tokens.
+type CachedTokens = (SystemTime, u64, Arc<Vec<Token>>);
+
 /// Checks requests against a data directory's tokens file, which it reads again when it changes, so
 /// a token created or revoked takes effect without a restart: the first token created turns
 /// authentication on at once. Once it has seen tokens, a missing file refuses every request: losing the
@@ -264,7 +267,7 @@ pub struct Authenticator {
     path: Option<PathBuf>,
     /// Whether the tokens file has been seen, in this process.
     seen: std::sync::atomic::AtomicBool,
-    cached: Mutex<Option<(SystemTime, u64, Vec<Token>)>>,
+    cached: Mutex<Option<CachedTokens>>,
 }
 
 impl Authenticator {
@@ -303,7 +306,7 @@ impl Authenticator {
         exists
     }
 
-    fn tokens(&self, path: &Path) -> Result<Vec<Token>, String> {
+    fn tokens(&self, path: &Path) -> Result<Arc<Vec<Token>>, String> {
         let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let modified = metadata
             .modified()
@@ -319,21 +322,11 @@ impl Authenticator {
             && *at == modified
             && *size == metadata.len()
         {
-            return Ok(tokens.clone());
+            return Ok(Arc::clone(tokens));
         }
-        let tokens = read_file(path)?.tokens;
-        *cached = Some((modified, metadata.len(), tokens.clone()));
+        let tokens = Arc::new(read_file(path)?.tokens);
+        *cached = Some((modified, metadata.len(), Arc::clone(&tokens)));
         Ok(tokens)
-    }
-
-    /// The namespace of the named token: `*` for all.
-    pub fn token_namespace(&self, name: &str) -> Option<String> {
-        let path = self.path.as_ref()?;
-        let tokens = self.tokens(path).ok()?;
-        tokens
-            .into_iter()
-            .find(|token| token.name == name)
-            .map(|token| token.namespace)
     }
 
     /// Checks a request's `authorization` header for `needed`.
@@ -342,11 +335,22 @@ impl Authenticator {
         authorization: Option<&str>,
         needed: Permission,
     ) -> Result<Principal, Refusal> {
+        self.check_in(authorization, needed)
+            .map(|(principal, _)| principal)
+    }
+
+    /// [`Authenticator::check`], with the namespace of the token (`*` for all), if there is a token. The
+    /// same lookup answers both, so a token that passes always has its namespace.
+    pub fn check_in(
+        &self,
+        authorization: Option<&str>,
+        needed: Permission,
+    ) -> Result<(Principal, Option<String>), Refusal> {
         if !self.is_enabled() {
-            return Ok(Principal::Anyone);
+            return Ok((Principal::Anyone, None));
         }
         let Some(path) = &self.path else {
-            return Ok(Principal::Anyone);
+            return Ok((Principal::Anyone, None));
         };
         let secret = authorization
             .and_then(|value| value.strip_prefix("Bearer "))
@@ -373,7 +377,10 @@ impl Authenticator {
                 ),
             ));
         }
-        Ok(Principal::Token(token.name.clone()))
+        Ok((
+            Principal::Token(token.name.clone()),
+            Some(token.namespace.clone()),
+        ))
     }
 }
 

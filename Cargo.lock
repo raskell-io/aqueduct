@@ -124,6 +124,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqueduct-bench-server"
+version = "0.0.0"
+dependencies = [
+ "aqueduct-core",
+ "aqueduct-engine",
+ "aqueduct-procedure",
+ "aqueduct-protocol",
+ "aqueduct-sdk",
+ "aqueduct-server",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "aqueduct-bench-storage"
 version = "0.0.0"
 dependencies = [

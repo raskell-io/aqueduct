@@ -52,3 +52,8 @@ work with no outside services; OIDC/JWT follows for teams with an identity provi
 - The audit log proves order and integrity against later edits, not against someone who rewrites the
   whole file from the start. Anchoring its head elsewhere would close that, as for run histories.
 - Namespaces (phase 3) will scope permissions per tenant.
+
+**Measured on 2026-11-05** ([docs/measurements/2026-11-05-server-m4.md](../measurements/2026-11-05-server-m4.md)):
+syncing each audit line on its own capped a server at about 250 actions per second, so concurrent lines now
+share one write and one sync. A line is still synced before its request is answered. Audited starts reach 8,300
+to 9,400 per second at 256 clients, against 12,500 to 16,700 without tokens.

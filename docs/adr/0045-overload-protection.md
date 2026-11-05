@@ -54,3 +54,10 @@ Configured under `"limits"` in the server's configuration:
   section 5.4 exist), and a call's inbox depth, other than through `max_running_runs` and the rate limit.
 - **`aqueduct_server::serve`** stays without limits, for programs that embed the server and protect it
   themselves. `serve_with` and `serve_tls` apply them.
+
+**Measured on 2026-11-05** ([docs/measurements/2026-11-05-server-m4.md](../measurements/2026-11-05-server-m4.md)):
+refusing a request before reading its body reset the HTTP/2 stream, which could fail that request with a
+transport error, and after enough resets, the connection. Refusals now read a small body first (at most 64 KiB,
+for at most 20 ms). With 16 times as many clients as places, a server keeps starting 12,000 to 13,800 runs per
+second, with no errors. With `max_running_runs` set, 100,000 parked runs halve start throughput, because the
+count is recomputed by scanning every run after each flush; this is not fixed yet.
