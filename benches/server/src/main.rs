@@ -747,9 +747,9 @@ fn drain(count: usize, namespaces: usize, durability: Durability) {
     let who = Who::of(&server, None);
     let done = Arc::new(AtomicU64::new(0));
     let runtime = client_runtime();
-    let elapsed = runtime.block_on(async {
+    let begin = Instant::now();
+    let handed_out = runtime.block_on(async {
         let channels = channels(server.addr, 8).await;
-        let begin = Instant::now();
         for channel in channels.iter().take(4) {
             tokio::spawn(step_worker(
                 channel.clone(),
@@ -770,10 +770,32 @@ fn drain(count: usize, namespaces: usize, durability: Durability) {
         }
         begin.elapsed()
     });
+    // Results are journaled after workers have them: the run is done when that is durable.
+    while server
+        .engine
+        .runs()
+        .unwrap()
+        .iter()
+        .any(|run| run.status == aqueduct_core::Status::Running)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let completed = begin.elapsed();
+    let finished = server
+        .engine
+        .runs()
+        .unwrap()
+        .iter()
+        .filter(|run| run.status == aqueduct_core::Status::Completed)
+        .count();
+    assert_eq!(finished as u64, total, "not every run completed");
     runtime.shutdown_background();
     #[allow(clippy::cast_precision_loss)]
-    let rate = total as f64 / elapsed.as_secs_f64();
-    println!("| {total} | {namespaces} | {rate:.0} |");
+    let (out, done) = (
+        total as f64 / handed_out.as_secs_f64(),
+        total as f64 / completed.as_secs_f64(),
+    );
+    println!("| {total} | {namespaces} | {out:.0} | {done:.0} |");
 }
 
 fn cell(setup: &Setup, label: &str, clients: usize, seconds: f64, namespace: Option<&'static str>) {
@@ -935,10 +957,18 @@ fn main() {
 
     if wanted("drain") {
         println!("\n## Draining a queued backlog (`Fsync`, 4 gRPC workers)\n");
-        println!("| steps | namespaces | steps per second |\n|---:|---:|---:|");
-        let count = if quick { 2_000 } else { 20_000 };
-        for namespaces in [1, 8, 64] {
-            drain(count, namespaces, Durability::Fsync);
+        println!(
+            "| steps | namespaces | handed to workers per second | runs completed per second |\n|---:|---:|---:|---:|"
+        );
+        let counts: &[usize] = if quick {
+            &[2_000]
+        } else {
+            &[2_000, 20_000, 100_000]
+        };
+        for count in counts {
+            for namespaces in [1, 8, 64] {
+                drain(*count, namespaces, Durability::Fsync);
+            }
         }
     }
 }

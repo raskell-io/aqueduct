@@ -424,6 +424,8 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     dirty: BTreeSet<String>,
     deciders: Deciders,
     runs: BTreeMap<String, PartitionRun>,
+    /// How many runs are running in each namespace, not counting object loops.
+    running: BTreeMap<String, usize>,
     batch: Vec<Vec<u8>>,
     /// Entries of the batch for the observer: (run key, workflow, entry).
     observed: Vec<(String, String, Option<String>, Entry)>,
@@ -458,6 +460,23 @@ impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
             .field("deciders", &self.deciders)
             .finish()
     }
+}
+
+/// Whether a run counts as running while it is: an object's loop waits for calls, whoever is calling.
+fn counts_as_running(key: &str) -> bool {
+    !key.starts_with("$object/")
+}
+
+fn count_running(runs: &BTreeMap<String, PartitionRun>) -> BTreeMap<String, usize> {
+    let mut running = BTreeMap::new();
+    for (key, run) in runs {
+        if counts_as_running(key) && !run.state.status().is_terminal() {
+            *running
+                .entry(crate::namespaces::namespace_of(key).to_owned())
+                .or_default() += 1;
+        }
+    }
+    running
 }
 
 impl<L: LogStore> Partition<L> {
@@ -529,12 +548,14 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 },
             );
         }
+        let running = count_running(&runs);
         Ok(Partition {
             log,
             state,
             dirty,
             deciders,
             runs,
+            running,
             batch: Vec::new(),
             observed: Vec::new(),
             observer: None,
@@ -872,6 +893,17 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 chain: ChainWriter::new(id),
             },
         );
+        if counts_as_running(id)
+            && self
+                .runs
+                .get(id)
+                .is_some_and(|run| !run.state.status().is_terminal())
+        {
+            *self
+                .running
+                .entry(crate::namespaces::namespace_of(id).to_owned())
+                .or_default() += 1;
+        }
         for entry in &first.entries {
             self.log_entry(id, entry)?;
         }
@@ -1599,6 +1631,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// Writes and syncs the batch, then releases the messages that waited for it. On error the
     /// partition must be dropped and recovered.
     pub fn flush(&mut self) -> Result<Vec<Outbound>, StorageError> {
+        debug_assert_eq!(self.running, count_running(&self.runs));
         if !self.batch.is_empty() {
             let started = std::time::Instant::now();
             let records = self.batch.len();
@@ -1643,6 +1676,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// The runs, by key.
     pub fn runs(&self) -> &BTreeMap<String, PartitionRun> {
         &self.runs
+    }
+
+    /// How many runs are running in each namespace, not counting object loops. Kept up to date as runs
+    /// start and end: reading it costs nothing however many runs there are.
+    pub fn running(&self) -> &BTreeMap<String, usize> {
+        &self.running
     }
 
     /// One run.
@@ -1789,11 +1828,21 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 .runs
                 .get_mut(key)
                 .ok_or_else(|| PartitionError::Internal(format!("run {key} vanished")))?;
+            let was_terminal = run.state.status().is_terminal();
             run.state.apply(entry).map_err(|e| {
                 PartitionError::Internal(format!(
                     "run {key}: the core produced an invalid entry: {e}"
                 ))
             })?;
+            if !was_terminal && run.state.status().is_terminal() && counts_as_running(key) {
+                let namespace = crate::namespaces::namespace_of(key);
+                if let Some(count) = self.running.get_mut(namespace) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.running.remove(namespace);
+                    }
+                }
+            }
             self.log_entry(key, entry)?;
         }
         Ok(transition.effects)
