@@ -26,6 +26,8 @@ use aqueduct_registry::{
 };
 use aqueduct_storage::{FileLog, FileLogOptions, RedbStateStore};
 
+mod migrate;
+
 const USAGE: &str = "usage: aqueduct <command> <data-dir> [arguments]
 
 commands:
@@ -45,6 +47,12 @@ commands:
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
+  migrate --from <dir> --to <url> [--token-file <file>] [--ca <file>] [--dry-run]
+                                      move a data directory's runs and procedure versions to a
+                                      server (ADR 0047). The source is frozen first, and the server
+                                      applies the import when it next starts. The token needs admin:
+                                      from the file, or AQUEDUCT_TOKEN
+  migrate --from <dir> --abort        unfreeze a source whose migration did not finish
   server <dir> [--listen <address>] [--listen-anywhere] [--config <file.json>]
          [--tls-cert <file.pem> --tls-key <file.pem>]
                                       serve the directory's approved procedures over gRPC and
@@ -166,6 +174,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 lint_report(&procedure)
             ))
         }
+        Some("migrate") => migrate::migrate(&args[1..]),
         Some("versions") => versions(&args[1..]),
         Some("keys") => keys(&args[1..]),
         Some("mcp") => {
@@ -461,6 +470,10 @@ fn server_options(
 fn server(dir: &Path, args: &[String]) -> Result<String, String> {
     let (address, config, tls) = server_options(dir, args)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let notes = migrate::merge_pending_registry(dir)?;
+    for note in &notes {
+        eprintln!("import: {note}");
+    }
     let registry = Registry::open(dir).map_err(|e| e.to_string())?;
     // Steps run on step workers and push endpoints (ADR 0038, ADR 0040).
     let builder = aqueduct_engine::embedded::Engine::builder(dir)
@@ -471,6 +484,39 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
         .open()
         .map_err(|e| e.to_string())?;
     let security = aqueduct_server::Security::for_dir(dir)?;
+    for note in &notes {
+        security.audit.record("server", "import", "pending", note);
+    }
+    match engine.import_report() {
+        Some(aqueduct_engine::import::ImportReport {
+            rejected: Some(why),
+            ..
+        }) => {
+            eprintln!(
+                "import rejected, and set aside under {}: {why}",
+                dir.join("import").display()
+            );
+            security
+                .audit
+                .record("server", "import", "pending", &format!("rejected: {why}"));
+        }
+        Some(report) => {
+            eprintln!(
+                "import applied: {} runs added, {} already here",
+                report.imported, report.already_there
+            );
+            security.audit.record(
+                "server",
+                "import",
+                "pending",
+                &format!(
+                    "applied: {} runs added, {} already here",
+                    report.imported, report.already_there
+                ),
+            );
+        }
+        None => {}
+    }
     if !security.auth.is_enabled() {
         eprintln!(
             "no tokens in this directory: requests are not authenticated (aqueduct tokens create)"
@@ -532,6 +578,9 @@ pub(crate) fn lint_report(procedure: &Procedure) -> String {
 
 /// Loads a data directory with the registry's procedures, which answer queries and updates.
 fn load_procedures(dir: &Path) -> Result<Partition<FileLog, RedbStateStore>, String> {
+    if let Some(frozen) = aqueduct_engine::import::frozen(dir) {
+        return Err(frozen);
+    }
     let registry = Registry::open(dir).map_err(|e| e.to_string())?;
     let deciders = registry.deciders().map_err(|e| e.to_string())?;
     let mut partition = load_with(dir, deciders)?;
@@ -1330,6 +1379,9 @@ pub(crate) fn start_run(
         ),
         None => None,
     };
+    if let Some(frozen) = aqueduct_engine::import::frozen(dir) {
+        return Err(frozen);
+    }
     std::fs::create_dir_all(dir.join("log")).map_err(|e| e.to_string())?;
     let mut partition = load_with(dir, deciders)?;
     partition.set_time(

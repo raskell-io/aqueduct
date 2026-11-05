@@ -450,6 +450,9 @@ impl Builder {
 
     /// Opens the engine: recovers the log, resumes every run, and starts the threads.
     pub fn open(mut self) -> Result<Engine, EngineError> {
+        if let Some(frozen) = crate::import::frozen(&self.dir) {
+            return Err(EngineError::Open(frozen));
+        }
         for (name, version) in std::mem::take(&mut self.activations) {
             self.deciders
                 .activate(&name, &version)
@@ -459,7 +462,13 @@ impl Builder {
             .map_err(|e| EngineError::Open(e.to_string()))?;
         let state = RedbStateStore::open(&self.dir.join("state.redb"))
             .map_err(|e| EngineError::Open(e.to_string()))?;
-        let mut partition = Partition::recover_with_state(log, state, self.deciders)
+        let mut partition = Partition::load_with_state(log, state, self.deciders)
+            .map_err(|e| EngineError::Open(e.to_string()))?;
+        // Before any run acts: an import is applied whole (ADR 0047).
+        let import =
+            crate::import::apply_pending(&mut partition, &self.dir).map_err(EngineError::Open)?;
+        partition
+            .resume()
             .map_err(|e| EngineError::Open(e.to_string()))?;
         partition.inject_ack_before_sync(self.ack_before_sync);
         partition.set_default_retry_policy(self.default_retry);
@@ -529,6 +538,8 @@ impl Builder {
             workers,
             queue,
             activations: activation_queue,
+            dir: self.dir,
+            import,
         })
     }
 }
@@ -540,9 +551,31 @@ pub struct Engine {
     workers: Vec<JoinHandle<()>>,
     queue: Option<Arc<crate::queue::StepQueue>>,
     activations: Option<Arc<crate::activations::ActivationQueue>>,
+    dir: PathBuf,
+    import: Option<crate::import::ImportReport>,
 }
 
 impl Engine {
+    /// What opening did with a pending import (ADR 0047), if there was one.
+    pub fn import_report(&self) -> Option<&crate::import::ImportReport> {
+        self.import.as_ref()
+    }
+
+    /// Starts an upload into this engine's data directory (ADR 0047).
+    pub fn begin_import(&self) -> Result<crate::import::Stage, String> {
+        crate::import::Stage::begin(&self.dir)
+    }
+
+    /// A run's journal, by its run id.
+    pub fn history(&self, run: &str) -> Result<Option<Vec<aqueduct_core::Entry>>, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::History {
+            run: run.to_owned(),
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
     /// The queue of steps for remote workers, if the engine has remote steps
     /// ([`Builder::remote_steps`]).
     pub fn step_queue(&self) -> Option<&Arc<crate::queue::StepQueue>> {
@@ -910,6 +943,10 @@ impl Drop for Engine {
 }
 
 enum Request {
+    History {
+        run: String,
+        reply: Sender<Result<Option<Vec<aqueduct_core::Entry>>, EngineError>>,
+    },
     Start {
         key: String,
         workflow: String,
@@ -1307,6 +1344,12 @@ impl Processor {
                 };
                 self.deferred.push(Box::new(move || {
                     let _ = reply.send(answer);
+                }));
+            }
+            Request::History { run, reply } => {
+                let history = self.partition.history(&run).map_err(|e| e.to_string())?;
+                self.deferred.push(Box::new(move || {
+                    let _ = reply.send(Ok(history));
                 }));
             }
             Request::Runs { reply } => {

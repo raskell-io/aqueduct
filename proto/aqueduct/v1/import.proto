@@ -1,0 +1,73 @@
+// Aqueduct import API, version 1 (draft, ADR 0047).
+//
+// `aqueduct migrate` moves a data directory's runs and procedure versions to a server. What it uploads
+// is staged on the server, and applied, all of it or none of it, when the server next starts.
+
+syntax = "proto3";
+
+package aqueduct.v1;
+
+service Imports {
+  // One import: an ImportBegin, then runs, sources and files, then an ImportCommit. A stream that ends
+  // without its commit leaves nothing behind. Needs the `admin` permission, in the default namespace.
+  rpc Upload(stream ImportMessage) returns (ImportReceipt);
+}
+
+message ImportMessage {
+  oneof message {
+    ImportBegin begin = 1;
+    ImportRun run = 2;
+    ImportSource source = 3;
+    ImportFile file = 4;
+    ImportCommit commit = 5;
+  }
+}
+
+message ImportBegin {
+  // Where it comes from, for the audit log.
+  string source = 1;
+}
+
+// Part of a run's history, in the history format. A long history is sent in several messages.
+message ImportRun {
+  string run_id = 1;
+  repeated bytes records = 2;
+  // Whether this is the last part of this run's history.
+  bool last = 3;
+}
+
+// A procedure version's source.
+message ImportSource {
+  // The version id: the SHA-256 of the source.
+  string version = 1;
+  bytes text = 2;
+}
+
+enum ImportFileKind {
+  IMPORT_FILE_KIND_UNSPECIFIED = 0;
+  // The registry's event log.
+  IMPORT_FILE_KIND_EVENTS = 1;
+  // The registry's policy.
+  IMPORT_FILE_KIND_POLICY = 2;
+  // The registry's identities.
+  IMPORT_FILE_KIND_IDENTITIES = 3;
+}
+
+message ImportFile {
+  ImportFileKind kind = 1;
+  bytes data = 2;
+}
+
+// Everything was sent: these counts must match what arrived.
+message ImportCommit {
+  uint64 runs = 1;
+  uint64 sources = 2;
+}
+
+message ImportReceipt {
+  // Runs staged.
+  uint64 runs = 1;
+  // Of those, how many the server has already: the same history, or one that went on from it.
+  uint64 already_there = 2;
+  uint64 sources = 3;
+}

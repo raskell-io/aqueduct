@@ -12,6 +12,7 @@ mod agent;
 pub mod counterfactual;
 pub mod drift;
 pub mod embedded;
+pub mod import;
 pub mod metrics;
 pub mod namespaces;
 pub mod objects;
