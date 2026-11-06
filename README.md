@@ -13,9 +13,8 @@
 
 > **Status: single server (phase 3 of the [build brief](BRIEF.md)).** The embedded engine, procedures, agent steps
 > and the version registry are built. So is a server with workers in Rust, Python and TypeScript, deployments,
-> priorities, tokens, TLS, an audit log, namespaces and overload protection: every item of phase 3. One target is
-> not met: with tokens and the audit log, the server starts fewer than 10,000 runs a second. A replicated cluster
-> is planned and not started.
+> priorities, tokens, TLS, an audit log, namespaces and overload protection: every item of phase 3. A replicated
+> cluster is planned and not started.
 >
 > You can try it, but do not depend on it yet: the APIs and the history format will still change, and nothing
 > is published on crates.io. See [what is not done](#what-is-not-done), the [docs](docs/README.md) and the
@@ -246,12 +245,14 @@ and steps that do nothing ([measurements](docs/measurements/2026-11-05-server-m4
 | | |
 |---|---|
 | run starts per second over gRPC, 256 clients, no tokens | 12,500 to 16,700 (target: 10,000) |
-| the same, with tokens and the audit log | 8,300 to 9,400 (**below the target**) |
+| the same, with tokens and the audit log | 8,300 to 10,300: about the target, by load ([ADR 0050](docs/adr/0050-single-server-target.md)) |
 | the same, one client | about 200, or 120 with tokens: each waits for one flush, or two |
 | start to first step at a worker, p50, one client | about 4.5 ms |
 
-The embedded engine's numbers are in [its own measurements](docs/measurements/2026-10-31-engine-m4.md). Linux and TLS
-are not measured.
+On a GitHub-hosted Linux runner, where a sync costs about 0.18 ms rather than 4 ms, the same server starts 17,200 runs a
+second, and 14,400 with tokens and the audit log ([measurement](docs/measurements/2026-11-06-server-linux-runner.md)).
+The embedded engine's numbers are in [its own measurements](docs/measurements/2026-10-31-engine-m4.md). TLS is not
+measured.
 
 ## Guarantees
 
@@ -302,7 +303,7 @@ engine, not the server, whose transports have tests of their own, which are narr
 - **Isolation of code and disk between tenants:** namespaces separate runs and data, not workflow definitions, and
   they share one partition ([ADR 0046](docs/adr/0046-namespaces.md)).
 - **Workflow workers** have no HTTP long polling or push, and do not answer queries.
-- **Measurements:** none on Linux for the server, with TLS, with real payloads, or with long runs.
+- **Measurements:** none on a quiet reference machine, with TLS, with real payloads, or with long runs.
 
 ## Testing it yourself
 

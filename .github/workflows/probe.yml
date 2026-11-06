@@ -10,6 +10,7 @@ on:
       - .github/workflows/probe.yml
       - xtask/src/fsync.rs
       - benches/storage/**
+      - benches/server/**
 
 permissions:
   contents: read
@@ -30,3 +31,25 @@ jobs:
         run: cargo xtask fsync | tee -a "$GITHUB_STEP_SUMMARY"
       - name: storage benchmark
         run: cargo run --release -p aqueduct-bench-storage | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The single-server benchmark (benches/server): run starts, tokens and the audit log, overload,
+  # workers. On a hosted runner, beside other tenants: a Linux data point, not a reference.
+  server:
+    name: server benchmark (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: machine
+        run: |
+          { echo '```'; nproc; lscpu | head -20; free -g; df -h .; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: fsync
+        run: cargo xtask fsync | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: server benchmark
+        run: cargo run --release -p aqueduct-bench-server | tee -a "$GITHUB_STEP_SUMMARY"
