@@ -59,6 +59,11 @@ export interface WorkerOptions {
   capacity?: number;
   /** How long one poll waits for work, in milliseconds. Default 10,000. */
   pollMs?: number;
+  /**
+   * The build this worker runs (ADR 0048): it then takes steps of runs pinned to this build, and of runs
+   * not pinned, and leaves other builds' steps to their workers.
+   */
+  deployment?: string;
   /** A token with the `work` permission, if the server has authentication. */
   token?: string;
 }
@@ -83,6 +88,7 @@ export class Worker {
   readonly capacity: number;
   readonly pollMs: number;
   #token: string | undefined;
+  #deployment: string | undefined;
   #steps = new Map<string, Step>();
   #stopping = false;
   #abort = new AbortController();
@@ -93,6 +99,7 @@ export class Worker {
     this.capacity = Math.max(1, options.capacity ?? 4);
     this.pollMs = options.pollMs ?? 10_000;
     this.#token = options.token;
+    this.#deployment = options.deployment;
   }
 
   /** Implements step `name`. */
@@ -167,6 +174,7 @@ export class Worker {
           steps,
           max: 1,
           wait_ms: this.pollMs,
+          ...(this.#deployment === undefined ? {} : { deployment: this.#deployment }),
         });
       } catch {
         // The server is unreachable or restarting (or the worker is stopping): try again shortly.

@@ -25,6 +25,9 @@ worker.run()
   them from 1.
 - `capacity` threads each run one step at a time; `worker.stop()` ends `run()`.
 
+If this worker's steps belong to a release, announce it with `Worker(..., deployment="2026.11.5")`
+(ADR 0048): it then takes steps of runs pinned to that build, and of runs not pinned.
+
 If the server has authentication, give the worker a token with the `work` permission: `Worker(..., token="aqd_...")`. For an `https://` server with a private CA or self-signed certificate, add `ca_file="ca.pem"`.
 
 **As a push endpoint** (for serverless platforms; ADR 0040), the same steps answer the server's

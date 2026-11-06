@@ -39,6 +39,20 @@ fn activation(activation: Activation) -> v1::Activation {
     }
 }
 
+/// A worker counted as connected, until its session ends however it ends.
+struct Connected {
+    queue: Arc<ActivationQueue>,
+    workflows: Arc<Vec<String>>,
+    build: Option<String>,
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        self.queue
+            .disconnected(&self.workflows, self.build.as_deref());
+    }
+}
+
 type ServeStream = std::pin::Pin<
     Box<dyn tokio_stream::Stream<Item = Result<v1::WorkflowServerMessage, tonic::Status>> + Send>,
 >;
@@ -70,6 +84,13 @@ impl v1::workflows_server::Workflows for Api {
             SESSIONS.fetch_add(1, Ordering::Relaxed)
         );
         let workflows = Arc::new(hello.workflows);
+        let build = (!hello.deployment.is_empty()).then_some(hello.deployment);
+        queue.connected(&workflows, build.as_deref());
+        let connected = Connected {
+            queue: Arc::clone(&queue),
+            workflows: Arc::clone(&workflows),
+            build: build.clone(),
+        };
         let credit = Arc::new(AtomicU32::new(hello.capacity.max(1)));
         let closed = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(Notify::new());
@@ -119,7 +140,7 @@ impl v1::workflows_server::Workflows for Api {
         }
 
         tokio::spawn(serve_activations(
-            queue, scope, session, workflows, credit, closed, changed, out,
+            connected, queue, scope, build, session, workflows, credit, closed, changed, out,
         ));
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(stream),
@@ -129,8 +150,11 @@ impl v1::workflows_server::Workflows for Api {
 
 #[allow(clippy::too_many_arguments)]
 async fn serve_activations(
+    // Counted as connected for as long as this runs.
+    _connected: Connected,
     queue: Arc<ActivationQueue>,
     scope: Scope,
+    build: Option<String>,
     session: String,
     workflows: Arc<Vec<String>>,
     credit: Arc<AtomicU32>,
@@ -144,14 +168,16 @@ async fn serve_activations(
             changed.notified().await;
             continue;
         }
-        let (taking, names, name, scope) = (
+        let (taking, names, name, scope, running) = (
             Arc::clone(&queue),
             Arc::clone(&workflows),
             session.clone(),
             scope.clone(),
+            build.clone(),
         );
         let taken = tokio::task::spawn_blocking(move || {
-            taking.wait_take_in(&scope, &name, &names, available as usize, TAKE_WAIT)
+            let build = running.as_deref();
+            taking.wait_take_for(&scope, build, &name, &names, available as usize, TAKE_WAIT)
         })
         .await
         .unwrap_or_default();

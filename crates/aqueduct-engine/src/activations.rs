@@ -49,6 +49,8 @@ struct Entry {
     place: u64,
     /// The activation ids handed out for the run.
     ids: Vec<String>,
+    /// The build the run is pinned to (ADR 0048), if any.
+    version: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -58,13 +60,18 @@ struct Inner {
     /// The order in which waiting activations are offered, by namespace and workflow. Places are in
     /// offer order. A run leased or decided leaves its place behind, dropped when it is reached, so that
     /// nothing here costs more as the backlog grows.
-    waiting: BTreeMap<(String, String), VecDeque<(u64, String)>>,
+    waiting: BTreeMap<List, VecDeque<(u64, String)>>,
     next_place: u64,
     /// The runs under a lease, by when it runs out.
     leases: BTreeSet<(u64, String)>,
+    /// Connected workers, by workflow and build.
+    sessions: BTreeMap<(String, Option<String>), usize>,
     /// Activation ids handed out, to the run and history length they are for.
     issued: BTreeMap<String, (String, usize)>,
 }
+
+/// A waiting list: a namespace, a workflow, and the build its runs are pinned to.
+type List = (String, String, Option<String>);
 
 impl Inner {
     /// Gives a run's activation a place at the end of the waiting list.
@@ -75,18 +82,29 @@ impl Inner {
             return;
         };
         entry.place = place;
-        let list = (namespace_of(&run).to_owned(), entry.workflow.clone());
+        let list = (
+            namespace_of(&run).to_owned(),
+            entry.workflow.clone(),
+            entry.version.clone(),
+        );
         self.waiting
             .entry(list)
             .or_default()
             .push_back((place, run));
     }
 
-    /// The first waiting activation for these workflows in scope, by offer order: its list.
-    fn next_in(&mut self, scope: &Scope, workflows: &[String]) -> Option<(String, String)> {
-        let mut next: Option<(u64, (String, String))> = None;
+    /// The first waiting activation for these workflows in scope, by offer order: its list. A pinned run
+    /// goes only to a worker running its build: other code must never decide it.
+    fn next_in(
+        &mut self,
+        scope: &Scope,
+        workflows: &[String],
+        build: Option<&str>,
+    ) -> Option<List> {
+        let mut next: Option<(u64, List)> = None;
         for (list, waiting) in &mut self.waiting {
-            if !scope.includes(&list.0) || !workflows.contains(&list.1) {
+            let pinned_elsewhere = list.2.as_deref().is_some_and(|pin| Some(pin) != build);
+            if !scope.includes(&list.0) || !workflows.contains(&list.1) || pinned_elsewhere {
                 continue;
             }
             while let Some((place, run)) = waiting.front() {
@@ -149,6 +167,21 @@ impl ActivationQueue {
         env: Env,
         now_ms: u64,
     ) {
+        self.offer_pinned(run, workflow, None, at, history, env, now_ms);
+    }
+
+    /// [`ActivationQueue::offer`], for a run pinned to a build (ADR 0048).
+    #[allow(clippy::too_many_arguments)]
+    pub fn offer_pinned(
+        &self,
+        run: &str,
+        workflow: &str,
+        version: Option<&str>,
+        at: usize,
+        history: Vec<Vec<u8>>,
+        env: Env,
+        now_ms: u64,
+    ) {
         let mut inner = self.lock();
         if let Some(entry) = inner.entries.get(run) {
             let current = entry
@@ -182,6 +215,7 @@ impl ActivationQueue {
                 lease: None,
                 place: waiting.unwrap_or(0),
                 ids,
+                version: version.map(str::to_owned),
             },
         );
         if waiting.is_none() {
@@ -211,6 +245,19 @@ impl ActivationQueue {
         max: usize,
         now_ms: u64,
     ) -> Vec<Activation> {
+        self.take_for(scope, None, worker, workflows, max, now_ms)
+    }
+
+    /// [`ActivationQueue::take_in`], for a worker running a build (ADR 0048).
+    pub fn take_for(
+        &self,
+        scope: &Scope,
+        build: Option<&str>,
+        worker: &str,
+        workflows: &[String],
+        max: usize,
+        now_ms: u64,
+    ) -> Vec<Activation> {
         let mut inner = self.lock();
         // Leases that have run out are offered again, in a fixed order.
         let mut expired = Vec::new();
@@ -231,7 +278,7 @@ impl ActivationQueue {
         }
         let mut taken = Vec::new();
         while taken.len() < max {
-            let Some(list) = inner.next_in(scope, workflows) else {
+            let Some(list) = inner.next_in(scope, workflows, build) else {
                 break;
             };
             let Some((_, run)) = inner.waiting.get_mut(&list).and_then(VecDeque::pop_front) else {
@@ -281,9 +328,22 @@ impl ActivationQueue {
         max: usize,
         wait: Duration,
     ) -> Vec<Activation> {
+        self.wait_take_for(scope, None, worker, workflows, max, wait)
+    }
+
+    /// [`ActivationQueue::wait_take_in`], for a worker running a build (ADR 0048).
+    pub fn wait_take_for(
+        &self,
+        scope: &Scope,
+        build: Option<&str>,
+        worker: &str,
+        workflows: &[String],
+        max: usize,
+        wait: Duration,
+    ) -> Vec<Activation> {
         let deadline = Instant::now() + wait;
         loop {
-            let taken = self.take_in(scope, worker, workflows, max, self.now_ms());
+            let taken = self.take_for(scope, build, worker, workflows, max, self.now_ms());
             let left = deadline.saturating_duration_since(Instant::now());
             if !taken.is_empty() || left.is_zero() || max == 0 {
                 return taken;
@@ -321,6 +381,36 @@ impl ActivationQueue {
             }
         }
         Some((run, at))
+    }
+
+    /// A worker of these workflows connected, running `build`. It counts until [`Self::disconnected`].
+    pub fn connected(&self, workflows: &[String], build: Option<&str>) {
+        let mut inner = self.lock();
+        for workflow in workflows {
+            *inner
+                .sessions
+                .entry((workflow.clone(), build.map(str::to_owned)))
+                .or_default() += 1;
+        }
+    }
+
+    /// A worker counted by [`Self::connected`] went away.
+    pub fn disconnected(&self, workflows: &[String], build: Option<&str>) {
+        let mut inner = self.lock();
+        for workflow in workflows {
+            let key = (workflow.clone(), build.map(str::to_owned));
+            if let Some(count) = inner.sessions.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    inner.sessions.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// How many connected workers there are, by workflow and build.
+    pub fn sessions(&self) -> BTreeMap<(String, Option<String>), usize> {
+        self.lock().sessions.clone()
     }
 
     /// A worker's session ended: its leases are offered again at once.

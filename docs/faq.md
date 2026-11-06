@@ -76,6 +76,7 @@ be idempotent: every attempt of a step has the same idempotency key, to pass to 
 ## Can a run be changed while it is running?
 
 Its logic can be, carefully. A run stays on the version it started on, and new runs start on the active one
-([ADR 0029](adr/0029-version-pinning.md)). A Rust workflow can branch with `ctx.patched("id")` to change code under
+([ADR 0029](adr/0029-version-pinning.md)), for code in workers too: only a worker of a run's build decides it
+([ADR 0048](adr/0048-deployments.md)). A Rust workflow can branch with `ctx.patched("id")` to change code under
 runs already going ([ADR 0035](adr/0035-patched.md)). A run whose logic stops matching its journal is parked for an
 operator, not corrupted.

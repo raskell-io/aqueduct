@@ -39,6 +39,8 @@ struct Registered {
     /// Decided by a remote workflow worker (ADR 0039): its activations leave the partition as
     /// [`Outbound::Activation`], and its decisions come back through [`Partition::decision`].
     remote: bool,
+    /// For a remote workflow, the builds runs may be started on (ADR 0048).
+    builds: BTreeSet<String>,
 }
 
 impl Deciders {
@@ -76,6 +78,33 @@ impl Deciders {
             .or_default()
             .versions
             .insert(version.into(), decider);
+    }
+
+    /// Makes a build of a remote workflow the one new runs start on (ADR 0048). A build need not be known
+    /// beforehand: its code is in a worker.
+    pub fn activate_build(&mut self, workflow: &str, build: &str) -> Result<(), PartitionError> {
+        let registered = self
+            .by_name
+            .get_mut(workflow)
+            .filter(|r| r.remote)
+            .ok_or_else(|| PartitionError::UnknownWorkflow(workflow.to_owned()))?;
+        registered.builds.insert(build.to_owned());
+        registered.active = Some(build.to_owned());
+        Ok(())
+    }
+
+    /// Lets runs be started on a build of a remote workflow, without activating it: a draining one.
+    pub fn allow_build(&mut self, workflow: &str, build: &str) {
+        if let Some(registered) = self.by_name.get_mut(workflow).filter(|r| r.remote) {
+            registered.builds.insert(build.to_owned());
+        }
+    }
+
+    /// Stops runs being started on a build of a remote workflow.
+    pub fn forbid_build(&mut self, workflow: &str, build: &str) {
+        if let Some(registered) = self.by_name.get_mut(workflow) {
+            registered.builds.remove(build);
+        }
     }
 
     /// Makes a registered version the one new runs of the workflow start on.
@@ -144,7 +173,10 @@ impl Deciders {
             .get(workflow)
             .ok_or_else(|| PartitionError::UnknownWorkflow(workflow.to_owned()))?;
         match requested {
-            Some(version) if registered.versions.contains_key(version) => {
+            Some(version)
+                if registered.versions.contains_key(version)
+                    || registered.builds.contains(version) =>
+            {
                 Ok(Some(version.to_owned()))
             }
             Some(version) => Err(PartitionError::UnknownVersion {
@@ -1676,6 +1708,37 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// The runs, by key.
     pub fn runs(&self) -> &BTreeMap<String, PartitionRun> {
         &self.runs
+    }
+
+    /// The build a run is pinned to, if it is a run of a remote workflow with one (ADR 0048).
+    pub fn pinned_build(&self, key: &str) -> Option<&str> {
+        let run = self.runs.get(key)?;
+        if self.deciders.is_remote(run.state.workflow()) {
+            run.state.version()
+        } else {
+            None
+        }
+    }
+
+    /// Open runs of remote workflows, by workflow and build.
+    pub fn open_builds(&self) -> BTreeMap<(String, String), usize> {
+        let mut open = BTreeMap::new();
+        for run in self.runs.values() {
+            if run.state.status().is_terminal() || !self.deciders.is_remote(run.state.workflow()) {
+                continue;
+            }
+            if let Some(build) = run.state.version() {
+                *open
+                    .entry((run.state.workflow().to_owned(), build.to_owned()))
+                    .or_default() += 1;
+            }
+        }
+        open
+    }
+
+    /// The workflows' logic, to change at run time (ADR 0048).
+    pub fn deciders_mut(&mut self) -> &mut Deciders {
+        &mut self.deciders
     }
 
     /// A run's journal, whether it is in memory or only in the last checkpoint.

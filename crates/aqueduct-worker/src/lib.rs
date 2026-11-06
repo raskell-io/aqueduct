@@ -95,6 +95,7 @@ pub struct Worker {
     steps: BTreeMap<String, StepFn>,
     workflows: BTreeMap<String, WorkflowLogic>,
     queues: Vec<String>,
+    deployment: Option<String>,
     token: Option<String>,
     ca: Option<String>,
 }
@@ -108,6 +109,7 @@ impl Worker {
             steps: BTreeMap::new(),
             workflows: BTreeMap::new(),
             queues: Vec::new(),
+            deployment: None,
             token: None,
             ca: None,
         }
@@ -127,6 +129,14 @@ impl Worker {
         step: impl Fn(&Invocation) -> Outcome + Send + Sync + 'static,
     ) -> Worker {
         self.steps.insert(name.to_owned(), Arc::new(step));
+        self
+    }
+
+    /// Announces the build this worker runs (ADR 0048): a release or a commit. It then decides only runs
+    /// pinned to this build, and runs not pinned, and takes those runs' steps. Another build's runs stay
+    /// with workers of that build, so new code never decides a run that started on old code.
+    pub fn deployment(mut self, build: &str) -> Worker {
+        self.deployment = Some(build.to_owned());
         self
     }
 
@@ -179,6 +189,7 @@ impl Worker {
                 self.capacity,
                 &self.steps,
                 &self.queues,
+                self.deployment.as_deref(),
                 self.token.as_deref(),
                 self.ca.as_deref(),
             )
@@ -193,6 +204,7 @@ impl Worker {
                 &self.name,
                 self.capacity,
                 &self.workflows,
+                self.deployment.as_deref(),
                 self.token.as_deref(),
                 self.ca.as_deref(),
             )
@@ -249,12 +261,14 @@ fn with_token(
 
 /// A session of the step-worker protocol. Dropping it aborts the steps in flight (their tasks hold the
 /// stream open otherwise).
+#[allow(clippy::too_many_arguments)]
 async fn serve_steps(
     url: &str,
     name: &str,
     capacity: u32,
     steps: &BTreeMap<String, StepFn>,
     queues: &[String],
+    deployment: Option<&str>,
     token: Option<&str>,
     ca: Option<&str>,
 ) -> Result<(), WorkerError> {
@@ -266,6 +280,7 @@ async fn serve_steps(
             steps: steps.keys().cloned().collect(),
             capacity,
             queues: queues.to_vec(),
+            deployment: deployment.unwrap_or_default().to_owned(),
         })),
     };
     out.send(hello)
@@ -339,6 +354,7 @@ async fn serve_workflows(
     name: &str,
     capacity: u32,
     workflows: &BTreeMap<String, WorkflowLogic>,
+    deployment: Option<&str>,
     token: Option<&str>,
     ca: Option<&str>,
 ) -> Result<(), WorkerError> {
@@ -350,6 +366,7 @@ async fn serve_workflows(
                 worker: name.to_owned(),
                 workflows: workflows.keys().cloned().collect(),
                 capacity,
+                deployment: deployment.unwrap_or_default().to_owned(),
             },
         )),
     };

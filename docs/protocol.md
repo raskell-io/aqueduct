@@ -1,7 +1,7 @@
 # Aqueduct service protocol, version 1 (draft)
 
 Status: **draft** (ADR 0038). `aqueduct server` serves all of it: the ingress (section 2), step workers
-(section 3), workflow workers (section 4) and imports (section 5). Messages and routes may change until the format and protocol freeze in
+(section 3), workflow workers (section 4), imports (section 5) and deployments (section 6). Messages and routes may change until the format and protocol freeze in
 phase 5; after that, changes within v1 are additive. The protobuf definitions in
 [`proto/aqueduct/v1`](../proto/aqueduct/v1) are the source of truth; this document explains them and
 gives the HTTP/JSON form of each call.
@@ -143,6 +143,8 @@ journal as it does for local logic.
 - **Activations are leased** like step invocations.
 - **A worker that cannot decide** returns its credit instead of a decision.
 - **Not yet:** queries on remotely decided workflows, and validation of updates on receipt.
+- **Deployments** (ADR 0048). A worker may announce a build, `deployment` in its `WorkflowHello`. A run pinned to a
+  build is offered only to workers announcing that build; a run not pinned, to any. See section 6.
 
 ## 5. Imports (`aqueduct.v1.Imports`, ADR 0047)
 
@@ -155,9 +157,26 @@ has another run, if an import is already waiting for a restart, or if another is
 stream ended without its commit. A run the server already has, as it was or gone on from there, is counted in
 `already_there`, so an import can be repeated.
 
-## 6. Not in this draft yet
+## 6. Deployments (`aqueduct.v1.Deployments`, ADR 0048)
 
-- **Deployments across workers:** version pinning and draining for worker code.
+A deployment is a build of a remote workflow. New runs start on the active build and stay pinned to it, in `version`.
+All of this needs `admin` in the default namespace.
+
+| call | HTTP/JSON | body | answer |
+|---|---|---|---|
+| `ListDeployments` | `GET /v1/deployments` | | `{"deployments": [{"workflow", "build", "state", "open_runs", "workers"}]}` |
+| `ActivateDeployment` | `POST /v1/deployments/{workflow}/{build}/activate` | `{"force"?}` | `{}` |
+| `RetireDeployment` | `POST /v1/deployments/{workflow}/{build}/retire` | | `{}` |
+
+`state` is `"active"`, `"draining"`, `"retired"`, or `"unlisted"` for a build that runs or workers name and that was
+never activated. Refusals are `FAILED_PRECONDITION` / 422: no connected worker announces the build (and no `force`),
+the build was retired, it is active, or it has open runs. `NOT_FOUND` / 404 if the workflow is not remote.
+
+A step worker may announce a build too, `deployment` in its `Hello` or poll. It then takes steps of runs pinned to that
+build and of runs not pinned. Without one, it takes any step.
+
+## 7. Not in this draft yet
+
 - **Per-run priorities.**
 - **OIDC/JWT and mTLS.** The server has static tokens (ADR 0041) and TLS (ADR 0042). It binds to loopback by default;
   beyond loopback it needs tokens and a certificate.

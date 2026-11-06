@@ -841,6 +841,7 @@ async fn step_worker_sessions_are_scoped() {
             steps: vec!["work".to_owned()],
             capacity: 5,
             queues: Vec::new(),
+            deployment: String::new(),
         };
         out.send(v1::WorkerMessage {
             message: Some(Message::Hello(hello)),
@@ -949,6 +950,7 @@ async fn workflow_worker_sessions_are_scoped() {
             worker: "w".to_owned(),
             workflows: vec!["remote".to_owned()],
             capacity: 5,
+            deployment: String::new(),
         };
         out.send(v1::WorkflowWorkerMessage {
             message: Some(Message::Hello(hello)),

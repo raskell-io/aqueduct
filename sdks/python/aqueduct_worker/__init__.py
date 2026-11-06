@@ -73,8 +73,12 @@ class Worker:
         poll_ms: int = 10_000,
         token: Optional[str] = None,
         ca_file: Optional[str] = None,
+        deployment: Optional[str] = None,
     ):
         self.name = name
+        # The build this worker runs (ADR 0048): it then takes steps of runs pinned to this build, and of
+        # runs not pinned, and leaves other builds' steps to their workers.
+        self.deployment = deployment
         self.token = token
         # For an https:// server: a private CA or self-signed certificate to trust, besides the system's.
         self._tls = ssl.create_default_context(cafile=ca_file) if ca_file else None
@@ -163,9 +167,12 @@ class Worker:
         steps: List[str] = sorted(self._steps)
         while not self._stopping.is_set():
             try:
+                body = {"worker": self.name, "steps": steps, "max": 1, "wait_ms": self.poll_ms}
+                if self.deployment is not None:
+                    body["deployment"] = self.deployment
                 polled = self._post(
                     "/v1/workers/poll",
-                    {"worker": self.name, "steps": steps, "max": 1, "wait_ms": self.poll_ms},
+                    body,
                     timeout=self.poll_ms / 1000 + 10,
                 )
             except (urllib.error.URLError, OSError, ValueError):

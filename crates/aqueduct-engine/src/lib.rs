@@ -10,6 +10,7 @@
 pub mod activations;
 mod agent;
 pub mod counterfactual;
+pub mod deployments;
 pub mod drift;
 pub mod embedded;
 pub mod import;

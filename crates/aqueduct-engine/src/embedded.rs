@@ -220,6 +220,9 @@ pub enum EngineError {
     /// Opening or recovering the engine failed.
     #[error("cannot open the engine: {0}")]
     Open(String),
+    /// A deployment cannot be changed that way (ADR 0048).
+    #[error("{0}")]
+    Deployment(String),
 }
 
 /// Configures and opens an [`Engine`].
@@ -458,6 +461,11 @@ impl Builder {
                 .activate(&name, &version)
                 .map_err(|e| EngineError::Open(e.to_string()))?;
         }
+        let deployments =
+            crate::deployments::Deployments::load(&self.dir).map_err(EngineError::Open)?;
+        deployments
+            .apply(&mut self.deciders)
+            .map_err(EngineError::Open)?;
         let log = FileLog::open(self.dir.join("log"), self.log)
             .map_err(|e| EngineError::Open(e.to_string()))?;
         let state = RedbStateStore::open(&self.dir.join("state.redb"))
@@ -525,6 +533,8 @@ impl Builder {
             deferred: Vec::new(),
             remote: queue.clone().map(|queue| (queue, local)),
             activations: activation_queue.clone(),
+            deployments,
+            dir: self.dir.clone(),
             max_running: self.max_running,
             running: 0,
             namespace_max: self.namespace_running,
@@ -564,6 +574,43 @@ impl Engine {
     /// Starts an upload into this engine's data directory (ADR 0047).
     pub fn begin_import(&self) -> Result<crate::import::Stage, String> {
         crate::import::Stage::begin(&self.dir)
+    }
+
+    /// Every build of every remote workflow (ADR 0048).
+    pub fn deployments(&self) -> Result<Vec<crate::deployments::DeploymentInfo>, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Deployments { reply })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// Makes a build of a remote workflow the one new runs start on, durably, and the one before it
+    /// drain. Also a rollback. Unless `force`, a connected worker must announce it: otherwise new runs
+    /// would wait for one.
+    pub fn activate_deployment(
+        &self,
+        workflow: &str,
+        build: &str,
+        force: bool,
+    ) -> Result<(), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::ActivateDeployment {
+            workflow: workflow.to_owned(),
+            build: build.to_owned(),
+            force,
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// Retires a draining build with no open runs.
+    pub fn retire_deployment(&self, workflow: &str, build: &str) -> Result<(), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::RetireDeployment {
+            workflow: workflow.to_owned(),
+            build: build.to_owned(),
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
     }
 
     /// A run's journal, by its run id.
@@ -943,6 +990,20 @@ impl Drop for Engine {
 }
 
 enum Request {
+    Deployments {
+        reply: Sender<Result<Vec<crate::deployments::DeploymentInfo>, EngineError>>,
+    },
+    ActivateDeployment {
+        workflow: String,
+        build: String,
+        force: bool,
+        reply: Sender<Result<(), EngineError>>,
+    },
+    RetireDeployment {
+        workflow: String,
+        build: String,
+        reply: Sender<Result<(), EngineError>>,
+    },
     History {
         run: String,
         reply: Sender<Result<Option<Vec<aqueduct_core::Entry>>, EngineError>>,
@@ -1068,6 +1129,8 @@ struct Processor {
     activations: Option<Arc<crate::activations::ActivationQueue>>,
     /// The cap on running runs, and how many there are: counted after each flush, and kept up by the
     /// starts admitted since.
+    deployments: crate::deployments::Deployments,
+    dir: PathBuf,
     max_running: Option<usize>,
     running: usize,
     /// The same, per namespace.
@@ -1346,6 +1409,24 @@ impl Processor {
                     let _ = reply.send(answer);
                 }));
             }
+            Request::Deployments { reply } => {
+                let _ = reply.send(Ok(self.deployment_list()));
+            }
+            Request::ActivateDeployment {
+                workflow,
+                build,
+                force,
+                reply,
+            } => {
+                let _ = reply.send(self.activate_deployment(&workflow, &build, force));
+            }
+            Request::RetireDeployment {
+                workflow,
+                build,
+                reply,
+            } => {
+                let _ = reply.send(self.retire_deployment(&workflow, &build));
+            }
             Request::History { run, reply } => {
                 let history = self.partition.history(&run).map_err(|e| e.to_string())?;
                 self.deferred.push(Box::new(move || {
@@ -1401,6 +1482,102 @@ impl Processor {
         let early = self.partition.take_unsynced();
         self.deliver(early);
         Ok(true)
+    }
+
+    fn deployment_list(&self) -> Vec<crate::deployments::DeploymentInfo> {
+        use crate::deployments::DeploymentInfo;
+        let mut listed: BTreeMap<(String, String), DeploymentInfo> = BTreeMap::new();
+        let mut entry = |workflow: &str, build: &str| -> (String, String) {
+            let key = (workflow.to_owned(), build.to_owned());
+            listed.entry(key.clone()).or_insert(DeploymentInfo {
+                workflow: workflow.to_owned(),
+                build: build.to_owned(),
+                state: None,
+                open_runs: 0,
+                workers: 0,
+            });
+            key
+        };
+        let mut states = Vec::new();
+        for (workflow, builds) in &self.deployments.builds {
+            for (build, state) in builds {
+                states.push((entry(workflow, build), *state));
+            }
+        }
+        let mut open = Vec::new();
+        for ((workflow, build), count) in self.partition.open_builds() {
+            open.push((entry(&workflow, &build), count));
+        }
+        let mut workers = Vec::new();
+        if let Some(queue) = &self.activations {
+            for ((workflow, build), count) in queue.sessions() {
+                if let Some(build) = build {
+                    workers.push((entry(&workflow, &build), count));
+                }
+            }
+        }
+        for (key, state) in states {
+            if let Some(info) = listed.get_mut(&key) {
+                info.state = Some(state);
+            }
+        }
+        for (key, count) in open {
+            if let Some(info) = listed.get_mut(&key) {
+                info.open_runs = count;
+            }
+        }
+        for (key, count) in workers {
+            if let Some(info) = listed.get_mut(&key) {
+                info.workers = count;
+            }
+        }
+        listed.into_values().collect()
+    }
+
+    fn activate_deployment(
+        &mut self,
+        workflow: &str,
+        build: &str,
+        force: bool,
+    ) -> Result<(), EngineError> {
+        if !self.partition.deciders_mut().is_remote(workflow) {
+            return Err(EngineError::UnknownWorkflow(workflow.to_owned()));
+        }
+        if build.is_empty() {
+            return Err(EngineError::Deployment("a build needs a name".to_owned()));
+        }
+        let connected = self.activations.as_ref().is_some_and(|queue| {
+            queue
+                .sessions()
+                .contains_key(&(workflow.to_owned(), Some(build.to_owned())))
+        });
+        if !connected && !force {
+            return Err(EngineError::Deployment(format!(
+                "no connected worker announces build `{build}` of `{workflow}`: new runs would wait for one"
+            )));
+        }
+        // Durable before it takes effect: a run started on it must find it there after a crash.
+        self.deployments
+            .activate(&self.dir, workflow, build)
+            .map_err(EngineError::Deployment)?;
+        self.partition
+            .deciders_mut()
+            .activate_build(workflow, build)
+            .map_err(|_| EngineError::UnknownWorkflow(workflow.to_owned()))
+    }
+
+    fn retire_deployment(&mut self, workflow: &str, build: &str) -> Result<(), EngineError> {
+        let open = self
+            .partition
+            .open_builds()
+            .get(&(workflow.to_owned(), build.to_owned()))
+            .copied()
+            .unwrap_or(0);
+        self.deployments
+            .retire(&self.dir, workflow, build, open)
+            .map_err(EngineError::Deployment)?;
+        self.partition.deciders_mut().forbid_build(workflow, build);
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), String> {
@@ -1506,7 +1683,8 @@ impl Processor {
                 {
                     let attempt = self.attempt(&key, cmd);
                     if let Some((queue, _)) = &self.remote {
-                        queue.offer(&key, cmd, &name, input, attempt, queue.now_ms());
+                        let build = self.partition.pinned_build(&key);
+                        queue.offer_pinned(&key, cmd, &name, input, attempt, build, queue.now_ms());
                     }
                 }
                 Outbound::Dispatch {
@@ -1570,7 +1748,8 @@ impl Processor {
                         .take(at)
                         .map(|entry| chain.append(entry))
                         .collect();
-                    queue.offer(&key, &workflow, at, history, env, queue.now_ms());
+                    let build = self.partition.pinned_build(&key);
+                    queue.offer_pinned(&key, &workflow, build, at, history, env, queue.now_ms());
                 }
                 Outbound::ResultRecorded { .. }
                 | Outbound::AttemptRecorded { .. }

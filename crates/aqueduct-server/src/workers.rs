@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aqueduct_engine::embedded::{Attempt, Engine};
 use aqueduct_engine::namespaces::Scope;
-use aqueduct_engine::queue::{Invocation, StepQueue};
+use aqueduct_engine::queue::{Invocation, Serves, StepQueue};
 use aqueduct_protocol::v1;
 use axum::extract::State;
 use axum::routing::post;
@@ -34,6 +34,11 @@ impl Api {
             message: "this server runs no remote steps".into(),
         })
     }
+}
+
+/// What a worker that announces this build takes (ADR 0048).
+fn serves(build: Option<&str>) -> Serves<'_> {
+    build.map_or(Serves::Any, Serves::Build)
 }
 
 /// Records a worker's result, if the queue still waits for it.
@@ -107,6 +112,7 @@ impl v1::workers_server::Workers for Api {
         let mut queues = hello.steps;
         queues.extend(hello.queues);
         let steps = Arc::new(queues);
+        let build = (!hello.deployment.is_empty()).then_some(hello.deployment);
         let credit = Arc::new(AtomicU32::new(hello.capacity.max(1)));
         let closed = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(Notify::new());
@@ -151,7 +157,10 @@ impl v1::workers_server::Workers for Api {
 
         // Invocations to the worker, never more than its credit.
         tokio::spawn(async move {
-            serve_invocations(queue, scope, session, steps, credit, closed, changed, out).await;
+            serve_invocations(
+                queue, scope, build, session, steps, credit, closed, changed, out,
+            )
+            .await;
         });
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(stream),
@@ -165,6 +174,7 @@ impl v1::workers_server::Workers for Api {
 async fn serve_invocations(
     queue: Arc<StepQueue>,
     scope: Scope,
+    build: Option<String>,
     session: String,
     steps: Arc<Vec<String>>,
     credit: Arc<AtomicU32>,
@@ -179,14 +189,16 @@ async fn serve_invocations(
                 changed.notified().await;
                 continue;
             }
-            let (queue, steps, name, scope) = (
+            let (queue, steps, name, scope, build) = (
                 Arc::clone(&queue),
                 Arc::clone(&steps),
                 session.clone(),
                 scope.clone(),
+                build.clone(),
             );
             let taken = tokio::task::spawn_blocking(move || {
-                queue.wait_take_in(&scope, &name, &steps, available as usize, TAKE_WAIT)
+                let serves = serves(build.as_deref());
+                queue.wait_take_for(&scope, serves, &name, &steps, available as usize, TAKE_WAIT)
             })
             .await
             .unwrap_or_default();
@@ -214,6 +226,9 @@ struct Poll {
     /// Named task queues, besides the queues of its step names.
     #[serde(default)]
     queues: Vec<String>,
+    /// The build it runs (ADR 0048).
+    #[serde(default)]
+    deployment: Option<String>,
     #[serde(default = "one")]
     max: usize,
     #[serde(default)]
@@ -231,7 +246,8 @@ async fn http_poll(State(api): State<Api>, Body(poll): Body<Poll>) -> Result<Jso
     queues.extend(poll.queues);
     let scope = crate::worker_scope();
     let taken = tokio::task::spawn_blocking(move || {
-        queue.wait_take_in(&scope, &poll.worker, &queues, poll.max, wait)
+        let serves = serves(poll.deployment.as_deref().filter(|build| !build.is_empty()));
+        queue.wait_take_for(&scope, serves, &poll.worker, &queues, poll.max, wait)
     })
     .await
     .unwrap_or_default();

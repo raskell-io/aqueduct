@@ -3,6 +3,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proto");
     let files = [
+        "aqueduct/v1/deployment.proto",
         "aqueduct/v1/import.proto",
         "aqueduct/v1/ingress.proto",
         "aqueduct/v1/worker.proto",

@@ -40,6 +40,9 @@ message Hello {
   uint32 capacity = 3;
   // Named task queues it takes steps from (ADR 0040), besides the queues of its step names.
   repeated string queues = 4;
+  // The build it runs (ADR 0048). It then takes steps of runs pinned to this build and of runs not
+  // pinned; without one, it takes any step.
+  string deployment = 5;
 }
 
 message ServerMessage {
