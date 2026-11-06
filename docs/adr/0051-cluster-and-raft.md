@@ -1,0 +1,76 @@
+# 0051: The cluster, and Raft of our own
+
+- **Status:** accepted
+- **Date:** 2026-11-06
+
+## Context
+
+Phase 4 (BRIEF.md section 15) replicates the engine: each partition's log becomes a Raft group of three or five
+replicas, so a partition survives the loss of a minority of its nodes (section 5.5). It is done when a simulated
+five-node cluster survives network partitions, crashes and clock skew for 100,000 seeds nightly, when cluster targets
+are measured, and after a failover drill on real machines.
+
+Open question 5 asked whether to use openraft or write Raft ourselves. ADR 0006 already decided how the engine is
+built: every component is a synchronous state machine that consumes messages and returns messages and storage
+operations, so that one seeded event queue can drive the whole system and any failure reproduces from its seed.
+
+## Options
+
+1. **openraft.** Very active, MIT or Apache-2.0. It is asynchronous and built on Tokio: the simulator could only drive
+   it with a deterministic async executor, which ADR 0006 rejected. 0.10 is still in alpha (alpha.37, October 2026)
+   with frequent API changes, and it brings Tokio, futures, chrono, clap and tracing into the core.
+2. **raft-rs (TiKV).** Proven in production, and sans-I/O (`RawNode`, `Ready`), so it fits the simulator. Its last
+   release is 0.7 from March 2023. It depends on protobuf 2, slog, fxhash and rand 0.8; adapting its storage trait to
+   our log is work as well.
+3. **Our own, sans-I/O.** A Raft written as a pure state machine, in the shape of the partition. No new dependencies,
+   and the simulator drives it exactly. The cost: Raft's correctness is ours to establish.
+
+The owner chose option 3 (2026-11-06).
+
+## Decision
+
+**`aqueduct-raft`: Raft as a pure state machine.** A node takes messages, clock ticks and proposals, and produces a
+`Ready`: the term, vote and commit index to persist, the entries to persist (after truncating a conflicting suffix), the
+messages to send, and the entries committed and durable here, to apply. The driver persists what a `Ready` asks before
+sending its messages, and reports back with `advance`. The node never touches a disk, a socket or a clock.
+
+The algorithm follows the Raft paper and thesis (Ongaro, 2014):
+
+- **Leader election** with randomised timeouts, a **pre-vote** phase (thesis 9.6) so that a node cut off from the
+  others cannot raise terms and disrupt a working leader when it returns, and **check quorum**: a leader that has not
+  heard from a majority within an election timeout steps down.
+- **Log replication** with the consistency check on the previous entry, conflict hints to find the agreement point
+  quickly, and commit only of entries from the leader's own term (thesis 3.6.2), helped by a no-op entry at the start of
+  each term.
+- **Durability:** a vote is granted, and an append acknowledged, only after it is persisted; a leader counts its own
+  entries towards a majority only once it has persisted them. A node applies only entries both committed and
+  durable on it.
+
+**Built in this order, each step simulated before the next:**
+
+1. Election, replication and commit; the simulator with five nodes, partitions, crashes and clock skew (this ADR's PR).
+2. Snapshots and log trimming; replicas that catch up from a snapshot.
+3. Membership changes, one server at a time (thesis 4.1).
+4. A replicated partition: the engine's batches become Raft entries, the leader runs the partition, followers
+   materialise its state, and acknowledgements wait for commit instead of a local sync.
+5. Many partitions, the slot table (ADR 0011) and a metadata store as a Raft group of its own.
+6. The cluster transport over gRPC, and routing at ingress.
+7. Leadership balancing, snapshots to object storage, history archival and retention, rolling upgrades.
+8. The web console, the 100,000-seed nightly simulation, cluster measurements and a failover drill.
+
+**Reads** go to the leader and confirm leadership with a round of heartbeats (read index, thesis 6.4) rather than a
+lease, so that correctness does not depend on bounded clock drift. **Timers** keep their meaning (BRIEF.md section 5.3):
+they fire no earlier than their wake time by the current leader's clock. After a failover, a new leader whose clock is
+ahead of the old one's can fire a timer early by that difference; that is stated, not hidden.
+
+## Consequences
+
+- The simulator can drive whole clusters deterministically, and a failure reproduces from its seed, as for one node.
+- **Raft's correctness is ours.** It is checked after every simulated event: at most one leader per term, logs that
+  agree up to any entry they share, every committed entry in every later leader's log, the same entry applied at each
+  index everywhere, and no acknowledged proposal lost. A Jepsen-style test on real machines comes before 1.0
+  (section 10). Until that, the cluster must not be called production-ready.
+- No dependency to keep up with, and none of its async runtime in the core.
+- Performance work (pipelining, batching appends, flow control) is ours too. The first version sends one append at a
+  time per follower, with all entries it is missing.
+- The Raft log stores the partition's batches as they are now, so the history format does not change.

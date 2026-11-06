@@ -253,6 +253,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqueduct-raft"
+version = "0.0.0"
+
+[[package]]
 name = "aqueduct-registry"
 version = "0.0.0"
 dependencies = [
@@ -3923,6 +3927,7 @@ dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
  "aqueduct-procedure",
+ "aqueduct-raft",
  "aqueduct-sim",
  "aqueduct-storage",
 ]

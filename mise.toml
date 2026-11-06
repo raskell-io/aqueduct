@@ -108,6 +108,8 @@ cargo xtask sim --seeds 2000 --workload starlark
 cargo xtask sim --seeds 2000 --workload timers
 cargo xtask sim --seeds 2000 --workload rust
 cargo xtask sim --seeds 2000 --workload composite
+cargo xtask raft --seeds 20000
+cargo xtask raft --seeds 5000 --nodes 3
 """
 
 [tasks."crash:ci"]

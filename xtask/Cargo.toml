@@ -14,5 +14,6 @@ workspace = true
 aqueduct-core.workspace = true
 aqueduct-engine.workspace = true
 aqueduct-procedure.workspace = true
+aqueduct-raft.workspace = true
 aqueduct-sim.workspace = true
 aqueduct-storage.workspace = true
