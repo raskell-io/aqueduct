@@ -78,12 +78,27 @@ impl Node {
         disk: SimDisk,
         ack_before_sync: bool,
         decider: Arc<dyn Decider + Send + Sync>,
+        others: &[(String, Arc<dyn Decider + Send + Sync>)],
+        objects: &[String],
     ) -> Result<Self, String> {
         let mut deciders = Deciders::new();
         deciders.insert_version(WORKFLOW, VERSION, decider);
         deciders
             .activate(WORKFLOW, VERSION)
             .map_err(|e| e.to_string())?;
+        // Children and handlers are pinned like the workflow; object loops are the engine's own.
+        for (name, decider) in others {
+            deciders.insert_version(name.clone(), VERSION, Arc::clone(decider));
+            deciders
+                .activate(name, VERSION)
+                .map_err(|e| e.to_string())?;
+        }
+        for object in objects {
+            deciders.insert(
+                aqueduct_engine::objects::loop_workflow(object),
+                Arc::new(aqueduct_engine::objects::ObjectLoop::new(object)),
+            );
+        }
         let mut partition = Partition::load_with_state(disk, SimState::default(), deciders.clone())
             .map_err(|e| e.to_string())?;
         partition.inject_ack_before_sync(ack_before_sync);
@@ -166,6 +181,37 @@ impl Node {
         self.partition()?
             .step_result(key, cmd, outcome)
             .map_err(|e| e.to_string())
+    }
+
+    /// Sends the client's update: its answer if the run has given one, and whether it was accepted.
+    pub fn on_update(&mut self, key: &str) -> Result<(Option<Payload>, bool), String> {
+        let id = format!("{}-{key}", crate::workflow::CONFIRM);
+        let payload = Payload::new(crate::workflow::CONFIRMED.to_vec());
+        match self
+            .partition()?
+            .update(key, crate::workflow::CONFIRM, &id, payload)
+        {
+            Ok(aqueduct_engine::UpdateStatus::Answered(Ok(answer))) => Ok((Some(answer), true)),
+            // Accepted: the answer comes once the run gives it and it is durable.
+            Ok(aqueduct_engine::UpdateStatus::Accepted { .. }) => Ok((None, true)),
+            // Not waiting for it yet, or ended: the client tries again.
+            Ok(_) | Err(aqueduct_engine::PartitionError::UnknownRun(_)) => Ok((None, false)),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// An object key's state, as its loop holds it.
+    pub fn object_state(&mut self, object: &str, key: &str) -> Result<Option<Payload>, String> {
+        let run = aqueduct_engine::objects::object_run_key(object, key);
+        match self
+            .partition()?
+            .query(&run, aqueduct_engine::objects::STATE_QUERY)
+        {
+            Ok(state) => Ok(state),
+            // Nothing was ever sent to it.
+            Err(aqueduct_engine::PartitionError::UnknownRun(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     pub fn on_signal(&mut self, key: &str) -> Result<(), String> {

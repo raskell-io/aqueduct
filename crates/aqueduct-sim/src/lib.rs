@@ -14,6 +14,14 @@
 //!   is parked;
 //! - after quiescence, the durable log holds exactly the in-memory journals.
 //!
+//! The composite workload adds, for child runs, updates and virtual objects:
+//!
+//! - a child's outcome is its parent's, as the reference computes it;
+//! - a run receives its update once, and the answer its sender gets is the one journaled, given only
+//!   once it is durable;
+//! - every message to an object arrives exactly once: an object key's count is the number of
+//!   completed runs that sent to it (a cancelled run may or may not have sent).
+//!
 //! Any failure reproduces with `cargo xtask sim --seed <n>`.
 
 #![forbid(unsafe_code)]
@@ -39,6 +47,10 @@ pub enum WorkloadKind {
     StarlarkTimers,
     /// The pipeline as a Rust `async fn` written with the SDK (`aqueduct-sdk`).
     RustPipeline,
+    /// A Starlark procedure that calls a child run, waits for an update from the client and answers
+    /// it, and sends a message to a virtual object: exercises child runs, updates and exactly-once
+    /// delivery to objects under faults.
+    Composite,
 }
 
 /// Deliberately injected bugs, used to check that the simulator catches them.
@@ -132,6 +144,12 @@ impl Default for Config {
 /// What happened in a successful simulation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
+    /// Messages objects received (the composite workload).
+    pub messages: u64,
+    /// Updates answered, as the client saw them (the composite workload).
+    pub updates_answered: u64,
+    /// Child runs (the composite workload).
+    pub children: u64,
     /// The seed.
     pub seed: u64,
     /// Events processed.
@@ -199,6 +217,7 @@ impl std::fmt::Display for Failure {
             WorkloadKind::StarlarkPipeline => "starlark",
             WorkloadKind::StarlarkTimers => "timers",
             WorkloadKind::RustPipeline => "rust",
+            WorkloadKind::Composite => "composite",
         };
         write!(
             f,

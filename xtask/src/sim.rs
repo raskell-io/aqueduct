@@ -27,9 +27,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     Some("starlark") => WorkloadKind::StarlarkPipeline,
                     Some("timers") => WorkloadKind::StarlarkTimers,
                     Some("rust") => WorkloadKind::RustPipeline,
+                    Some("composite") => WorkloadKind::Composite,
                     other => {
                         return Err(format!(
-                            "--workload must be native, starlark, timers or rust, not {other:?}"
+                            "--workload must be native, starlark, timers, rust or composite, not {other:?}"
                         ));
                     }
                 }
@@ -74,12 +75,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.budget_escalations += report.budget_escalations;
         total.budget_approvals += report.budget_approvals;
         total.answer_escalations += report.answer_escalations;
+        total.children += report.children;
+        total.updates_answered += report.updates_answered;
+        total.messages += report.messages;
     }
     println!(
         "{count} seeds ({from}..{}, {workload:?}) passed in {:.1} s\n\
          events {}, crashes {} (of which failed syncs {}), torn tails truncated {}, checkpoints {}\n\
          messages dropped {}, duplicated {}\n\
-         step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}, cancelled {}, escalations resolved {}, agent calls {}, budget escalations {} (approved {}), answers escalated {}",
+         step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}, cancelled {}, escalations resolved {}, agent calls {}, budget escalations {} (approved {}), answers escalated {}\n\
+         child runs {}, updates answered {}, messages to objects {}",
         from + count,
         started.elapsed().as_secs_f64(),
         total.events,
@@ -100,6 +105,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.budget_escalations,
         total.budget_approvals,
         total.answer_escalations,
+        total.children,
+        total.updates_answered,
+        total.messages,
     );
     Ok(())
 }
