@@ -5,6 +5,7 @@
 mod crash;
 mod crash_engine;
 mod fsync;
+mod raft;
 mod sim;
 
 use std::process::ExitCode;
@@ -14,6 +15,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("fsync") => fsync::run(&args[1..]).map_err(|e| e.to_string()),
         Some("sim") => sim::run(&args[1..]),
+        Some("raft") => raft::run(&args[1..]),
         Some("crash") => crash::run(&args[1..]),
         Some("crash-child") => crash::child(&args[1..]),
         Some("crash-engine") => crash_engine::run(&args[1..]),
@@ -22,7 +24,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage: cargo xtask <task>\n\ntasks:\n  crash [--kills N] [--seed S]   kill a log writer at random moments and check for lost records
   crash-engine [--kills N] [--seed S]   kill the embedded engine mid-run and check every run
-  fsync [dir]                    measure fsync latency and group commit throughput\n  sim --seed N | --seeds N [--from S] [--workload native|starlark]   run the simulator"
+  fsync [dir]                    measure fsync latency and group commit throughput\n  raft --seed N | --seeds N [--from S] [--nodes 5]   simulate Raft groups (ADR 0051)\n  sim --seed N | --seeds N [--from S] [--workload native|starlark]   run the simulator"
             );
             return ExitCode::from(2);
         }

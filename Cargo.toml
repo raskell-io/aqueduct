@@ -26,6 +26,7 @@ aqueduct-protocol = { path = "crates/aqueduct-protocol" }
 aqueduct-server = { path = "crates/aqueduct-server" }
 aqueduct-worker = { path = "crates/aqueduct-worker" }
 aqueduct-registry = { path = "crates/aqueduct-registry" }
+aqueduct-raft = { path = "crates/aqueduct-raft" }
 crc32fast = "1"
 proptest = "1"
 sha2 = "0.10"

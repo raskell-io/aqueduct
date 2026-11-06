@@ -20,6 +20,7 @@ How Aqueduct is put together, and where new code belongs. The why is in the ADRs
 | `aqueduct-worker` | A Rust library for step and workflow workers. | protocol, sdk |
 | `aqueduct-cli` | The `aqueduct` command: inspect, verify, export, replay, versions, `server`, `migrate`, `tokens`, `mcp`. Most commands work on a stopped engine's directory. | all of the above |
 | `aqueduct-sim` | The deterministic simulator: the real `Partition` on a simulated disk, network, clock and workers, with crashes, torn writes, failed syncs, lost and duplicated messages. | engine, sdk, procedure |
+| `aqueduct-raft` | Raft as a pure state machine, and its own deterministic simulator (ADR 0051). Not yet used by the engine. | |
 | `aqueduct` | The facade users depend on, with the runnable examples. | all of the above |
 | `benches/*` | Storage, embedded engine and server benchmarks. Results go to `docs/measurements/`. | |
 | `conformance` | The suite every worker library passes, polling and as a push endpoint. | |

@@ -97,6 +97,10 @@ A record says what was true and decided at its date: later records may change wh
 - [0049: Per-run priorities](adr/0049-priorities.md)
 - [0050: The single-server target, as measured](adr/0050-single-server-target.md)
 
+### Cluster
+
+- [0051: The cluster, and Raft of our own](adr/0051-cluster-and-raft.md)
+
 ### Observability
 
 - [0021: Telemetry through an observer hook; one OpenTelemetry trace per run](adr/0021-opentelemetry.md)
