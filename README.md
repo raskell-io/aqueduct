@@ -255,7 +255,7 @@ are not measured.
 
 ## Guarantees
 
-What holds today, and what checks it. The simulator runs 16,000 seeds on every change; the crash harness sends real
+What holds today, and what checks it. The simulator runs 18,000 seeds on every change; the crash harness sends real
 `kill -9`s to the log and to the embedded engine.
 
 | guarantee | checked by |
@@ -271,8 +271,9 @@ What holds today, and what checks it. The simulator runs 16,000 seeds on every c
 | **A recorded model call is never made again.** Replay reads the answer, model and cost from the journal ([ADR 0023](docs/adr/0023-agent-steps.md)). | simulator, tests |
 | **An audit line is synced before its request is answered,** and a changed line breaks the chain ([ADR 0041](docs/adr/0041-authentication.md)). | tests |
 
-The simulator's workloads do not yet cover updates, child runs or objects, and the crash harness runs against the
-embedded engine, not the server. Those have tests of their own, which are narrower.
+The simulator's `composite` workload covers child runs, updates and objects (messages arrive exactly once); it has no
+updates waited for twice, so their deduplication is checked by tests only. The crash harness runs against the embedded
+engine, not the server, whose transports have tests of their own, which are narrower.
 
 ## What the engine does
 
@@ -308,7 +309,7 @@ embedded engine, not the server. Those have tests of their own, which are narrow
 ```sh
 mise run ci                                      # everything CI checks, one after the other
 cargo xtask sim --seeds 10000                    # deterministic simulation: crashes, torn writes, fsync failures, lossy networks
-cargo xtask sim --seeds 2000 --workload timers   # workloads: native, starlark, timers, rust
+cargo xtask sim --seeds 2000 --workload timers   # workloads: native, starlark, timers, rust, composite
 cargo xtask sim --seed 42 --workload rust        # reproduce one seed exactly
 cargo xtask crash --kills 1000                   # SIGKILL a log writer; no acknowledged record may be lost
 cargo xtask crash-engine --kills 200             # SIGKILL the engine mid-run; every acknowledged run must end correctly

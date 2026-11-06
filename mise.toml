@@ -107,6 +107,7 @@ cargo xtask sim --seeds 10000
 cargo xtask sim --seeds 2000 --workload starlark
 cargo xtask sim --seeds 2000 --workload timers
 cargo xtask sim --seeds 2000 --workload rust
+cargo xtask sim --seeds 2000 --workload composite
 """
 
 [tasks."crash:ci"]

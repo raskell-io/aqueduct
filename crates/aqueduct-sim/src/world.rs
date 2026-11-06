@@ -61,6 +61,13 @@ enum Ev {
     ClientSignalAck {
         key: String,
     },
+    NodeUpdate {
+        key: String,
+    },
+    ClientUpdateAck {
+        key: String,
+        answer: Payload,
+    },
     NodeCancel {
         key: String,
     },
@@ -125,6 +132,8 @@ impl Ev {
             Ev::NodeResolve { .. } => 20,
             Ev::ClientResolveAck { .. } => 21,
             Ev::NodeAgentResult { .. } => 22,
+            Ev::NodeUpdate { .. } => 23,
+            Ev::ClientUpdateAck { .. } => 24,
         }
     }
 
@@ -145,6 +154,8 @@ impl Ev {
                 | Ev::NodeAgentResult { .. }
                 | Ev::NodeAttemptFailed { .. }
                 | Ev::WorkerAttemptAck { .. }
+                | Ev::NodeUpdate { .. }
+                | Ev::ClientUpdateAck { .. }
         )
     }
 }
@@ -168,6 +179,10 @@ struct World<'c> {
     acked_results: BTreeSet<(String, CommandIndex)>,
     /// Runs whose `go` signal the client saw acknowledged.
     acked_signals: BTreeSet<String>,
+    /// The answers the client was given to its updates.
+    acked_updates: BTreeMap<String, Payload>,
+    /// Runs whose update was accepted, whose sender waits for the answer. A crash loses who waits.
+    awaiting_answers: BTreeSet<String>,
     /// Runs the client cancels, and those whose cancellation it saw acknowledged (never lost).
     to_cancel: BTreeSet<String>,
     acked_cancels: BTreeSet<String>,
@@ -224,14 +239,19 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         seq: 0,
         queue: BTreeMap::new(),
         faults: true,
-        node: Node::new(disk, config.bugs.ack_before_sync, workload.decider.clone()).map_err(
-            |message| Failure {
-                seed,
-                workload: config.workload,
-                time: 0,
-                message,
-            },
-        )?,
+        node: Node::new(
+            disk,
+            config.bugs.ack_before_sync,
+            workload.decider.clone(),
+            &workload.others,
+            &workload.objects,
+        )
+        .map_err(|message| Failure {
+            seed,
+            workload: config.workload,
+            time: 0,
+            message,
+        })?,
         workload,
         crash_pending: false,
         pre_crash: BTreeMap::new(),
@@ -239,6 +259,8 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         acked_starts: BTreeSet::new(),
         acked_results: BTreeSet::new(),
         acked_signals: BTreeSet::new(),
+        acked_updates: BTreeMap::new(),
+        awaiting_answers: BTreeSet::new(),
         to_cancel: BTreeSet::new(),
         acked_cancels: BTreeSet::new(),
         resolving: BTreeMap::new(),
@@ -374,7 +396,10 @@ impl World<'_> {
                 if self.node.up && incarnation == self.node.incarnation {
                     self.node.flush_scheduled = false;
                     match self.node.flush() {
-                        Ok(outbound) => self.deliver(outbound),
+                        Ok(outbound) => {
+                            self.deliver(outbound);
+                            self.answer_waiting_updates();
+                        }
                         Err(_) => {
                             self.report.sync_failures += 1;
                             self.crash();
@@ -406,7 +431,10 @@ impl World<'_> {
                 }
             }
             Ev::ClientStartAck { key } => {
-                self.acked_starts.insert(key);
+                // Object calls are started by the engine too; the client counts its own runs.
+                if self.wanted.iter().any(|(wanted, _)| *wanted == key) {
+                    self.acked_starts.insert(key);
+                }
             }
             Ev::ClientSignalAck { key } => {
                 self.acked_signals.insert(key);
@@ -416,6 +444,30 @@ impl World<'_> {
                     self.node.on_signal(&key)?;
                     self.after_node_event();
                 }
+            }
+            Ev::NodeUpdate { key } => {
+                if self.node.up {
+                    let (answer, accepted) = self.node.on_update(&key)?;
+                    // An answer is given only once nothing it depends on is still to be written.
+                    let durable = !self.node.needs_flush();
+                    self.after_node_event();
+                    if let Some(answer) = answer.filter(|_| durable) {
+                        self.send(Ev::ClientUpdateAck { key, answer });
+                    } else if accepted {
+                        // As the engine does: the sender waits, and is answered after a flush.
+                        self.awaiting_answers.insert(key);
+                    }
+                }
+            }
+            Ev::ClientUpdateAck { key, answer } => {
+                if let Some(earlier) = self.acked_updates.get(&key)
+                    && *earlier != answer
+                {
+                    return Err(format!(
+                        "run {key} answered its update twice, differently: {earlier:?} and {answer:?}"
+                    ));
+                }
+                self.acked_updates.insert(key, answer);
             }
             Ev::ClientCancelAck { key } => {
                 self.acked_cancels.insert(key);
@@ -489,7 +541,23 @@ impl World<'_> {
                         .latest(key)
                         .is_some_and(|r| r.state().status().is_terminal())
                 });
-                let pending = !missing.is_empty()
+                // Send the update to runs that have not answered it, until they do or end.
+                let unconfirmed: Vec<String> = if self.workload.updates {
+                    self.acked_starts
+                        .iter()
+                        .filter(|key| !self.acked_updates.contains_key(*key))
+                        .filter(|key| {
+                            !self
+                                .latest(key)
+                                .is_some_and(|r| r.state().status().is_terminal())
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let pending = !unconfirmed.is_empty()
+                    || !missing.is_empty()
                     || !unsignalled.is_empty()
                     || self.acked_cancels.len() < self.to_cancel.len()
                     // A run may still escalate: keep looking.
@@ -497,6 +565,11 @@ impl World<'_> {
                     || (self.workload.signals && self.acked_signals.len() < self.wanted.len());
                 for (key, input) in missing {
                     self.send(Ev::NodeStart { key, input });
+                }
+                for key in &unconfirmed {
+                    if self.rng.chance(400_000) {
+                        self.send(Ev::NodeUpdate { key: key.clone() });
+                    }
                 }
                 for key in unsignalled {
                     if self.rng.chance(400_000) {
@@ -677,7 +750,30 @@ impl World<'_> {
         }
     }
 
+    /// After a flush, everything journaled is durable: senders waiting for an update's answer get it,
+    /// once the run has given one.
+    fn answer_waiting_updates(&mut self) {
+        if self.node.needs_flush() {
+            return;
+        }
+        let waiting: Vec<String> = self.awaiting_answers.iter().cloned().collect();
+        for key in waiting {
+            let answer = self.latest(&key).and_then(|run| {
+                run.journal().iter().find_map(|e| match e {
+                    Entry::UpdateCompleted { result, .. } => Some(result.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(answer) = answer {
+                self.awaiting_answers.remove(&key);
+                self.send(Ev::ClientUpdateAck { key, answer });
+            }
+        }
+    }
+
     fn crash(&mut self) {
+        // The engine loses who was waiting; their senders try again.
+        self.awaiting_answers.clear();
         self.pre_crash = self
             .node
             .runs()
@@ -841,6 +937,13 @@ impl World<'_> {
             && !self.node.needs_flush()
             && self.acked_starts.len() == self.wanted.len()
             && (!self.workload.signals || self.acked_signals.len() == self.wanted.len())
+            && (!self.workload.updates
+                || self.wanted.iter().all(|(key, _)| {
+                    self.acked_updates.contains_key(key)
+                        || self
+                            .latest(key)
+                            .is_some_and(|r| r.state().status().is_terminal())
+                }))
             && self.acked_cancels.len() == self.to_cancel.len()
             && self.wanted.iter().all(|(key, _)| {
                 self.latest(key)
@@ -856,14 +959,19 @@ impl World<'_> {
             let count = |f: fn(&aqueduct_core::Entry) -> bool| {
                 run.journal().iter().filter(|e| f(e)).count()
             };
-            let received = count(|e| matches!(e, aqueduct_core::Entry::SignalReceived { .. }));
+            // The client's `go` signal: object loops take calls through signals of their own.
+            let received = count(
+                |e| matches!(e, aqueduct_core::Entry::SignalReceived { name, .. } if name == "go"),
+            );
             // A wait that a cancellation completed takes no signal.
             let waited = run
                 .state()
                 .steps()
                 .iter()
                 .filter(|s| {
-                    matches!(s.kind, aqueduct_core::CommandKind::Signal { .. }) && !s.cancelled
+                    matches!(s.kind, aqueduct_core::CommandKind::Signal { .. })
+                        && s.name == "go"
+                        && !s.cancelled
                 })
                 .count();
             if received > 1 || received < waited {
@@ -976,6 +1084,72 @@ impl World<'_> {
             }
         }
 
+        // Updates were received once, and the answer the client was given is the one journaled.
+        for (key, run) in self.node.runs() {
+            let received = run
+                .journal()
+                .iter()
+                .filter(|e| matches!(e, Entry::UpdateReceived { .. }))
+                .count();
+            if received > 1 {
+                return Err(format!("run {key} received {received} updates"));
+            }
+        }
+        for (key, answer) in &self.acked_updates {
+            let run = self
+                .latest(key)
+                .ok_or_else(|| format!("run {key} missing at the end"))?;
+            let journaled = run.journal().iter().find_map(|e| match e {
+                Entry::UpdateCompleted { result, .. } => Some(result.clone()),
+                _ => None,
+            });
+            if journaled.as_ref() != Some(answer) {
+                return Err(format!(
+                    "run {key}'s update was answered {answer:?}, the journal has {journaled:?}"
+                ));
+            }
+        }
+
+        self.report.updates_answered = self.acked_updates.len() as u64;
+        self.report.children = self
+            .node
+            .runs()
+            .values()
+            .filter(|run| run.state().workflow() == "child")
+            .count() as u64;
+
+        // Every message arrived exactly once: an object key counts the runs that sent to it. A
+        // cancelled run may have sent its message or not.
+        if !self.workload.objects.is_empty() {
+            let mut expected: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+            for (key, input) in &self.wanted {
+                let (_, sends) = workflow::reference_with_sends(&self.workload, input)?;
+                let cancelled = self
+                    .latest(key)
+                    .is_some_and(|run| run.state().cancel_reason().is_some());
+                for target in sends {
+                    let range = expected.entry(target).or_default();
+                    if !cancelled {
+                        range.0 += 1;
+                    }
+                    range.1 += 1;
+                }
+            }
+            for ((object, key), (least, most)) in expected {
+                let state = self.node.object_state(&object, &key)?;
+                let count = state
+                    .and_then(|p| serde_json::from_slice::<serde_json::Value>(p.as_bytes()).ok())
+                    .and_then(|v| v["n"].as_u64())
+                    .unwrap_or(0);
+                if count < least || count > most {
+                    return Err(format!(
+                        "object {object} key {key} counted {count} messages, expected {least} to {most}"
+                    ));
+                }
+                self.report.messages += count;
+            }
+        }
+
         // The durable log holds exactly the in-memory journals, with valid chains.
         let decoded = frame::decode_all(self.node.disk().durable());
         if decoded.valid_len != self.node.disk().durable().len() {
@@ -1003,7 +1177,9 @@ impl World<'_> {
             if verified.entries != run.journal() {
                 return Err(format!("run {key}: durable journal differs from memory"));
             }
-            if run.state().version() != Some(crate::node::VERSION) {
+            // An object key's loop is the engine's own; its calls are pinned like any run.
+            let engines_own = key.starts_with("$object/");
+            if !engines_own && run.state().version() != Some(crate::node::VERSION) {
                 return Err(format!("run {key} is not pinned to its version"));
             }
             for byte in verified.head {

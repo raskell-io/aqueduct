@@ -185,6 +185,33 @@ def run(input):
     return step("validate", extracted + "#" + go)
 "##;
 
+/// The composite workload's parent: a child run, an update it answers, and a message to an object.
+pub const COMPOSITE: &str = r##"
+def run(input):
+    kid = call("child", input)
+    request = wait(update("confirm"))
+    respond(request, kid + "+" + request["value"])
+    send("counter", "c" + str(len(input) % 3), "add", 1)
+    return step("validate", kid + "#" + request["value"])
+"##;
+
+/// The composite workload's child run.
+pub const COMPOSITE_CHILD: &str = "def run(input):\n    return step(\"extract\", input)\n";
+
+/// The object the composite workload's runs send to: a counter per key.
+pub const COUNTER: &str = "counter";
+
+/// The counter's handler: adds its argument to the key's count.
+pub const COUNTER_ADD: &str = r##"
+def run(call):
+    total = call["state"].get("n", 0) + call["args"]
+    return {"output": total, "writes": {"n": total}}
+"##;
+
+/// The update the client sends each composite run, and what it says.
+pub const CONFIRM: &str = "confirm";
+pub const CONFIRMED: &[u8] = b"\"yes\"";
+
 /// The token budget a run with this input starts with: for a third of runs too small for the Starlark
 /// pipeline's agent call (which then escalates), for a third ample, for a third none.
 pub fn run_budget(input: &Payload) -> Option<u64> {
@@ -254,10 +281,22 @@ pub struct Workload {
     pub escalations: bool,
     pub decider: Arc<dyn Decider + Send + Sync>,
     pub execute: fn(&str, &Payload) -> StepOutcome,
+    /// Whether runs wait for an update from the client.
+    pub updates: bool,
+    /// Other workflows, pinned to the same version: children and object handlers.
+    pub others: Vec<(String, Arc<dyn Decider + Send + Sync>)>,
+    /// Virtual objects.
+    pub objects: Vec<String>,
 }
 
 impl Workload {
     pub fn new(kind: WorkloadKind) -> Result<Workload, String> {
+        let compile =
+            |name: &str, source: &str| -> Result<Arc<dyn Decider + Send + Sync>, String> {
+                Ok(Arc::new(
+                    Procedure::compile(name, source).map_err(|e| e.to_string())?,
+                ))
+            };
         Ok(match kind {
             WorkloadKind::Pipeline => Workload {
                 kind,
@@ -265,6 +304,9 @@ impl Workload {
                 escalations: false,
                 decider: Arc::new(Pipeline),
                 execute,
+                updates: false,
+                others: Vec::new(),
+                objects: Vec::new(),
             },
             WorkloadKind::RustPipeline => Workload {
                 kind,
@@ -272,6 +314,9 @@ impl Workload {
                 escalations: false,
                 decider: Arc::new(aqueduct_sdk::workflow(rust_pipeline)),
                 execute: execute_json,
+                updates: false,
+                others: Vec::new(),
+                objects: Vec::new(),
             },
             WorkloadKind::StarlarkTimers => Workload {
                 kind,
@@ -282,6 +327,25 @@ impl Workload {
                         .map_err(|e| e.to_string())?,
                 ),
                 execute: execute_json,
+                updates: false,
+                others: Vec::new(),
+                objects: Vec::new(),
+            },
+            WorkloadKind::Composite => Workload {
+                kind,
+                signals: false,
+                escalations: false,
+                decider: compile("composite.star", COMPOSITE)?,
+                execute: execute_json,
+                updates: true,
+                others: vec![
+                    ("child".to_owned(), compile("child.star", COMPOSITE_CHILD)?),
+                    (
+                        aqueduct_engine::objects::handler_workflow(COUNTER, "add"),
+                        compile("add.star", COUNTER_ADD)?,
+                    ),
+                ],
+                objects: vec![COUNTER.to_owned()],
             },
             WorkloadKind::StarlarkPipeline => Workload {
                 kind,
@@ -293,6 +357,9 @@ impl Workload {
                         .map_err(|e| e.to_string())?,
                 ),
                 execute: execute_json,
+                updates: false,
+                others: Vec::new(),
+                objects: Vec::new(),
             },
         })
     }
@@ -306,7 +373,8 @@ impl Workload {
             }
             WorkloadKind::StarlarkPipeline
             | WorkloadKind::StarlarkTimers
-            | WorkloadKind::RustPipeline => {
+            | WorkloadKind::RustPipeline
+            | WorkloadKind::Composite => {
                 let text: String = (0..len)
                     .map(|_| char::from(b'a' + rng.below(26) as u8))
                     .collect();
@@ -316,23 +384,52 @@ impl Workload {
     }
 }
 
+/// How a run ends: its status, output and error.
+pub type Ending = (Status, Option<Payload>, Option<String>);
+
 /// The expected end of a run with this input, computed by sequential execution without faults.
-pub fn reference(
+pub fn reference(workload: &Workload, input: &Payload) -> Result<Ending, String> {
+    reference_with_sends(workload, input).map(|(ending, _)| ending)
+}
+
+/// [`reference`], with the messages the run sends to objects: `(object, key)` for each.
+pub fn reference_with_sends(
     workload: &Workload,
     input: &Payload,
-) -> Result<(Status, Option<Payload>, Option<String>), String> {
-    let first = aqueduct_core::start_version(
+) -> Result<(Ending, Vec<(String, String)>), String> {
+    let mut sends = Vec::new();
+    let ending = reference_of(
+        workload,
+        workload.decider.as_ref(),
         crate::node::WORKFLOW,
-        input.clone(),
+        input,
         run_budget(input),
+        &mut sends,
+    )?;
+    Ok((ending, sends))
+}
+
+fn reference_of(
+    workload: &Workload,
+    decider: &(dyn Decider + Send + Sync),
+    workflow: &str,
+    input: &Payload,
+    budget: Option<u64>,
+    sends: &mut Vec<(String, String)>,
+) -> Result<Ending, String> {
+    let first = aqueduct_core::start_version(
+        workflow,
+        input.clone(),
+        budget,
         Some(crate::node::VERSION.to_owned()),
     );
     let mut state = RunState::from_journal(&first.entries).map_err(|e| e.to_string())?;
     let mut work = first.effects;
     let mut signalled = false;
+    let mut updated = false;
     loop {
         let event = match work.pop() {
-            Some(Effect::Activate) => Event::Decision(workload.decider.decide(&state.view())),
+            Some(Effect::Activate) => Event::Decision(decider.decide(&state.view())),
             Some(Effect::DispatchStep { cmd, name, input }) => Event::StepResult {
                 cmd,
                 outcome: (workload.execute)(&name, &input),
@@ -344,10 +441,33 @@ pub fn reference(
                 outcome: Ok(fake_model(&name, &request)),
             },
             Some(Effect::Finished(_)) => continue,
-            Some(Effect::StartChild { .. } | Effect::CancelChild { .. } | Effect::Send { .. }) => {
-                return Err(
-                    "the simulated workloads start no child runs and send no messages".into(),
-                );
+            // A child runs to its end on its own, and its end is the command's outcome.
+            Some(Effect::StartChild {
+                cmd,
+                workflow: child,
+                input: child_input,
+                ..
+            }) => {
+                let child_decider = workload
+                    .others
+                    .iter()
+                    .find(|(name, _)| *name == child)
+                    .map(|(_, decider)| decider.as_ref())
+                    .ok_or_else(|| format!("the reference has no workflow `{child}`"))?;
+                let (status, output, error) =
+                    reference_of(workload, child_decider, &child, &child_input, None, sends)?;
+                let outcome = match status {
+                    Status::Completed => StepOutcome::Completed(output.unwrap_or_default()),
+                    _ => StepOutcome::Failed(error.unwrap_or_default()),
+                };
+                Event::ChildResult { cmd, outcome }
+            }
+            Some(Effect::Send { object, key, .. }) => {
+                sends.push((object, key));
+                continue;
+            }
+            Some(Effect::CancelChild { .. }) => {
+                return Err("the simulated workloads cancel no children".into());
             }
             // The run continued as new: the key's next run takes over.
             Some(Effect::ContinueAsNew { input }) => {
@@ -355,7 +475,7 @@ pub fn reference(
                     .budget()
                     .map(|budget| budget.saturating_sub(state.tokens_used()));
                 let next = aqueduct_core::start_version(
-                    crate::node::WORKFLOW,
+                    workflow,
                     input,
                     left,
                     Some(crate::node::VERSION.to_owned()),
@@ -368,6 +488,18 @@ pub fn reference(
             // Nothing to do but wait: let time pass (fire timers), or deliver the client's signal.
             None => match state.timers().first() {
                 Some(&(cmd, _)) => Event::TimerFired { cmd },
+                // The client's update, once the run waits for it.
+                None if workload.updates
+                    && !updated
+                    && state.awaiting_update(CONFIRM).is_some() =>
+                {
+                    updated = true;
+                    Event::Update {
+                        name: CONFIRM.into(),
+                        id: CONFIRM.into(),
+                        payload: Payload::new(CONFIRMED.to_vec()),
+                    }
+                }
                 None if workload.signals && !signalled => {
                     signalled = true;
                     Event::Signal {
