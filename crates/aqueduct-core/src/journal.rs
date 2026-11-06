@@ -212,6 +212,12 @@ pub enum Entry {
         /// The resolution.
         outcome: Payload,
     },
+    /// The run's priority was set: higher is taken first by workers, among the waiting work of its
+    /// namespace (ADR 0049). Not seen by the run's logic, so it never changes what the run decides.
+    PrioritySet {
+        /// The priority.
+        priority: u32,
+    },
     /// The run was asked to stop. Every command without an outcome completes as failed and cancelled;
     /// when none is pending, the next command the run issues does. At most once per run.
     CancelRequested {

@@ -576,6 +576,18 @@ impl Engine {
         crate::import::Stage::begin(&self.dir)
     }
 
+    /// Sets the priority of a key's latest run (ADR 0049), durably: its waiting steps and activations
+    /// move to their new place at once. A run that has ended is left as it is.
+    pub fn set_priority(&self, key: &str, priority: u32) -> Result<(), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::SetPriority {
+            key: key.to_owned(),
+            priority,
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
     /// Every build of every remote workflow (ADR 0048).
     pub fn deployments(&self) -> Result<Vec<crate::deployments::DeploymentInfo>, EngineError> {
         let (reply, answer) = mpsc::channel();
@@ -990,6 +1002,11 @@ impl Drop for Engine {
 }
 
 enum Request {
+    SetPriority {
+        key: String,
+        priority: u32,
+        reply: Sender<Result<(), EngineError>>,
+    },
     Deployments {
         reply: Sender<Result<Vec<crate::deployments::DeploymentInfo>, EngineError>>,
     },
@@ -1409,6 +1426,30 @@ impl Processor {
                     let _ = reply.send(answer);
                 }));
             }
+            Request::SetPriority {
+                key,
+                priority,
+                reply,
+            } => {
+                let answer = match self.partition.set_priority(&key, priority) {
+                    Ok(Some(run)) => {
+                        // Waiting work moves at once; the answer waits until the change is durable.
+                        if let Some((queue, _)) = &self.remote {
+                            queue.reprioritize(&run, priority);
+                        }
+                        if let Some(queue) = &self.activations {
+                            queue.reprioritize(&run, priority);
+                        }
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(PartitionError::UnknownRun(key)) => Err(EngineError::UnknownRun(key)),
+                    Err(error) => return Err(error.to_string()),
+                };
+                self.deferred.push(Box::new(move || {
+                    let _ = reply.send(answer);
+                }));
+            }
             Request::Deployments { reply } => {
                 let _ = reply.send(Ok(self.deployment_list()));
             }
@@ -1684,7 +1725,9 @@ impl Processor {
                     let attempt = self.attempt(&key, cmd);
                     if let Some((queue, _)) = &self.remote {
                         let build = self.partition.pinned_build(&key);
-                        queue.offer_pinned(&key, cmd, &name, input, attempt, build, queue.now_ms());
+                        let priority = self.partition.priority(&key);
+                        let now = queue.now_ms();
+                        queue.offer_pinned(&key, cmd, &name, input, attempt, build, priority, now);
                     }
                 }
                 Outbound::Dispatch {
@@ -1749,7 +1792,9 @@ impl Processor {
                         .map(|entry| chain.append(entry))
                         .collect();
                     let build = self.partition.pinned_build(&key);
-                    queue.offer_pinned(&key, &workflow, build, at, history, env, queue.now_ms());
+                    let priority = self.partition.priority(&key);
+                    let now = queue.now_ms();
+                    queue.offer_pinned(&key, &workflow, build, priority, at, history, env, now);
                 }
                 Outbound::ResultRecorded { .. }
                 | Outbound::AttemptRecorded { .. }

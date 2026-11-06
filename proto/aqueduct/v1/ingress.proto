@@ -25,6 +25,8 @@ service Ingress {
   rpc CompleteAwakeable(CompleteAwakeableRequest) returns (Ack);
   // Asks a run to stop: what it waits for fails as cancelled.
   rpc Cancel(CancelRequest) returns (Ack);
+  // Sets a running run's priority (ADR 0049): its waiting work moves at once.
+  rpc SetPriority(SetPriorityRequest) returns (Ack);
   // Asks a run a query: the last value its logic published under the name (ADR 0036).
   rpc Query(QueryRequest) returns (QueryResponse);
   // Sends an update and waits for the run's answer (ADR 0036).
@@ -49,6 +51,9 @@ message StartRequest {
   // The run's token budget for agent calls; 0 means none.
   uint64 budget_tokens = 5;
   ReusePolicy reuse = 6;
+  // The run's priority (ADR 0049): higher is taken first by workers, within the namespace. Starting a
+  // key that has a running run sets that run's priority. Unset: 0 for a new run.
+  optional uint32 priority = 7;
 }
 
 enum ReusePolicy {
@@ -116,6 +121,8 @@ message RunDescription {
   repeated Command commands = 8;
   // Journal entries so far.
   uint64 entries = 9;
+  // The run's priority (ADR 0049).
+  uint32 priority = 10;
 }
 
 message ListRunsRequest {
@@ -153,6 +160,11 @@ message CompleteAwakeableRequest {
 message CancelRequest {
   string key = 1;
   string reason = 2;
+}
+
+message SetPriorityRequest {
+  string key = 1;
+  uint32 priority = 2;
 }
 
 message QueryRequest {

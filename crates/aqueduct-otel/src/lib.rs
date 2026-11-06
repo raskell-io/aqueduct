@@ -367,6 +367,11 @@ impl Observer for OtelObserver {
                 ],
                 Some(error.clone()),
             ),
+            Entry::PrioritySet { priority } => point(
+                "priority set".into(),
+                vec![KeyValue::new("aqueduct.priority", i64::from(*priority))],
+                None,
+            ),
             Entry::CancelRequested { reason } => point(
                 "cancel requested".into(),
                 vec![KeyValue::new("aqueduct.reason", reason.clone())],

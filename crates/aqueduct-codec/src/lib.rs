@@ -73,6 +73,7 @@ mod kind {
     pub const UPDATE_COMPLETED: u8 = 32;
     pub const UPDATE_REJECTED: u8 = 33;
     pub const MESSAGE_SENT: u8 = 34;
+    pub const PRIORITY_SET: u8 = 35;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -200,6 +201,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::UpdateCompleted { .. } => kind::UPDATE_COMPLETED,
         Entry::UpdateRejected { .. } => kind::UPDATE_REJECTED,
         Entry::MessageSent { .. } => kind::MESSAGE_SENT,
+        Entry::PrioritySet { .. } => kind::PRIORITY_SET,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -335,6 +337,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_varint(&mut out, response.input_tokens);
             put_varint(&mut out, response.output_tokens);
         }
+        Entry::PrioritySet { priority } => put_varint(&mut out, u64::from(*priority)),
         Entry::RunFailed { error } => put_bytes(&mut out, error.as_bytes()),
         Entry::Parked { reason } | Entry::CancelRequested { reason } => {
             put_bytes(&mut out, reason.as_bytes());
@@ -534,6 +537,9 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
         },
         kind::CONTINUED_AS_NEW => Entry::ContinuedAsNew {
             input: reader.payload()?,
+        },
+        kind::PRIORITY_SET => Entry::PrioritySet {
+            priority: u32::try_from(reader.varint()?).map_err(|_| DecodeError::Overflow)?,
         },
         kind::CANCEL_REQUESTED => Entry::CancelRequested {
             reason: reader.string()?,

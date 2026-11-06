@@ -83,7 +83,7 @@ commands:
                                       serve the Model Context Protocol on stdio, for agents: propose,
                                       validate and replay versions, start and inspect runs, resolve
                                       escalations (changes are made as <identity>; default agent/mcp)
-  start <dir> <workflow> <key> <json> [--version <v>] [--budget <tokens>]
+  start <dir> <workflow> <key> <json> [--version <v>] [--budget <tokens>] [--priority <n>]
                                       start a run on the registry's active version (or <v>); it
                                       runs when the engine next opens
   signal <dir> <key> <name> <json> [<id>]
@@ -697,6 +697,9 @@ fn runs(dir: &Path) -> Result<String, String> {
 fn describe(dir: &Path, key: &str) -> Result<String, String> {
     let (state, _) = run_state(dir, key)?;
     let mut out = format!("run       {key}\nworkflow  {}\n", state.workflow());
+    if state.priority() != 0 {
+        out.push_str(&format!("priority  {}\n", state.priority()));
+    }
     if let Some(version) = state.version() {
         out.push_str(&format!("version   {version}\n"));
     }
@@ -1344,7 +1347,7 @@ pub(crate) fn replay_workflow(
 /// version (or `version`), and its first decision; the engine runs it when it next opens.
 fn start(dir: &Path, args: &[String]) -> Result<String, String> {
     let mut positional: Vec<&str> = Vec::new();
-    let (mut version, mut budget) = (None, None);
+    let (mut version, mut budget, mut priority) = (None, None, None);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -1356,6 +1359,13 @@ fn start(dir: &Path, args: &[String]) -> Result<String, String> {
                         .map_err(|_| format!("--budget needs a number, not `{text}`"))?,
                 );
             }
+            "--priority" => {
+                let text = rest.next().ok_or("--priority needs a number")?;
+                priority = Some(
+                    text.parse::<u32>()
+                        .map_err(|_| format!("--priority needs a number, not `{text}`"))?,
+                );
+            }
             flag if flag.starts_with("--") => return Err(format!("unknown option `{flag}`")),
             other => positional.push(other),
         }
@@ -1363,7 +1373,7 @@ fn start(dir: &Path, args: &[String]) -> Result<String, String> {
     let [workflow, key, json] = positional[..] else {
         return Err(format!("start needs <workflow> <key> <json>\n\n{USAGE}"));
     };
-    start_run(dir, workflow, key, json, version, budget)
+    start_run(dir, workflow, key, json, version, budget, priority)
 }
 
 pub(crate) fn start_run(
@@ -1373,6 +1383,7 @@ pub(crate) fn start_run(
     json: &str,
     version: Option<String>,
     budget_tokens: Option<u64>,
+    priority: Option<u32>,
 ) -> Result<String, String> {
     serde_json::from_str::<serde_json::Value>(json)
         .map_err(|e| format!("the input is not JSON ({e})"))?;
@@ -1403,6 +1414,7 @@ pub(crate) fn start_run(
         reuse: aqueduct_engine::ReusePolicy::ReturnExisting,
         budget_tokens,
         version,
+        priority,
     };
     partition
         .start_with(
@@ -1839,6 +1851,7 @@ fn describe_entry(entry: &Entry) -> String {
         Entry::RunFailed { error } => format!("run failed: {error}"),
         Entry::Parked { reason } => format!("run parked: {reason}"),
         Entry::CancelRequested { reason } => format!("cancel requested: {reason}"),
+        Entry::PrioritySet { priority } => format!("priority set: {priority}"),
         Entry::Escalated {
             cmd,
             reason,
@@ -2009,6 +2022,7 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         Entry::RunFailed { error } => json!({"kind": "RunFailed", "error": error}),
         Entry::Parked { reason } => json!({"kind": "Parked", "reason": reason}),
         Entry::CancelRequested { reason } => json!({"kind": "CancelRequested", "reason": reason}),
+        Entry::PrioritySet { priority } => json!({"kind": "PrioritySet", "priority": priority}),
         Entry::Escalated {
             cmd: c,
             reason,

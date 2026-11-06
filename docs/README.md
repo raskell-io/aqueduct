@@ -93,6 +93,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0046: Namespaces](adr/0046-namespaces.md)
 - [0047: Migrating a data directory to a server](adr/0047-migrate.md)
 - [0048: Deployments across workers](adr/0048-deployments.md)
+- [0049: Per-run priorities](adr/0049-priorities.md)
 
 ### Observability
 
