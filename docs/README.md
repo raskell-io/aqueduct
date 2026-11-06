@@ -19,6 +19,7 @@ To contribute: [CONTRIBUTING](../CONTRIBUTING.md).
 
 | | |
 |---|---|
+| [Single server, Linux runner](measurements/2026-11-06-server-linux-runner.md) | The same on a hosted Linux runner |
 | [Single server](measurements/2026-11-05-server-m4.md) | Starts, tokens and the audit log, overload, workers, draining a backlog |
 | [Embedded engine](measurements/2026-10-31-engine-m4.md) | Start to first step, throughput, by durability mode |
 | [Storage](measurements/2026-10-31-storage-m4.md) | The plain log, redb and fjall (ADR 0009) |
@@ -94,6 +95,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0047: Migrating a data directory to a server](adr/0047-migrate.md)
 - [0048: Deployments across workers](adr/0048-deployments.md)
 - [0049: Per-run priorities](adr/0049-priorities.md)
+- [0050: The single-server target, as measured](adr/0050-single-server-target.md)
 
 ### Observability
 

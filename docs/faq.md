@@ -63,7 +63,7 @@ runs wait until a workflow worker serves them. [ADR 0047](adr/0047-migrate.md) h
 ## How fast is it?
 
 On an Apple M4 with a real flush on every commit, a single server starts 12,500 to 16,700 runs per second over gRPC with
-256 clients, and 8,300 to 9,400 with tokens and the audit log. One client gets about 200, because each start waits for
+256 clients, and 8,300 to 10,300 with tokens and the audit log; on a Linux runner, 17,200 and 14,400. One client gets about 200, because each start waits for
 the disk: throughput comes from many clients sharing a flush. Those runs were on a machine that was not idle, with steps
 that do nothing. [The measurements](measurements/2026-11-05-server-m4.md) say how far to trust them.
 
