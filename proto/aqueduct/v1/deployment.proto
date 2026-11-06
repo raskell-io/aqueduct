@@ -1,0 +1,49 @@
+// Aqueduct deployments API, version 1 (draft, ADR 0048).
+//
+// A deployment is a build of a remote workflow's code. New runs start on the active build and stay pinned
+// to it; a build replaced by another drains, and is retired once no runs are left on it. All of it needs
+// the `admin` permission, in the default namespace.
+
+syntax = "proto3";
+
+package aqueduct.v1;
+
+service Deployments {
+  // Every build of every remote workflow.
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
+  // Makes a build the one new runs start on; the one before starts draining. Also a rollback.
+  rpc ActivateDeployment(ActivateDeploymentRequest) returns (DeploymentAck);
+  // Retires a build that is not active and has no open runs.
+  rpc RetireDeployment(RetireDeploymentRequest) returns (DeploymentAck);
+}
+
+message ListDeploymentsRequest {}
+
+message Deployment {
+  string workflow = 1;
+  string build = 2;
+  // `active`, `draining`, `retired`, or `unlisted`: runs or workers name it, and it was never activated.
+  string state = 3;
+  // Runs pinned to it that have not ended.
+  uint64 open_runs = 4;
+  // Workflow workers connected now that announce it.
+  uint64 workers = 5;
+}
+
+message ListDeploymentsResponse {
+  repeated Deployment deployments = 1;
+}
+
+message ActivateDeploymentRequest {
+  string workflow = 1;
+  string build = 2;
+  // Activate it though no connected worker announces it: new runs wait until one does.
+  bool force = 3;
+}
+
+message RetireDeploymentRequest {
+  string workflow = 1;
+  string build = 2;
+}
+
+message DeploymentAck {}

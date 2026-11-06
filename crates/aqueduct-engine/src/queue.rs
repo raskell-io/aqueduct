@@ -41,6 +41,9 @@ pub struct Invocation {
 /// A step: its run and command.
 type Target = (String, CommandIndex);
 
+/// A waiting list: a queue, and the build its steps are pinned to.
+type List = (String, Option<String>);
+
 /// Where a step is: waiting for a worker, or leased to one until a deadline.
 #[derive(Debug)]
 struct Entry {
@@ -55,6 +58,27 @@ struct Entry {
     place: u64,
     /// The invocation ids handed out for it: a result under any of them counts.
     ids: Vec<String>,
+    /// The build its run is pinned to (ADR 0048), if any.
+    deployment: Option<String>,
+}
+
+/// Which pinned steps a worker takes (ADR 0048).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Serves<'a> {
+    /// A worker that announces no build: any step.
+    Any,
+    /// A worker that announces a build: steps of runs pinned to it, and of runs not pinned.
+    Build(&'a str),
+}
+
+impl Serves<'_> {
+    /// Whether a worker takes a step of a run pinned to `deployment`.
+    fn takes(&self, deployment: Option<&str>) -> bool {
+        match self {
+            Serves::Any => true,
+            Serves::Build(build) => deployment.is_none_or(|pinned| pinned == *build),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -70,7 +94,7 @@ struct Inner {
     /// The order in which waiting steps are offered, by namespace and queue. Places are in offer order
     /// across queues. A step answered or leased leaves its place behind, dropped when it is reached, so
     /// that nothing here costs more as the backlog grows.
-    waiting: BTreeMap<String, BTreeMap<String, VecDeque<(u64, Target)>>>,
+    waiting: BTreeMap<String, BTreeMap<List, VecDeque<(u64, Target)>>>,
     next_place: u64,
     /// The steps under a lease, by when it runs out.
     leases: BTreeSet<(u64, Target)>,
@@ -96,19 +120,25 @@ impl Inner {
         self.waiting
             .entry(namespace_of(&target.0).to_owned())
             .or_default()
-            .entry(entry.queue.clone())
+            .entry((entry.queue.clone(), entry.deployment.clone()))
             .or_default()
             .push_back((place, target));
     }
 
-    /// The next place in a namespace's named queues, in offer order, dropping those out of date.
-    fn next_in(&mut self, namespace: &str, queues: &[String]) -> Option<(u64, String)> {
+    /// The next place in a namespace's named queues that a worker takes from, in offer order, dropping
+    /// those out of date.
+    fn next_in(
+        &mut self,
+        namespace: &str,
+        queues: &[String],
+        serves: Serves<'_>,
+    ) -> Option<(u64, List)> {
         let lists = self.waiting.get_mut(namespace)?;
-        let mut next: Option<(u64, String)> = None;
-        for queue in queues {
-            let Some(list) = lists.get_mut(queue) else {
+        let mut next: Option<(u64, List)> = None;
+        for (name, list) in lists.iter_mut() {
+            if !queues.contains(&name.0) || !serves.takes(name.1.as_deref()) {
                 continue;
-            };
+            }
             while let Some((place, target)) = list.front() {
                 let current = self
                     .entries
@@ -122,14 +152,14 @@ impl Inner {
             if let Some((place, _)) = list.front()
                 && next.as_ref().is_none_or(|(first, _)| place < first)
             {
-                next = Some((*place, queue.clone()));
+                next = Some((*place, name.clone()));
             }
         }
         next
     }
 
-    fn pop(&mut self, namespace: &str, queue: &str) -> Option<Target> {
-        let list = self.waiting.get_mut(namespace)?.get_mut(queue)?;
+    fn pop(&mut self, namespace: &str, list: &List) -> Option<Target> {
+        let list = self.waiting.get_mut(namespace)?.get_mut(list)?;
         list.pop_front().map(|(_, target)| target)
     }
 }
@@ -200,6 +230,21 @@ impl StepQueue {
         attempt: u32,
         now_ms: u64,
     ) {
+        self.offer_pinned(run, cmd, step, input, attempt, None, now_ms);
+    }
+
+    /// [`StepQueue::offer`], for a run pinned to a build (ADR 0048).
+    #[allow(clippy::too_many_arguments)]
+    pub fn offer_pinned(
+        &self,
+        run: &str,
+        cmd: CommandIndex,
+        step: &str,
+        input: Payload,
+        attempt: u32,
+        deployment: Option<&str>,
+        now_ms: u64,
+    ) {
         let mut inner = self.lock();
         let target = (run.to_owned(), cmd);
         if let Some(entry) = inner.entries.get(&target) {
@@ -221,6 +266,7 @@ impl StepQueue {
             lease: None,
             place: 0,
             ids: Vec::new(),
+            deployment: deployment.map(str::to_owned),
         });
         entry.lease = None;
         // Never below what the run has recorded.
@@ -254,6 +300,19 @@ impl StepQueue {
         max: usize,
         now_ms: u64,
     ) -> Vec<Invocation> {
+        self.take_for(scope, Serves::Any, worker, queues, max, now_ms)
+    }
+
+    /// [`StepQueue::take_in`], for a worker that announces what it serves (ADR 0048).
+    pub fn take_for(
+        &self,
+        scope: &Scope,
+        serves: Serves<'_>,
+        worker: &str,
+        queues: &[String],
+        max: usize,
+        now_ms: u64,
+    ) -> Vec<Invocation> {
         let mut inner = self.lock();
         Self::expire_locked(&mut inner, now_ms);
         let inner = &mut *inner;
@@ -266,7 +325,7 @@ impl StepQueue {
             .collect();
         let candidates: Vec<String> = namespaces
             .into_iter()
-            .filter(|namespace| inner.next_in(namespace, queues).is_some())
+            .filter(|namespace| inner.next_in(namespace, queues, serves).is_some())
             .collect();
         // Those coming back from idle catch up. (A worker of one namespace has no one to be fair to.)
         if *scope == Scope::All {
@@ -288,20 +347,20 @@ impl StepQueue {
         let mut taken = Vec::new();
         while taken.len() < max {
             // The lowest pass with something to take, the first of equals.
-            let mut next: Option<(String, String, f64)> = None;
+            let mut next: Option<(String, List, f64)> = None;
             for namespace in &candidates {
                 let pass = inner.pass.get(namespace).copied().unwrap_or(0.0);
                 if next.as_ref().is_some_and(|(_, _, lowest)| pass >= *lowest) {
                     continue;
                 }
-                if let Some((_, queue)) = inner.next_in(namespace, queues) {
-                    next = Some((namespace.clone(), queue, pass));
+                if let Some((_, list)) = inner.next_in(namespace, queues, serves) {
+                    next = Some((namespace.clone(), list, pass));
                 }
             }
-            let Some((namespace, queue, pass)) = next else {
+            let Some((namespace, list, pass)) = next else {
                 break;
             };
-            let Some(target) = inner.pop(&namespace, &queue) else {
+            let Some(target) = inner.pop(&namespace, &list) else {
                 break;
             };
             let weight = self.weights.get(&namespace).copied().unwrap_or(1.0);
@@ -333,7 +392,7 @@ impl StepQueue {
         if *scope == Scope::All {
             inner.backlogged = candidates
                 .into_iter()
-                .filter(|namespace| inner.next_in(namespace, queues).is_some())
+                .filter(|namespace| inner.next_in(namespace, queues, serves).is_some())
                 .collect();
         }
         taken
@@ -359,9 +418,22 @@ impl StepQueue {
         max: usize,
         wait: Duration,
     ) -> Vec<Invocation> {
+        self.wait_take_for(scope, Serves::Any, worker, queues, max, wait)
+    }
+
+    /// [`StepQueue::wait_take_in`], for a worker that announces what it serves (ADR 0048).
+    pub fn wait_take_for(
+        &self,
+        scope: &Scope,
+        serves: Serves<'_>,
+        worker: &str,
+        queues: &[String],
+        max: usize,
+        wait: Duration,
+    ) -> Vec<Invocation> {
         let deadline = Instant::now() + wait;
         loop {
-            let taken = self.take_in(scope, worker, queues, max, self.now_ms());
+            let taken = self.take_for(scope, serves, worker, queues, max, self.now_ms());
             let left = deadline.saturating_duration_since(Instant::now());
             if !taken.is_empty() || left.is_zero() || max == 0 {
                 return taken;

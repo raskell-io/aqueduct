@@ -26,6 +26,7 @@ use aqueduct_registry::{
 };
 use aqueduct_storage::{FileLog, FileLogOptions, RedbStateStore};
 
+mod deployments;
 mod migrate;
 
 const USAGE: &str = "usage: aqueduct <command> <data-dir> [arguments]
@@ -47,6 +48,14 @@ commands:
   drift <dir> --model <provider>/<model> --max-tokens <n> [<key>...] [options]
                                       ask past runs' agent calls again, live, with a model, and
                                       compare the answers with the recorded ones (model-drift replay)
+  deployments list --server <url> [--token-file <file>] [--ca <file>]
+                                      each build of each remote workflow: state, open runs, workers
+                                      (ADR 0048). The token needs admin: from the file, or AQUEDUCT_TOKEN
+  deployments activate <workflow> <build> --server <url> [--force] [...]
+                                      new runs start on this build; the active one starts draining.
+                                      A connected worker must announce it, unless --force
+  deployments retire <workflow> <build> --server <url> [...]
+                                      only once it is draining, with no open runs
   migrate --from <dir> --to <url> [--token-file <file>] [--ca <file>] [--dry-run]
                                       move a data directory's runs and procedure versions to a
                                       server (ADR 0047). The source is frozen first, and the server
@@ -175,6 +184,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
             ))
         }
         Some("migrate") => migrate::migrate(&args[1..]),
+        Some("deployments") => deployments::deployments(&args[1..]),
         Some("versions") => versions(&args[1..]),
         Some("keys") => keys(&args[1..]),
         Some("mcp") => {

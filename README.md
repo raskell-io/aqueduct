@@ -13,8 +13,8 @@
 
 > **Status: single server, nearly complete (phase 3 of the [build brief](BRIEF.md)).** The embedded engine,
 > procedures, agent steps and the version registry are built. So is a server with workers in Rust, Python and
-> TypeScript, tokens, TLS, an audit log, namespaces and overload protection. Deployments across workers and
-> per-run priorities are the two items left in this phase. A replicated cluster is planned and not started.
+> TypeScript, deployments, tokens, TLS, an audit log, namespaces and overload protection. Per-run priorities are
+> the one item left in this phase. A replicated cluster is planned and not started.
 >
 > You can try it, but do not depend on it yet: the APIs and the history format will still change, and nothing
 > is published on crates.io. See [what is not done](#what-is-not-done), the [docs](docs/README.md) and the
@@ -42,7 +42,7 @@ one journal format and one set of guarantees.
 | mode | what runs | who it suits | state |
 |---|---|---|---|
 | **Embedded** | the engine, inside your program (`aqueduct` crate) | CLIs, desktop apps, single binary services, tests | built |
-| **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built, two items left |
+| **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built, one item left |
 | **Cluster** | several servers, replicated | production platforms | planned |
 
 An embedded directory and a server's are the same format, and
@@ -229,6 +229,7 @@ run records one result.
 | **Protocol** | gRPC and HTTP/JSON, draft | [protocol](docs/protocol.md), [ADR 0038](docs/adr/0038-server-and-protocol.md) |
 | **Step workers** | [Rust](crates/aqueduct-worker/src/lib.rs), [Python](sdks/python/README.md) (standard library only), [TypeScript](sdks/typescript/README.md) (no dependencies), all held to a [conformance suite](conformance/README.md) | [ADR 0038](docs/adr/0038-server-and-protocol.md) |
 | **Workflow workers** | Rust workflows' logic in another process; the server sends each activation the run's verified history | [ADR 0039](docs/adr/0039-workflow-workers.md) |
+| **Deployments** | a worker announces its build; new runs start on the active one and stay pinned to it, only that build's workers decide them, and a build drains before it is retired | [ADR 0048](docs/adr/0048-deployments.md) |
 | **Task queues, push endpoints** | steps grouped into named queues, or posted to an HTTP endpoint for serverless platforms | [ADR 0040](docs/adr/0040-task-queues-and-push.md) |
 | **Tokens, audit log** | `aqueduct tokens create`; each route needs a permission; a hash-chained log of who did what, and of every refusal | [ADR 0041](docs/adr/0041-authentication.md) |
 | **TLS** | `--tls-cert`, `--tls-key`; beyond loopback it needs tokens and a certificate | [ADR 0042](docs/adr/0042-server-tls.md) |
@@ -289,7 +290,7 @@ embedded engine, not the server. Those have tests of their own, which are narrow
 
 ## What is not done
 
-- **Deployments across workers, and per-run priorities:** the rest of phase 3.
+- **Per-run priorities:** the rest of phase 3.
 - **A cluster:** no replication. A single server does not survive losing its disk.
 - **Stable formats:** the protocol and the history format are drafts until phase 5.
 - **Packages:** nothing on crates.io, PyPI or npm. Depend on the repository.

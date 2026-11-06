@@ -244,6 +244,7 @@ async fn grpc_calls_are_refused_with_grpc_codes_and_audited() {
                 steps: vec!["s".into()],
                 capacity: 1,
                 queues: Vec::new(),
+                deployment: String::new(),
             })),
         }]))
         .await

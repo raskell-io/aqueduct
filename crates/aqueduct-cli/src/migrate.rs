@@ -195,14 +195,17 @@ fn report(
     out
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, String> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())
 }
 
-async fn connect(url: &str, ca: Option<&str>) -> Result<tonic::transport::Channel, String> {
+pub(crate) async fn connect(
+    url: &str,
+    ca: Option<&str>,
+) -> Result<tonic::transport::Channel, String> {
     let error = |e: tonic::transport::Error| {
         // What actually went wrong is further down: `transport error` says little.
         let mut text = format!("cannot connect to {url}: {e}");

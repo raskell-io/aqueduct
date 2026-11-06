@@ -519,6 +519,7 @@ async fn step_worker(
             steps: vec!["first".into(), "second".into(), "third".into()],
             capacity,
             queues: Vec::new(),
+            deployment: String::new(),
         })),
     })
     .await

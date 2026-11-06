@@ -91,6 +91,14 @@ struct Server {
     log: Arc<Mutex<String>>,
 }
 
+/// A server is stopped however its test ends, so a failing test leaves no process behind.
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Server {
     fn start(dir: &Path, config: &Path) -> Result<Server, String> {
         let mut child = Command::new(BINARY)
@@ -131,12 +139,13 @@ impl Server {
         }
     }
 
-    fn stop(mut self) -> String {
+    fn stop(self) -> String {
         let pid = self.child.id().to_string();
         Command::new("kill").args(["-TERM", &pid]).status().unwrap();
-        self.child.wait().unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        self.log.lock().unwrap().clone()
+        let log = self.log.clone();
+        drop(self);
+        log.lock().unwrap().clone()
     }
 
     fn url(&self) -> String {

@@ -34,6 +34,9 @@ message WorkflowHello {
   repeated string workflows = 2;
   // How many activations it works on at once.
   uint32 capacity = 3;
+  // The build it runs (ADR 0048). It takes activations of runs pinned to this build and of runs not
+  // pinned; without one, only of runs not pinned.
+  string deployment = 4;
 }
 
 message WorkflowServerMessage {

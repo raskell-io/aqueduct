@@ -18,6 +18,7 @@
 
 pub mod audit;
 pub mod auth;
+mod deployments;
 mod imports;
 mod limits;
 mod push;
@@ -142,6 +143,7 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
     let grpc = tonic::service::Routes::new(v1::ingress_server::IngressServer::new(api.clone()))
         .add_service(v1::workers_server::WorkersServer::new(api.clone()))
         .add_service(v1::workflows_server::WorkflowsServer::new(api.clone()))
+        .add_service(v1::deployments_server::DeploymentsServer::new(api.clone()))
         .add_service(
             v1::imports_server::ImportsServer::new(api.clone())
                 .max_decoding_message_size(imports::MOST_IN_A_MESSAGE),
@@ -166,6 +168,7 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
         .with_state(api.clone());
     grpc.merge(http)
         .merge(workers::routes(api.clone()))
+        .merge(deployments::routes(api.clone()))
         .layer(axum::middleware::from_fn_with_state(api, authorize))
 }
 
@@ -328,6 +331,9 @@ fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static st
             }
             _ => (Permission::Admin, "unknown call"),
         };
+    }
+    if path.starts_with("/aqueduct.v1.Deployments/") || path.starts_with("/v1/deployments") {
+        return (Permission::Admin, "deployment");
     }
     if path == "/aqueduct.v1.Imports/Upload" {
         return (Permission::Admin, "import");
@@ -509,6 +515,7 @@ impl From<EngineError> for Failure {
             | EngineError::InvalidAwakeable(_) => Kind::Invalid,
             EngineError::Timeout(_) => Kind::Timeout,
             EngineError::UpdateRejected(_)
+            | EngineError::Deployment(_)
             | EngineError::InvalidResolution(_)
             | EngineError::HandlerFailed(_)
             | EngineError::Unsupported(_) => Kind::Rejected,
