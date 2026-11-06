@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use aqueduct_core::Env;
 
 use crate::namespaces::{Scope, namespace_of};
+use crate::queue::aged;
 
 /// An activation for a worker: decide run `run` at the first `at` entries of its history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +52,10 @@ struct Entry {
     ids: Vec<String>,
     /// The build the run is pinned to (ADR 0048), if any.
     version: Option<String>,
+    /// The run's priority (ADR 0049).
+    priority: u32,
+    /// When the run's first waiting activation was offered: waiting raises its priority.
+    since_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -70,8 +75,8 @@ struct Inner {
     issued: BTreeMap<String, (String, usize)>,
 }
 
-/// A waiting list: a namespace, a workflow, and the build its runs are pinned to.
-type List = (String, String, Option<String>);
+/// A waiting list: a namespace, a workflow, the build its runs are pinned to, and their priority.
+type List = (String, String, Option<String>, u32);
 
 impl Inner {
     /// Gives a run's activation a place at the end of the waiting list.
@@ -86,6 +91,7 @@ impl Inner {
             namespace_of(&run).to_owned(),
             entry.workflow.clone(),
             entry.version.clone(),
+            entry.priority,
         );
         self.waiting
             .entry(list)
@@ -100,8 +106,10 @@ impl Inner {
         scope: &Scope,
         workflows: &[String],
         build: Option<&str>,
+        now_ms: u64,
     ) -> Option<List> {
-        let mut next: Option<(u64, List)> = None;
+        // The highest priority, as raised by waiting; among equals, the first offered.
+        let mut next: Option<((u64, std::cmp::Reverse<u64>), List)> = None;
         for (list, waiting) in &mut self.waiting {
             let pinned_elsewhere = list.2.as_deref().is_some_and(|pin| Some(pin) != build);
             if !scope.includes(&list.0) || !workflows.contains(&list.1) || pinned_elsewhere {
@@ -117,10 +125,12 @@ impl Inner {
                 }
                 waiting.pop_front();
             }
-            if let Some((place, _)) = waiting.front()
-                && next.as_ref().is_none_or(|(first, _)| place < first)
-            {
-                next = Some((*place, list.clone()));
+            if let Some((place, run)) = waiting.front() {
+                let since = self.entries.get(run).map_or(now_ms, |e| e.since_ms);
+                let rank = (aged(list.3, since, now_ms), std::cmp::Reverse(*place));
+                if next.as_ref().is_none_or(|(best, _)| rank > *best) {
+                    next = Some((rank, list.clone()));
+                }
             }
         }
         next.map(|(_, list)| list)
@@ -167,7 +177,7 @@ impl ActivationQueue {
         env: Env,
         now_ms: u64,
     ) {
-        self.offer_pinned(run, workflow, None, at, history, env, now_ms);
+        self.offer_pinned(run, workflow, None, 0, at, history, env, now_ms);
     }
 
     /// [`ActivationQueue::offer`], for a run pinned to a build (ADR 0048).
@@ -177,6 +187,7 @@ impl ActivationQueue {
         run: &str,
         workflow: &str,
         version: Option<&str>,
+        priority: u32,
         at: usize,
         history: Vec<Vec<u8>>,
         env: Env,
@@ -193,13 +204,15 @@ impl ActivationQueue {
             }
         }
         let previous = inner.entries.remove(run);
+        let since_ms = previous.as_ref().map_or(now_ms, |p| p.since_ms);
         let (offers, ids, waiting) = match previous {
             Some(previous) => {
                 if let Some((_, until)) = &previous.lease {
                     inner.leases.remove(&(*until, run.to_owned()));
                 }
                 // One already waiting keeps its place.
-                let waiting = previous.lease.is_none().then_some(previous.place);
+                let waiting = (previous.lease.is_none() && previous.priority == priority)
+                    .then_some(previous.place);
                 (previous.offers, previous.ids, waiting)
             }
             None => (0, Vec::new(), None),
@@ -216,6 +229,8 @@ impl ActivationQueue {
                 place: waiting.unwrap_or(0),
                 ids,
                 version: version.map(str::to_owned),
+                priority,
+                since_ms,
             },
         );
         if waiting.is_none() {
@@ -278,7 +293,7 @@ impl ActivationQueue {
         }
         let mut taken = Vec::new();
         while taken.len() < max {
-            let Some(list) = inner.next_in(scope, workflows, build) else {
+            let Some(list) = inner.next_in(scope, workflows, build, now_ms) else {
                 break;
             };
             let Some((_, run)) = inner.waiting.get_mut(&list).and_then(VecDeque::pop_front) else {
@@ -383,6 +398,23 @@ impl ActivationQueue {
         Some((run, at))
     }
 
+    /// A run's priority changed (ADR 0049): a waiting activation moves to its new place at once.
+    pub fn reprioritize(&self, run: &str, priority: u32) {
+        let mut inner = self.lock();
+        let Some(entry) = inner.entries.get_mut(run) else {
+            return;
+        };
+        entry.priority = priority;
+        let waiting = entry.lease.is_none();
+        if waiting {
+            inner.enqueue(run.to_owned());
+        }
+        drop(inner);
+        if waiting {
+            self.ready.notify_all();
+        }
+    }
+
     /// A worker of these workflows connected, running `build`. It counts until [`Self::disconnected`].
     pub fn connected(&self, workflows: &[String], build: Option<&str>) {
         let mut inner = self.lock();
@@ -450,6 +482,41 @@ mod tests {
 
     fn workflows() -> Vec<String> {
         vec!["orders".to_owned()]
+    }
+
+    #[test]
+    fn activations_go_by_priority_and_waiting_raises_it() {
+        // Leases long enough that nothing taken is offered again here.
+        let q = ActivationQueue::new(Duration::from_secs(600));
+        let offer = |run: &str, priority: u32, now: u64| {
+            q.offer_pinned(
+                run,
+                "orders",
+                None,
+                priority,
+                1,
+                Vec::new(),
+                Env::default(),
+                now,
+            );
+        };
+        offer("old", 0, 0);
+        offer("urgent", 3, 5_000);
+        let runs = |taken: Vec<Activation>| taken.into_iter().map(|a| a.run).collect::<Vec<_>>();
+        assert_eq!(runs(q.take("w", &workflows(), 1, 5_000)), ["urgent"]);
+        offer("fresh", 3, 40_000);
+        assert_eq!(
+            runs(q.take("w", &workflows(), 1, 40_000)),
+            ["old"],
+            "aged to 4"
+        );
+        // A new priority moves a waiting activation.
+        q.reprioritize("fresh", 0);
+        offer("later", 1, 40_000);
+        assert_eq!(
+            runs(q.take("w", &workflows(), 2, 40_001)),
+            ["later", "fresh"]
+        );
     }
 
     #[test]

@@ -11,10 +11,11 @@
   Every run leaves a history you can replay and audit.
 </p>
 
-> **Status: single server, nearly complete (phase 3 of the [build brief](BRIEF.md)).** The embedded engine,
-> procedures, agent steps and the version registry are built. So is a server with workers in Rust, Python and
-> TypeScript, deployments, tokens, TLS, an audit log, namespaces and overload protection. Per-run priorities are
-> the one item left in this phase. A replicated cluster is planned and not started.
+> **Status: single server (phase 3 of the [build brief](BRIEF.md)).** The embedded engine, procedures, agent steps
+> and the version registry are built. So is a server with workers in Rust, Python and TypeScript, deployments,
+> priorities, tokens, TLS, an audit log, namespaces and overload protection: every item of phase 3. One target is
+> not met: with tokens and the audit log, the server starts fewer than 10,000 runs a second. A replicated cluster
+> is planned and not started.
 >
 > You can try it, but do not depend on it yet: the APIs and the history format will still change, and nothing
 > is published on crates.io. See [what is not done](#what-is-not-done), the [docs](docs/README.md) and the
@@ -42,7 +43,7 @@ one journal format and one set of guarantees.
 | mode | what runs | who it suits | state |
 |---|---|---|---|
 | **Embedded** | the engine, inside your program (`aqueduct` crate) | CLIs, desktop apps, single binary services, tests | built |
-| **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built, one item left |
+| **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built |
 | **Cluster** | several servers, replicated | production platforms | planned |
 
 An embedded directory and a server's are the same format, and
@@ -279,6 +280,7 @@ embedded engine, not the server. Those have tests of their own, which are narrow
 |---|---|
 | **Durable waits** | timers, signals, awakeables with `select`, escalations to a person ([ADR 0016](docs/adr/0016-select-and-awakeables.md), [ADR 0020](docs/adr/0020-escalations.md)) |
 | **Long-lived runs** | continue-as-new, and keys reused as generations ([ADR 0022](docs/adr/0022-generations-and-continue-as-new.md)) |
+| **Priorities** | an urgent run's steps and activations go first within its namespace, waiting work ages so nothing starves, and children and successors inherit it ([ADR 0049](docs/adr/0049-priorities.md)) |
 | **Recorded values** | `ctx.now()`, `ctx.random()`, `ctx.uuid()`: recorded once, read back on replay ([ADR 0015](docs/adr/0015-recorded-values.md)) |
 | **Child runs** | `call("payment", input)`, `ctx.child("payment", &input)`; cancelling a parent cancels its children ([ADR 0034](docs/adr/0034-child-runs.md)) |
 | **Virtual objects** | keyed state, handlers run one at a time per key, state changes commit with completion ([ADR 0043](docs/adr/0043-virtual-objects.md)); messages between objects commit with the writes and arrive once ([ADR 0044](docs/adr/0044-outboxes.md)) |
@@ -290,7 +292,6 @@ embedded engine, not the server. Those have tests of their own, which are narrow
 
 ## What is not done
 
-- **Per-run priorities:** the rest of phase 3.
 - **A cluster:** no replication. A single server does not survive losing its disk.
 - **Stable formats:** the protocol and the history format are drafts until phase 5.
 - **Packages:** nothing on crates.io, PyPI or npm. Depend on the repository.

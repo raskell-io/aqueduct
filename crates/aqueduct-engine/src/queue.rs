@@ -41,8 +41,8 @@ pub struct Invocation {
 /// A step: its run and command.
 type Target = (String, CommandIndex);
 
-/// A waiting list: a queue, and the build its steps are pinned to.
-type List = (String, Option<String>);
+/// A waiting list: a queue, the build its steps are pinned to, and their priority.
+type List = (String, Option<String>, u32);
 
 /// Where a step is: waiting for a worker, or leased to one until a deadline.
 #[derive(Debug)]
@@ -60,6 +60,18 @@ struct Entry {
     ids: Vec<String>,
     /// The build its run is pinned to (ADR 0048), if any.
     deployment: Option<String>,
+    /// Its run's priority (ADR 0049).
+    priority: u32,
+    /// When it was first offered: waiting raises its priority, so nothing waits for ever.
+    since_ms: u64,
+}
+
+/// How long waiting raises a step's or an activation's priority by one (ADR 0049).
+pub const AGING_MS: u64 = 10_000;
+
+/// A priority, raised by one for every [`AGING_MS`] waited.
+pub(crate) fn aged(priority: u32, since_ms: u64, now_ms: u64) -> u64 {
+    u64::from(priority) + now_ms.saturating_sub(since_ms) / AGING_MS
 }
 
 /// Which pinned steps a worker takes (ADR 0048).
@@ -120,7 +132,11 @@ impl Inner {
         self.waiting
             .entry(namespace_of(&target.0).to_owned())
             .or_default()
-            .entry((entry.queue.clone(), entry.deployment.clone()))
+            .entry((
+                entry.queue.clone(),
+                entry.deployment.clone(),
+                entry.priority,
+            ))
             .or_default()
             .push_back((place, target));
     }
@@ -132,9 +148,11 @@ impl Inner {
         namespace: &str,
         queues: &[String],
         serves: Serves<'_>,
+        now_ms: u64,
     ) -> Option<(u64, List)> {
         let lists = self.waiting.get_mut(namespace)?;
-        let mut next: Option<(u64, List)> = None;
+        // The highest priority, as raised by waiting; among equals, the first offered.
+        let mut next: Option<((u64, std::cmp::Reverse<u64>), List)> = None;
         for (name, list) in lists.iter_mut() {
             if !queues.contains(&name.0) || !serves.takes(name.1.as_deref()) {
                 continue;
@@ -149,13 +167,15 @@ impl Inner {
                 }
                 list.pop_front();
             }
-            if let Some((place, _)) = list.front()
-                && next.as_ref().is_none_or(|(first, _)| place < first)
-            {
-                next = Some((*place, name.clone()));
+            if let Some((place, target)) = list.front() {
+                let since = self.entries.get(target).map_or(now_ms, |e| e.since_ms);
+                let rank = (aged(name.2, since, now_ms), std::cmp::Reverse(*place));
+                if next.as_ref().is_none_or(|(best, _)| rank > *best) {
+                    next = Some((rank, name.clone()));
+                }
             }
         }
-        next
+        next.map(|((_, std::cmp::Reverse(place)), list)| (place, list))
     }
 
     fn pop(&mut self, namespace: &str, list: &List) -> Option<Target> {
@@ -230,7 +250,7 @@ impl StepQueue {
         attempt: u32,
         now_ms: u64,
     ) {
-        self.offer_pinned(run, cmd, step, input, attempt, None, now_ms);
+        self.offer_pinned(run, cmd, step, input, attempt, None, 0, now_ms);
     }
 
     /// [`StepQueue::offer`], for a run pinned to a build (ADR 0048).
@@ -243,6 +263,7 @@ impl StepQueue {
         input: Payload,
         attempt: u32,
         deployment: Option<&str>,
+        priority: u32,
         now_ms: u64,
     ) {
         let mut inner = self.lock();
@@ -267,7 +288,10 @@ impl StepQueue {
             place: 0,
             ids: Vec::new(),
             deployment: deployment.map(str::to_owned),
+            priority,
+            since_ms: now_ms,
         });
+        entry.priority = priority;
         entry.lease = None;
         // Never below what the run has recorded.
         entry.attempts = entry.attempts.max(attempt.saturating_sub(1));
@@ -325,7 +349,7 @@ impl StepQueue {
             .collect();
         let candidates: Vec<String> = namespaces
             .into_iter()
-            .filter(|namespace| inner.next_in(namespace, queues, serves).is_some())
+            .filter(|namespace| inner.next_in(namespace, queues, serves, now_ms).is_some())
             .collect();
         // Those coming back from idle catch up. (A worker of one namespace has no one to be fair to.)
         if *scope == Scope::All {
@@ -353,7 +377,7 @@ impl StepQueue {
                 if next.as_ref().is_some_and(|(_, _, lowest)| pass >= *lowest) {
                     continue;
                 }
-                if let Some((_, list)) = inner.next_in(namespace, queues, serves) {
+                if let Some((_, list)) = inner.next_in(namespace, queues, serves, now_ms) {
                     next = Some((namespace.clone(), list, pass));
                 }
             }
@@ -392,7 +416,7 @@ impl StepQueue {
         if *scope == Scope::All {
             inner.backlogged = candidates
                 .into_iter()
-                .filter(|namespace| inner.next_in(namespace, queues, serves).is_some())
+                .filter(|namespace| inner.next_in(namespace, queues, serves, now_ms).is_some())
                 .collect();
         }
         taken
@@ -471,6 +495,32 @@ impl StepQueue {
         Some(target)
     }
 
+    /// A run's priority changed (ADR 0049): its waiting steps move to their new place at once, keeping
+    /// how long they have waited.
+    pub fn reprioritize(&self, run: &str, priority: u32) {
+        let mut inner = self.lock();
+        let targets: Vec<Target> = inner
+            .entries
+            .range((run.to_owned(), CommandIndex(0))..=(run.to_owned(), CommandIndex(u32::MAX)))
+            .map(|(target, _)| target.clone())
+            .collect();
+        let mut moved = false;
+        for target in targets {
+            let Some(entry) = inner.entries.get_mut(&target) else {
+                continue;
+            };
+            entry.priority = priority;
+            if entry.lease.is_none() {
+                inner.enqueue(target);
+                moved = true;
+            }
+        }
+        drop(inner);
+        if moved {
+            self.ready.notify_all();
+        }
+    }
+
     /// A worker's session ended: its leases are offered again at once.
     pub fn release(&self, worker: &str) {
         let mut inner = self.lock();
@@ -542,6 +592,66 @@ mod tests {
 
     fn names(steps: &[&str]) -> Vec<String> {
         steps.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn offer(q: &StepQueue, run: &str, priority: u32, now_ms: u64) {
+        let input = Payload::new(*b"1");
+        q.offer_pinned(run, CommandIndex(0), "s", input, 1, None, priority, now_ms);
+    }
+
+    fn runs_of(taken: &[Invocation]) -> Vec<&str> {
+        taken.iter().map(|i| i.run.as_str()).collect()
+    }
+
+    #[test]
+    fn higher_priorities_go_first_and_equals_in_the_order_offered() {
+        let q = queue();
+        offer(&q, "low-1", 0, 0);
+        offer(&q, "high", 5, 1);
+        offer(&q, "low-2", 0, 2);
+        offer(&q, "middle", 2, 3);
+        let taken = q.take("w", &names(&["s"]), 10, 4);
+        assert_eq!(runs_of(&taken), ["high", "middle", "low-1", "low-2"]);
+    }
+
+    #[test]
+    fn waiting_raises_a_steps_priority_so_nothing_waits_for_ever() {
+        let q = queue();
+        offer(&q, "old", 0, 0);
+        // Fresh work of priority 3 goes ahead of it until it has waited 30 seconds.
+        offer(&q, "new", 3, 25_000);
+        assert_eq!(runs_of(&q.take("w", &names(&["s"]), 1, 25_000)), ["new"]);
+        offer(&q, "newer", 3, 30_000);
+        assert_eq!(
+            runs_of(&q.take("w", &names(&["s"]), 1, 30_000)),
+            ["old"],
+            "three periods of waiting: it ranks with priority 3, and was offered first"
+        );
+    }
+
+    #[test]
+    fn a_new_priority_moves_waiting_steps_and_keeps_their_wait() {
+        let q = queue();
+        offer(&q, "a", 0, 0);
+        offer(&q, "b", 1, 0);
+        q.reprioritize("a", 4);
+        assert_eq!(runs_of(&q.take("w", &names(&["s"]), 1, 1)), ["a"]);
+        // Lowered under another that waited as long: it goes after it.
+        offer(&q, "c", 3, 2);
+        q.reprioritize("c", 0);
+        assert_eq!(runs_of(&q.take("w", &names(&["s"]), 2, 3)), ["b", "c"]);
+    }
+
+    #[test]
+    fn priorities_do_not_cross_namespaces() {
+        let q = queue();
+        // One namespace's urgent work does not take another's share of a shared worker.
+        for i in 0..4 {
+            offer(&q, &format!("$ns/a/urgent-{i}"), 9, 0);
+        }
+        offer(&q, "$ns/b/routine", 0, 0);
+        let taken = q.take("w", &names(&["s"]), 2, 1);
+        assert_eq!(runs_of(&taken), ["$ns/a/urgent-0", "$ns/b/routine"]);
     }
 
     #[test]

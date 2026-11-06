@@ -154,7 +154,8 @@ const TOOLS: &[Tool] = &[
                     "key": string("The run key, unique per run, for example claim-7."),
                     "input": {"description": "The run's input (any JSON)."},
                     "version": string("Start on this approved version instead of the active one."),
-                    "budget_tokens": {"type": "integer", "minimum": 1, "description": "The run's token budget for agent calls."}
+                    "budget_tokens": {"type": "integer", "minimum": 1, "description": "The run's token budget for agent calls."},
+                    "priority": {"type": "integer", "minimum": 0, "description": "Higher is taken first by workers, within the namespace (ADR 0049); waiting raises it by one every 10 seconds"}
                 }),
                 &["workflow", "key", "input"],
             )
@@ -387,6 +388,9 @@ impl Server {
                     &input,
                     args["version"].as_str().map(str::to_owned),
                     args["budget_tokens"].as_u64(),
+                    args["priority"]
+                        .as_u64()
+                        .map(|p| u32::try_from(p).unwrap_or(u32::MAX)),
                 )
             }
             "list_runs" => cli(&["runs", dir]),

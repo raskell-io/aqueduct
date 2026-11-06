@@ -45,19 +45,25 @@ gives the HTTP/JSON form of each call.
 
 | call | HTTP/JSON | body | answer |
 |---|---|---|---|
-| `Start` | `POST /v1/runs` | `{"key", "workflow", "input", "version"?, "budget_tokens"?, "reuse"?}` | `{"run_id", "version"}` |
+| `Start` | `POST /v1/runs` | `{"key", "workflow", "input", "version"?, "budget_tokens"?, "reuse"?, "priority"?}` | `{"run_id", "version"}` |
 | `Wait` | `GET /v1/runs/{key}/result?timeout_ms=` | | `{"status", "output", "error", "version"}` |
 | `Describe` | `GET /v1/runs/{key}` | | the run: status, version, input, output, commands |
 | `ListRuns` | `GET /v1/runs?workflow=&status=&limit=` | | `{"runs": [...]}` |
 | `Signal` | `POST /v1/runs/{key}/signals/{name}` | `{"payload", "id"?}` | `{}` |
 | `CompleteAwakeable` | `POST /v1/awakeables/{id}` | `{"payload"}` | `{}` |
 | `Cancel` | `POST /v1/runs/{key}/cancel` | `{"reason"?}` | `{}` |
+| `SetPriority` | `POST /v1/runs/{key}/priority` | `{"priority"}` | `{}` |
 | `Query` | `GET /v1/runs/{key}/queries/{name}` | | `{"value"}` |
 | `Update` | `POST /v1/runs/{key}/updates/{name}` | `{"payload", "id"?, "timeout_ms"?}` | `{"result"}` or 422 `{"error"}` |
 | `ListEscalations` | `GET /v1/escalations` | | `{"escalations": [{"id", "key", "reason", "payload"}]}` |
 | `ResolveEscalation` | `POST /v1/escalations/{id}` | `{"outcome"}` | `{}` |
 | `CallObject` | `POST /v1/objects/{object}/{key}/{handler}` | `{"args", "id"?, "timeout_ms"?}` | `{"output"}`, or 422 `{"error"}` if the handler failed |
 | `GetObjectState` | `GET /v1/objects/{object}/{key}` | | `{"state"}` |
+
+`priority` (ADR 0049) is a number, higher first, 0 by default: workers are given the highest priority among a
+namespace's waiting steps and activations, and waiting raises it by one every 10 seconds. Starting a key that has a running
+run sets that run's priority. `SetPriority` changes it while the run runs, with the `start` permission; children and
+successors inherit it. `Describe` includes it.
 
 `reuse` is `"return_existing"` (the default), `"reject"` or `"allow_after_completion"`. Statuses are
 `"running"`, `"completed"`, `"failed"`, `"parked"` and `"continued"`. Ids containing `#` or a NUL are
@@ -177,7 +183,6 @@ build and of runs not pinned. Without one, it takes any step.
 
 ## 7. Not in this draft yet
 
-- **Per-run priorities.**
 - **OIDC/JWT and mTLS.** The server has static tokens (ADR 0041) and TLS (ADR 0042). It binds to loopback by default;
   beyond loopback it needs tokens and a certificate.
 - **Version management** over the network (register, propose, prove, approve): for now through `aqueduct versions` on

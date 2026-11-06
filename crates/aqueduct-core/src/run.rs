@@ -541,6 +541,7 @@ pub struct RunState {
     entries: usize,
     /// The cancellation's reason, once one is recorded.
     cancel: Option<String>,
+    priority: u32,
     /// The next run's input, if the run continued as new.
     continued_with: Option<Payload>,
     /// Tokens used by the run's completed agent calls.
@@ -582,6 +583,7 @@ impl RunState {
             error: None,
             entries: 1,
             cancel: None,
+            priority: 0,
             continued_with: None,
             tokens_used: 0,
             budget: *budget_tokens,
@@ -626,6 +628,7 @@ impl RunState {
                 self.steps[index].held = None;
                 self.record(*cmd, StepOutcome::Completed(outcome.clone()))?;
             }
+            Entry::PrioritySet { priority } => self.priority = *priority,
             Entry::CancelRequested { reason } => {
                 if self.cancel.is_some() {
                     return Err(JournalError::DuplicateCancel);
@@ -1176,6 +1179,22 @@ impl RunState {
     /// The next run's input, if the run continued as new.
     pub fn continued_with(&self) -> Option<&Payload> {
         self.continued_with.as_ref()
+    }
+
+    /// The run's priority (ADR 0049): 0 unless set.
+    pub fn priority(&self) -> u32 {
+        self.priority
+    }
+
+    /// Sets the run's priority: the entry to journal, if the run is running and the priority changes.
+    pub fn set_priority(&self, priority: u32) -> Transition {
+        if self.status.is_terminal() || self.priority == priority {
+            return Transition::none();
+        }
+        Transition {
+            entries: vec![Entry::PrioritySet { priority }],
+            effects: Vec::new(),
+        }
     }
 
     /// The cancellation's reason, if the run was cancelled.

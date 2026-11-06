@@ -155,6 +155,7 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
         .route("/v1/runs/{key}/result", get(http_wait))
         .route("/v1/runs/{key}/signals/{name}", post(http_signal))
         .route("/v1/runs/{key}/cancel", post(http_cancel))
+        .route("/v1/runs/{key}/priority", post(http_set_priority))
         .route("/v1/runs/{key}/queries/{name}", get(http_query))
         .route("/v1/runs/{key}/updates/{name}", post(http_update))
         .route("/v1/awakeables/{id}", post(http_complete_awakeable))
@@ -324,6 +325,7 @@ fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static st
             "CompleteAwakeable" => (Permission::Signal, "complete awakeable"),
             "Update" => (Permission::Signal, "update"),
             "Cancel" => (Permission::Cancel, "cancel"),
+            "SetPriority" => (Permission::Start, "set priority"),
             "ResolveEscalation" => (Permission::Resolve, "resolve"),
             "CallObject" => (Permission::Signal, "call object"),
             "Wait" | "Describe" | "ListRuns" | "Query" | "ListEscalations" | "GetObjectState" => {
@@ -350,6 +352,7 @@ fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static st
         (&Method::POST, ["v1", "runs", _, "signals", _]) => (Permission::Signal, "signal"),
         (&Method::POST, ["v1", "runs", _, "updates", _]) => (Permission::Signal, "update"),
         (&Method::POST, ["v1", "runs", _, "cancel"]) => (Permission::Cancel, "cancel"),
+        (&Method::POST, ["v1", "runs", _, "priority"]) => (Permission::Start, "set priority"),
         (&Method::POST, ["v1", "awakeables", _]) => (Permission::Signal, "complete awakeable"),
         (&Method::POST, ["v1", "escalations", _]) => (Permission::Resolve, "resolve"),
         (&Method::POST, ["v1", "objects", _, _, _]) => (Permission::Signal, "call object"),
@@ -650,6 +653,7 @@ impl Api {
             reuse,
             budget_tokens: (start.budget_tokens > 0).then_some(start.budget_tokens),
             version: (!start.version.is_empty()).then_some(start.version),
+            priority: start.priority,
         };
         let key = run_key(&start.key)?;
         let namespace = namespace();
@@ -740,6 +744,18 @@ impl Api {
         self.call(move |engine| engine.complete_awakeable(&id, payload))
             .await?;
         Ok(v1::Ack {})
+    }
+
+    async fn set_priority(&self, key: String, priority: u32) -> Result<v1::Ack, Failure> {
+        let target = format!("{key} to {priority}");
+        let result = async {
+            let key = run_key(&key)?;
+            self.call(move |engine| engine.set_priority(&key, priority))
+                .await
+                .map(|()| v1::Ack {})
+        }
+        .await;
+        self.audited("set priority", target, result).await
     }
 
     async fn cancel(&self, key: String, reason: String) -> Result<v1::Ack, Failure> {
@@ -939,6 +955,7 @@ fn description(run_id: String, state: &RunState) -> v1::RunDescription {
         error: state.error().unwrap_or_default().to_owned(),
         commands,
         entries: state.len() as u64,
+        priority: state.priority(),
     }
 }
 
@@ -987,6 +1004,14 @@ impl v1::ingress_server::Ingress for Api {
     ) -> Answer<v1::Ack> {
         let request = request.into_inner();
         answer(Api::complete_awakeable(self, request.id, request.payload).await)
+    }
+
+    async fn set_priority(
+        &self,
+        request: tonic::Request<v1::SetPriorityRequest>,
+    ) -> Answer<v1::Ack> {
+        let request = request.into_inner();
+        answer(Api::set_priority(self, request.key, request.priority).await)
     }
 
     async fn cancel(&self, request: tonic::Request<v1::CancelRequest>) -> Answer<v1::Ack> {
@@ -1104,6 +1129,8 @@ struct StartBody {
     budget_tokens: u64,
     #[serde(default)]
     reuse: Option<String>,
+    #[serde(default)]
+    priority: Option<u32>,
 }
 
 async fn http_start(
@@ -1124,6 +1151,7 @@ async fn http_start(
             version: body.version,
             budget_tokens: body.budget_tokens,
             reuse: reuse as i32,
+            priority: body.priority,
         })
         .await?;
     Ok(Json(
@@ -1185,6 +1213,7 @@ async fn http_describe(
         "output": if run.output.is_empty() { Value::Null } else { value(&run.output) },
         "error": run.error,
         "entries": run.entries,
+        "priority": run.priority,
         "commands": commands,
     })))
 }
@@ -1269,6 +1298,20 @@ async fn http_complete_awakeable(
 struct CancelBody {
     #[serde(default)]
     reason: String,
+}
+
+#[derive(Deserialize)]
+struct PriorityBody {
+    priority: u32,
+}
+
+async fn http_set_priority(
+    State(api): State<Api>,
+    Path(key): Path<String>,
+    Body(body): Body<PriorityBody>,
+) -> Result<Json<Value>, Failure> {
+    api.set_priority(key, body.priority).await?;
+    Ok(Json(json!({})))
 }
 
 async fn http_cancel(

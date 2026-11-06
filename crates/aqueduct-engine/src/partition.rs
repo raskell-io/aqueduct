@@ -421,6 +421,10 @@ pub struct StartOptions {
     pub budget_tokens: Option<u64>,
     /// The version to start the run on; by default the workflow's active version (ADR 0029).
     pub version: Option<String>,
+    /// The run's priority (ADR 0049): higher is taken first. Starting a key that already has a running
+    /// run sets that run's priority, so a retried start that was lost before it was durable converges.
+    /// `None` leaves it as it is: 0 for a new run, inherited for a child or a successor.
+    pub priority: Option<u32>,
 }
 
 impl From<ReusePolicy> for StartOptions {
@@ -642,11 +646,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             };
             let workflow = run.state.workflow().to_owned();
             let budget = successor_budget(&run.state);
+            let priority = run.state.priority();
             let (base, generation) = split_run_id(key);
             let next = run_id(base, generation + 1);
             if !self.runs.contains_key(&next) && self.lookup_run(&next)?.is_none() {
                 let version = self.successor_version(&workflow);
-                self.create_run(&next, &workflow, input, budget, version)?;
+                self.create_run(&next, &workflow, input, budget, version, priority)?;
             }
         }
         Ok(())
@@ -689,6 +694,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             reuse: policy,
             budget_tokens,
             version,
+            priority,
         } = options;
         if !valid_key(key) {
             return Err(PartitionError::InvalidKey(key.to_owned()));
@@ -714,6 +720,9 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                         if head.workflow() != workflow || *head.input() != input {
                             return Err(PartitionError::KeyConflict(key.to_owned()));
                         }
+                        if let Some(priority) = priority {
+                            self.set_run_priority(&latest, priority)?;
+                        }
                         None
                     }
                 }
@@ -729,6 +738,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 input,
                 budget_tokens,
                 version,
+                priority.unwrap_or(0),
             )?;
         }
         Ok(())
@@ -790,7 +800,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             .entry(child.clone())
             .or_default()
             .insert((parent.to_owned(), cmd));
-        match self.start_run(&child, workflow, input, StartOptions::default()) {
+        // A child is as urgent as the run waiting for it.
+        let options = StartOptions {
+            priority: Some(self.runs.get(parent).map_or(0, |run| run.state.priority())),
+            ..StartOptions::default()
+        };
+        match self.start_run(&child, workflow, input, options) {
             Ok(()) => {}
             Err(
                 e @ (PartitionError::UnknownWorkflow(_)
@@ -913,8 +928,13 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         input: Payload,
         budget: Option<u64>,
         version: Option<String>,
+        priority: u32,
     ) -> Result<(), PartitionError> {
-        let first = start_version(workflow, input, budget, version);
+        let mut first = start_version(workflow, input, budget, version);
+        // In the same batch as the start: a run is never acknowledged without its priority.
+        if priority != 0 {
+            first.entries.push(Entry::PrioritySet { priority });
+        }
         let state = RunState::from_journal(&first.entries)
             .map_err(|e| PartitionError::Internal(e.to_string()))?;
         self.runs.insert(
@@ -1030,6 +1050,36 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             key: key.to_owned(),
         });
         Ok(())
+    }
+
+    /// Sets the priority of a key's latest run (ADR 0049), journaled. A run that has ended is left as it
+    /// is. Returns the run id, if the run is running.
+    pub fn set_priority(
+        &mut self,
+        key: &str,
+        priority: u32,
+    ) -> Result<Option<String>, PartitionError> {
+        let id = self
+            .latest(key)?
+            .ok_or_else(|| PartitionError::UnknownRun(key.to_owned()))?;
+        Ok(self.set_run_priority(&id, priority)?.then_some(id))
+    }
+
+    fn set_run_priority(&mut self, id: &str, priority: u32) -> Result<bool, PartitionError> {
+        let Some(run) = self.runs.get(id) else {
+            return Ok(false);
+        };
+        if run.state.status().is_terminal() {
+            return Ok(false);
+        }
+        let transition = run.state.set_priority(priority);
+        self.append(id, transition)?;
+        Ok(true)
+    }
+
+    /// A run's priority: 0 for a run this partition does not have in memory.
+    pub fn priority(&self, key: &str) -> u32 {
+        self.runs.get(key).map_or(0, |run| run.state.priority())
     }
 
     /// Resolves an escalation of the run with run id `key` (an exact run, not the key's latest); the run
@@ -2082,20 +2132,21 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     }
                 }
                 Effect::ContinueAsNew { input } => {
-                    let (workflow, budget) = self
+                    let (workflow, budget, priority) = self
                         .runs
                         .get(key)
                         .map(|run| {
                             (
                                 run.state.workflow().to_owned(),
                                 successor_budget(&run.state),
+                                run.state.priority(),
                             )
                         })
                         .ok_or_else(|| PartitionError::Internal(format!("run {key} vanished")))?;
                     let (base, generation) = split_run_id(key);
                     let next = run_id(base, generation + 1);
                     let version = self.successor_version(&workflow);
-                    self.create_run(&next, &workflow, input, budget, version)?;
+                    self.create_run(&next, &workflow, input, budget, version, priority)?;
                 }
             }
         }

@@ -70,6 +70,7 @@ record = version:u8  kind:u8  prev:hash  fields
 | 32 | `UpdateCompleted` | `cmd:cmd`, `update:cmd`, `result:bytes` |
 | 33 | `UpdateRejected` | `cmd:cmd`, `update:cmd`, `error:string` |
 | 34 | `MessageSent` | `cmd:cmd`, `object:string`, `key:string`, `handler:string`, `args:bytes` |
+| 35 | `PrioritySet` | `priority:varint` (fits 32 bits) |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal or update wait has no timeout. A signal's `id` is
@@ -150,6 +151,9 @@ A decoded history is a valid journal if:
    command other than `ValueRecorded`, `UpdateCompleted`, `UpdateRejected` and `MessageSent` (a `StepScheduled`,
    `TimerStarted`, `SignalAwaited`, `ChildStarted`, ...) is completed that way when it is recorded (a
    cancelled signal wait takes no kept signal). Commands after that are not affected.
+   `PrioritySet` sets the run's priority, for scheduling only (ADR 0049): the last one counts, and
+   before any the priority is 0. It may occur anywhere after `Started` while the run has not ended. It is
+   not a command, and it changes no command's outcome.
 4. `StepRetryScheduled` records a failed, retryable attempt of a step that has no outcome and no pending
    retry; `attempt` counts 1, 2, 3, ... per step. The next `TimerFired` for that step dispatches it again
    and gives it no outcome. A step's outcome may still arrive while a retry is pending (a late attempt).
