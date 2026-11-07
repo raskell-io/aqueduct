@@ -57,6 +57,10 @@ The algorithm follows the Raft paper and thesis (Ongaro, 2014):
 6. The cluster transport over gRPC, and routing at ingress.
 7. Leadership balancing, snapshots to object storage, history archival and retention, rolling upgrades.
 8. The web console, the 100,000-seed nightly simulation, cluster measurements and a failover drill.
+   The nightly simulation runs (`.github/workflows/nightly.yml`): twenty shards of 5,000 seeds of five
+   machines, one spare, four partitions and the fanout workload with replicas moved during faults, and
+   100,000 seeds of Raft on five nodes. `cargo xtask sim --jobs N` runs seeds on N threads, with the same
+   reports as one.
 
 **The replicated partition (step 4)** is `aqueduct_engine::replica::Replica`, sans-I/O like the partition and the
 Raft node it pairs:

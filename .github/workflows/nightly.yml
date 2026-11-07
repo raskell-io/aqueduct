@@ -1,0 +1,46 @@
+name: Nightly simulation
+
+# Phase 4's acceptance (BRIEF.md): a 5-node cluster with partitions, crashes and clock skew passes
+# 100,000 seeds nightly. Twenty shards of 5,000 seeds each, plus Raft on its own.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cluster:
+    name: cluster, seeds ${{ matrix.shard }}x5000
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Five machines, one spare among them, four partitions (each a Raft group), the fanout workload
+      # (children and messages across partitions), and an operator moving replicas during faults.
+      - shell: bash # -eo pipefail: a failing seed fails the job through the pipe
+        run: >
+          cargo xtask sim --replicas 5 --partitions 4 --spares 1 --workload fanout
+          --seeds 5000 --from $(( ${{ matrix.shard }} * 5000 )) --jobs 4
+          | tee -a "$GITHUB_STEP_SUMMARY"
+
+  raft:
+    name: raft, 100000 seeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - shell: bash
+        run: cargo xtask raft --seeds 100000 --nodes 5 | tee -a "$GITHUB_STEP_SUMMARY"

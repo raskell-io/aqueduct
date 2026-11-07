@@ -144,10 +144,15 @@ struct World<'c> {
     known: BTreeMap<NodeId, Metadata>,
     /// Per partition: the longest committed record sequence any of its replicas has applied.
     committed: BTreeMap<Group, Vec<Vec<u8>>>,
+    /// Per replica: how many of its committed records have been compared already.
+    checked: BTreeMap<Actor, usize>,
     wanted: Vec<(String, Payload)>,
     /// Messages each object key must receive: (object, key) and how many.
     sends: BTreeMap<(String, String), usize>,
     acked_starts: BTreeSet<String>,
+    /// The partition of every key acknowledged: hashing a key for its slot is the costliest thing the
+    /// checks after each event would otherwise do.
+    homes: BTreeMap<String, Group>,
     /// Results the worker has, not yet acknowledged, with the partition that dispatched them.
     results: BTreeMap<(String, CommandIndex), (Group, StepOutcome)>,
     acked_results: BTreeSet<(String, CommandIndex)>,
@@ -273,6 +278,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         setups,
         disks: actors.iter().map(|a| (*a, Disk::default())).collect(),
         committed: groups.iter().map(|g| (*g, Vec::new())).collect(),
+        checked: BTreeMap::new(),
         groups,
         incarnations: machines.iter().map(|m| (*m, 0)).collect(),
         ticks: machines.iter().map(|m| (*m, 0)).collect(),
@@ -289,6 +295,7 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         wanted,
         sends,
         acked_starts: BTreeSet::new(),
+        homes: BTreeMap::new(),
         results: BTreeMap::new(),
         acked_results: BTreeSet::new(),
         executions: BTreeMap::new(),
@@ -553,6 +560,9 @@ impl World<'_> {
                 }
             }
             Event::StartAck { key } => {
+                self.homes
+                    .entry(key.clone())
+                    .or_insert_with(|| group_of(&self.table, &key));
                 self.acked_starts.insert(key);
             }
             Event::Dispatch {
@@ -601,6 +611,9 @@ impl World<'_> {
             }
             Event::ResultAck { key, cmd } => {
                 self.results.remove(&(key.clone(), cmd));
+                self.homes
+                    .entry(key.clone())
+                    .or_insert_with(|| group_of(&self.table, &key));
                 self.acked_results.insert((key, cmd));
             }
             Event::Operator => {
@@ -677,6 +690,10 @@ impl World<'_> {
             }
             let built_before = replica.partition().is_some();
             let ready = replica.ready()?;
+            if ready.raft.snapshot.is_some() {
+                // The records were replaced: compare them all again.
+                self.checked.remove(&actor);
+            }
             let disk = self.disks.entry(actor).or_default();
             if let Some(snapshot) = &ready.raft.snapshot {
                 disk.log.retain(|e| e.index > snapshot.index);
@@ -701,8 +718,7 @@ impl World<'_> {
             if !built_before && replica.partition().is_some() {
                 self.builds += 1;
             }
-            let records = replica.committed().to_vec();
-            self.agree(actor, &records)?;
+            self.agree(actor)?;
             if self.rng.chance(50_000)
                 && let Some(replica) = self.replicas.get_mut(&actor)
             {
@@ -880,21 +896,26 @@ impl World<'_> {
 
     /// A partition's replicas never disagree on what is committed: each one's records extend, or are
     /// extended by, the longest any has applied.
-    fn agree(&mut self, actor: Actor, records: &[Vec<u8>]) -> Result<(), String> {
+    fn agree(&mut self, actor: Actor) -> Result<(), String> {
+        let Some(replica) = self.replicas.get(&actor) else {
+            return Ok(());
+        };
+        let records = replica.committed();
         let longest = self.committed.entry(actor.0).or_default();
+        let checked = self.checked.entry(actor).or_default();
+        // Only what is new since the last comparison: earlier records cannot change, short of a
+        // snapshot or a restart, which compare everything again.
         let shared = records.len().min(longest.len());
-        if records[..shared] != longest[..shared] {
-            let at = (0..shared)
-                .find(|i| records[*i] != longest[*i])
-                .unwrap_or(0);
+        if let Some(at) = ((*checked).min(shared)..shared).find(|i| records[*i] != longest[*i]) {
             return Err(format!(
                 "partition {} replica {} committed a different record at position {at} than another replica",
                 actor.0, actor.1
             ));
         }
         if records.len() > longest.len() {
-            *longest = records.to_vec();
+            longest.extend_from_slice(&records[longest.len()..]);
         }
+        *checked = records.len();
         Ok(())
     }
 
@@ -936,6 +957,7 @@ impl World<'_> {
                 self.setups[group as usize].clone(),
             )?;
             self.replicas.insert((group, machine), replica);
+            self.checked.remove(&(group, machine));
         }
         if let Some(disk) = self.meta_disks.get(&machine).cloned() {
             let node = MetadataNode::restart(
@@ -1049,14 +1071,14 @@ impl World<'_> {
         partition: &ReplicaPartition,
     ) -> Result<(), String> {
         for key in &self.acked_starts {
-            if group_of(&self.table, key) == group && Self::latest(partition, key).is_none() {
+            if self.homes.get(key) == Some(&group) && Self::latest(partition, key).is_none() {
                 return Err(format!(
                     "the leader of partition {group} in term {term} lost the acknowledged start of {key}"
                 ));
             }
         }
         for (key, cmd) in &self.acked_results {
-            if group_of(&self.table, key) != group {
+            if self.homes.get(key) != Some(&group) {
                 continue;
             }
             let index = usize::try_from(cmd.0).map_err(|e| e.to_string())?;

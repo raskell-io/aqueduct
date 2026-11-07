@@ -12,6 +12,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut replicas = 0usize;
     let mut partitions = 0usize;
     let mut spares = 0usize;
+    let mut jobs = 1usize;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = || -> Result<u64, String> {
@@ -25,6 +26,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--seeds" => count = value()?,
             "--from" => from = value()?,
             "--replicas" => replicas = usize::try_from(value()?).map_err(|e| e.to_string())?,
+            "--jobs" => jobs = usize::try_from(value()?).map_err(|e| e.to_string())?,
             "--spares" => spares = usize::try_from(value()?).map_err(|e| e.to_string())?,
             "--partitions" => {
                 partitions = usize::try_from(value()?).map_err(|e| e.to_string())?;
@@ -46,7 +48,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown argument {other}; use --seed N, or --seeds N [--from S], with --workload W, --replicas R, --partitions P and --spares S"
+                    "unknown argument {other}; use --seed N, or --seeds N [--from S], with --workload W, --replicas R, --partitions P, --spares S and --jobs J"
                 ));
             }
         }
@@ -67,8 +69,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     let started = Instant::now();
     let mut total = Report::default();
-    for seed in from..from + count {
-        let report = run_seed(seed, &config).map_err(|f| f.to_string())?;
+    for report in run_seeds(from, count, jobs, &config)? {
         total.events += report.events;
         total.crashes += report.crashes;
         total.sync_failures += report.sync_failures;
@@ -126,4 +127,40 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.replica_moves,
     );
     Ok(())
+}
+
+/// Runs seeds `from..from + count` on `jobs` threads, and returns their reports in seed order, or the
+/// failure of the lowest failing seed run. Seeds are independent, so the reports are those one thread
+/// would give; once a seed fails, no new seeds are started.
+fn run_seeds(from: u64, count: u64, jobs: usize, config: &Config) -> Result<Vec<Report>, String> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let next = AtomicU64::new(from);
+    let failed = AtomicBool::new(false);
+    let results = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1) {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let seed = next.fetch_add(1, Ordering::Relaxed);
+                    if seed >= from + count {
+                        break;
+                    }
+                    let result = run_seed(seed, config);
+                    if result.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    if let Ok(mut results) = results.lock() {
+                        results.push((seed, result));
+                    }
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().map_err(|e| e.to_string())?;
+    results.sort_by_key(|(seed, _)| *seed);
+    results
+        .into_iter()
+        .map(|(_, result)| result.map_err(|f| f.to_string()))
+        .collect()
 }
