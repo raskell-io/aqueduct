@@ -33,6 +33,27 @@ pub(crate) const LEADER_HEADER: &str = "aqueduct-leader";
 /// The largest request body forwarded to the leader (16 MiB).
 const MOST_FORWARDED: usize = 16 << 20;
 
+/// The header every message between servers carries: the sender's version (ADR 0060).
+const VERSION_HEADER: &str = "aqueduct-version";
+
+/// This server's version.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whether a server of version `theirs` may take part with this one: the same major version, and minor
+/// versions at most one apart (ADR 0060), so that a cluster can be upgraded one server at a time.
+pub fn compatible(theirs: &str, ours: &str) -> bool {
+    let parse = |version: &str| -> Option<(u64, u64)> {
+        let mut parts = version.split('.');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    };
+    match (parse(theirs), parse(ours)) {
+        (Some((their_major, their_minor)), Some((our_major, our_minor))) => {
+            their_major == our_major && their_minor.abs_diff(our_minor) <= 1
+        }
+        _ => false,
+    }
+}
+
 /// The header that carries the cluster's secret.
 const SECRET_HEADER: &str = "aqueduct-cluster-secret";
 
@@ -218,6 +239,7 @@ fn request(url: &str, secret: &str, body: Vec<u8>) -> Option<axum::http::Request
     axum::http::Request::post(url)
         .header("content-type", "application/octet-stream")
         .header(SECRET_HEADER, secret)
+        .header(VERSION_HEADER, VERSION)
         .body(Full::new(Bytes::from(body)))
         .ok()
 }
@@ -290,17 +312,29 @@ fn same(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-fn authentic(peer: &Peer, headers: &HeaderMap) -> bool {
+/// Whether a message from another server may be taken: it has the secret, and the sender's version is
+/// compatible with this one.
+fn admit(peer: &Peer, headers: &HeaderMap) -> Result<(), StatusCode> {
     let secret = headers
         .get(SECRET_HEADER)
         .map(|value| value.as_bytes())
         .unwrap_or_default();
-    same(secret, peer.secret.as_bytes())
+    if !same(secret, peer.secret.as_bytes()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let version = headers
+        .get(VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !compatible(version, VERSION) {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(())
 }
 
 async fn receive_raft(State(peer): State<Peer>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    if !authentic(&peer, &headers) {
-        return StatusCode::UNAUTHORIZED;
+    if let Err(refused) = admit(&peer, &headers) {
+        return refused;
     }
     let Ok((partition, envelopes)) = decode(&body) else {
         return StatusCode::BAD_REQUEST;
@@ -316,8 +350,8 @@ async fn receive_raft(State(peer): State<Peer>, headers: HeaderMap, body: Bytes)
 }
 
 async fn receive_remote(State(peer): State<Peer>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    if !authentic(&peer, &headers) {
-        return StatusCode::UNAUTHORIZED;
+    if let Err(refused) = admit(&peer, &headers) {
+        return refused;
     }
     let Some((partition, message)) = body.split_first_chunk::<4>() else {
         return StatusCode::BAD_REQUEST;
@@ -452,6 +486,11 @@ mod tests {
         assert!(decode(&body[..body.len() - 1]).is_err());
         assert!(decode(&[1, 0]).is_err());
         assert!(same(b"a secret", b"a secret"));
+        assert!(compatible("0.4.2", "0.4.0"));
+        assert!(compatible("0.5.0", "0.4.9"));
+        assert!(!compatible("0.6.0", "0.4.9"));
+        assert!(!compatible("1.4.0", "0.4.0"));
+        assert!(!compatible("", "0.4.0"));
         assert!(!same(b"a secret", b"a secreT"));
     }
 

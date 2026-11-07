@@ -1187,6 +1187,13 @@ impl Engine {
         RaftInbox(self.requests.clone())
     }
 
+    /// Before stopping a replicated engine: hands its leadership to a caught-up replica, so that its
+    /// partition is not left to an election (ADR 0060). It no longer prefers to lead. Returns at once;
+    /// [`Engine::leads`] says when it has handed over.
+    pub fn step_down(&self) {
+        let _ = self.requests.send(Request::StepDown);
+    }
+
     /// Whether this engine has its partition here: it leads, or is not replicated.
     pub fn leads(&self) -> bool {
         self.leading.lock().is_ok_and(|leading| leading.0)
@@ -1342,6 +1349,8 @@ enum Request {
     Raft(aqueduct_raft::Envelope),
     /// A message from another partition (ADR 0052).
     Remote(crate::Remote),
+    /// Hand leadership over before stopping (ADR 0060).
+    StepDown,
     Shutdown,
 }
 
@@ -1396,6 +1405,8 @@ pub(crate) trait Host: Send + 'static {
     fn leader(&self) -> Option<u64> {
         None
     }
+    /// Hands leadership to a caught-up replica, before stopping.
+    fn step_down(&mut self) {}
 }
 
 /// A partition on a local log: the embedded engine and the single server.
@@ -1556,6 +1567,11 @@ impl Host for Replicated {
     fn leader(&self) -> Option<u64> {
         self.replica.raft().leader()
     }
+
+    fn step_down(&mut self) {
+        self.preferred = None;
+        self.replica.step_down();
+    }
 }
 
 /// A reply to send once what it reflects is committed.
@@ -1677,6 +1693,10 @@ impl<H: Host> Processor<H> {
                 return Ok(true);
             }
             Request::Shutdown => return Ok(false),
+            Request::StepDown => {
+                self.host.step_down();
+                return Ok(true);
+            }
             Request::Stats { reply } if self.host.partition().is_none() => {
                 let _ = reply.send(EngineStats {
                     runs_in_memory: 0,
@@ -1993,7 +2013,7 @@ impl<H: Host> Processor<H> {
             Request::Remote(message) => {
                 self.part()?.receive(message).map_err(|e| e.to_string())?;
             }
-            Request::Shutdown | Request::Raft(_) => return Ok(false),
+            Request::Shutdown | Request::Raft(_) | Request::StepDown => return Ok(false),
         }
         // Only non-empty under the injected acknowledge-before-sync bug.
         let early = self.part()?.take_unsynced();

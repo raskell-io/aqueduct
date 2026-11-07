@@ -431,6 +431,25 @@ impl Replica {
         }
     }
 
+    /// On the leader: hands leadership to a caught-up member, before this replica stops (ADR 0060).
+    /// Whether a transfer is under way.
+    pub fn step_down(&mut self) -> bool {
+        if self.raft.role() != Role::Leader {
+            return false;
+        }
+        if self.raft.transferring().is_some() {
+            return true;
+        }
+        let me = self.raft.id();
+        let target = self
+            .raft
+            .members()
+            .iter()
+            .copied()
+            .find(|m| *m != me && self.raft.caught_up(*m));
+        target.is_some_and(|to| self.raft.transfer_leadership(to).is_ok())
+    }
+
     /// On the leader, moves the group one membership change towards `desired` (the metadata store's
     /// replicas for this partition, ADR 0053): one change at a time, adding before removing.
     pub fn reconcile(&mut self, desired: &[NodeId]) {
