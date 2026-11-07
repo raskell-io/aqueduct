@@ -623,6 +623,13 @@ impl RaftNode {
         Ok(())
     }
 
+    /// On the leader: whether `node` has every entry this leader has, so that it answers and could take
+    /// over at once.
+    pub fn caught_up(&self, node: NodeId) -> bool {
+        self.role == Role::Leader
+            && self.matched.get(&node).copied().unwrap_or(0) >= self.last_index()
+    }
+
     /// The target of a transfer under way, if any.
     pub fn transferring(&self) -> Option<NodeId> {
         self.transfer.map(|(target, _)| target)

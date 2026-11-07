@@ -106,6 +106,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0055: The engine on a replicated partition](adr/0055-engine-on-raft.md)
 - [0056: The server in a cluster](adr/0056-cluster-server.md)
 - [0057: Many partitions in one process](adr/0057-partitions-in-a-process.md)
+- [0058: Leadership transfer and balancing](adr/0058-leadership-balancing.md)
 
 ### Observability
 

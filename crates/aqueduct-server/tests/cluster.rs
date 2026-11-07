@@ -60,7 +60,14 @@ async fn ask(
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         for (id, addr) in nodes {
+            let began = Instant::now();
             let (status, answer) = http(*addr, method, path, body.clone()).await;
+            if began.elapsed() > Duration::from_secs(5) {
+                eprintln!(
+                    "SLOW {method} {path} at node {id}: {:?} -> {status} {answer}",
+                    began.elapsed()
+                );
+            }
             if (200..300).contains(&status) {
                 return (*id, answer);
             }
@@ -184,17 +191,18 @@ async fn three_servers_replicate_and_survive_their_leader() {
     let (status, _) = http(nodes[&leader], "POST", "/cluster/v1/raft", Value::Null).await;
     assert_eq!(status, 401);
     // A node that does not lead forwards to the one that does: any node can be asked.
+    // (A client retries an unavailable answer: leadership may be moving to the preferred node.)
     let follower = *nodes.keys().find(|id| **id != leader).unwrap();
-    let (status, answer) = http(
-        nodes[&follower],
+    let only = BTreeMap::from([(follower, nodes[&follower])]);
+    ask(
+        &only,
         "POST",
         "/v1/runs",
         json!({"key": "b", "workflow": "double", "input": 4}),
     )
     .await;
-    assert!((200..300).contains(&status), "{status}: {answer}");
-    let (status, answer) = http(nodes[&follower], "GET", "/v1/runs/b/result", Value::Null).await;
-    assert_eq!((status, &answer["output"]), (200, &json!(8)), "{answer}");
+    let (_, answer) = ask(&only, "GET", "/v1/runs/b/result", Value::Null).await;
+    assert_eq!(answer["output"], json!(8), "{answer}");
     // A request already forwarded once is answered where it arrives, never forwarded on: the leader
     // answers it, the others are unavailable. (Leadership may move meanwhile: each node is asked.)
     let mut refused = 0;

@@ -1971,6 +1971,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         for dispatch in dispatches {
             self.send(dispatch);
         }
+        self.repeat_remote();
+    }
+
+    /// Sends again every message to another partition that is not answered yet (ADR 0052): more often
+    /// than steps are re-dispatched, since a message lost between partitions holds up its sender.
+    pub fn repeat_remote(&mut self) {
         let waiting: Vec<Remote> = self
             .remote_children
             .values()
