@@ -12,14 +12,16 @@
 //! - **log matching:** two logs with an entry of the same index and term agree up to it;
 //! - **leader completeness:** a new leader's log holds every entry applied anywhere;
 //! - **state machine safety:** no two nodes apply different entries at one index;
-//! - **durability:** a node's persisted log never loses an entry it applied.
+//! - **durability:** a node's disk holds what it applied: in its snapshot, or its log;
+//! - **snapshots:** every node's state machine agrees at each index, whether it applied entries or
+//!   restored a snapshot (nodes compact their logs often, and followers catch up from snapshots).
 //!
 //! And at the end: every proposal the client saw applied is applied, at the same index, on every node;
 //! every node has applied the same log; and the client's proposals all got in (liveness, once healed).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Config, Entry, Envelope, HardState, NodeId, RaftNode, Role};
+use crate::{Config, Entry, Envelope, HardState, NodeId, RaftNode, Role, Snapshot};
 
 /// Parameters of a simulated world. Probabilities are in parts per million, times in milliseconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +56,7 @@ impl Default for SimConfig {
     fn default() -> SimConfig {
         SimConfig {
             nodes: 5,
-            proposals: 40,
+            proposals: 60,
             fault_window: 4_000,
             max_time: 60_000,
             drop_ppm: 50_000,
@@ -90,6 +92,10 @@ pub struct SimReport {
     pub duplicated: u64,
     /// When the world was done.
     pub end_time: u64,
+    /// Logs compacted into snapshots.
+    pub compactions: u64,
+    /// Snapshots a follower installed from its leader.
+    pub installs: u64,
 }
 
 /// A world that broke an invariant, with the seed that reproduces it.
@@ -129,7 +135,45 @@ impl Rng {
 #[derive(Clone, Debug, Default)]
 struct Disk {
     hard_state: HardState,
+    snapshot: Option<Snapshot>,
     log: Vec<Entry>,
+}
+
+/// A node's state machine: how far it has applied the log, and a digest of everything applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct State {
+    index: u64,
+    digest: u64,
+}
+
+impl State {
+    fn apply(self, entry: &Entry) -> State {
+        let mut digest = self.digest ^ 0xcbf2_9ce4_8422_2325;
+        for byte in entry
+            .term
+            .to_le_bytes()
+            .iter()
+            .chain(&entry.index.to_le_bytes())
+            .chain(&entry.data)
+        {
+            digest ^= u64::from(*byte);
+            digest = digest.wrapping_mul(0x0100_0000_01b3);
+        }
+        State {
+            index: entry.index,
+            digest,
+        }
+    }
+
+    fn encode(self) -> Vec<u8> {
+        [self.index.to_le_bytes(), self.digest.to_le_bytes()].concat()
+    }
+
+    fn decode(data: &[u8]) -> Option<State> {
+        let index = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+        let digest = u64::from_le_bytes(data.get(8..16)?.try_into().ok()?);
+        Some(State { index, digest })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -156,8 +200,10 @@ struct World<'c> {
     paused_until: BTreeMap<NodeId, u64>,
     /// While the network is split: the side of each node.
     sides: Option<BTreeMap<NodeId, bool>>,
-    /// What each node has applied since it last started.
-    applied: BTreeMap<NodeId, Vec<Entry>>,
+    /// Each node's state machine, as it is since it last started.
+    states: BTreeMap<NodeId, State>,
+    /// The state machine's digest after each index, wherever it was reached: they must all agree.
+    digest_at: BTreeMap<u64, u64>,
     /// The entry applied at each index, anywhere: they must all agree.
     applied_at: BTreeMap<u64, Entry>,
     /// The term whose leader first committed each index, with the entry it committed.
@@ -194,7 +240,8 @@ pub fn run(seed: u64, config: &SimConfig) -> Result<SimReport, SimFailure> {
         members: members.clone(),
         incarnations: members.iter().map(|id| (*id, 0)).collect(),
         disks: members.iter().map(|id| (*id, Disk::default())).collect(),
-        applied: members.iter().map(|id| (*id, Vec::new())).collect(),
+        states: members.iter().map(|id| (*id, State::default())).collect(),
+        digest_at: BTreeMap::new(),
         nodes,
         tick_ms,
         paused_until: BTreeMap::new(),
@@ -240,6 +287,13 @@ impl World<'_> {
             };
             self.now = time;
             self.report.events += 1;
+            // A world takes a few thousand events: far more is a storm that never settles.
+            if self.report.events > 2_000_000 {
+                return Err(format!(
+                    "liveness: {} events by time {}, and not done: messages without progress",
+                    self.report.events, self.now
+                ));
+            }
             if self.faults && self.now >= self.config.fault_window {
                 self.faults = false;
                 self.sides = None;
@@ -303,19 +357,26 @@ impl World<'_> {
             Event::Restart { node } => {
                 let disk = self.disks[&node].clone();
                 let seed = self.rng.next();
+                // Its state machine is what its snapshot holds; the log after it is applied again.
+                let state = match &disk.snapshot {
+                    Some(snapshot) => State::decode(&snapshot.data)
+                        .ok_or_else(|| format!("node {node}'s snapshot does not decode"))?,
+                    None => State::default(),
+                };
                 let raft = RaftNode::restart(
                     node,
                     &self.members,
                     Config::default(),
                     seed,
                     disk.hard_state,
+                    disk.snapshot,
                     disk.log,
-                    0,
+                    state.index,
                 );
                 self.nodes.insert(node, raft);
                 let incarnation = self.incarnations[&node] + 1;
                 self.incarnations.insert(node, incarnation);
-                self.applied.insert(node, Vec::new());
+                self.states.insert(node, state);
                 self.schedule(1, Event::Tick { node, incarnation });
             }
             Event::Propose => self.propose(),
@@ -361,7 +422,7 @@ impl World<'_> {
 
     /// Does what the node's `Ready`s ask: persists, then sends, then applies.
     fn drive(&mut self, node: NodeId) -> Result<(), String> {
-        loop {
+        for _ in 0..10_000 {
             let Some(raft) = self.nodes.get_mut(&node) else {
                 return Ok(());
             };
@@ -371,6 +432,11 @@ impl World<'_> {
             let ready = raft.ready();
             let (role, term) = (raft.role(), raft.term());
             let disk = self.disks.entry(node).or_default();
+            // A leader's snapshot first: it replaces the state machine and the log it covers.
+            if let Some(snapshot) = &ready.snapshot {
+                disk.log.retain(|e| e.index > snapshot.index);
+                disk.snapshot = Some(snapshot.clone());
+            }
             if let Some(hard_state) = ready.hard_state {
                 disk.hard_state = hard_state;
             }
@@ -381,11 +447,12 @@ impl World<'_> {
             for entry in &ready.entries {
                 disk.log.push(entry.clone());
             }
+            let base = disk.snapshot.as_ref().map_or(0, |s| s.index);
             if let Some((position, entry)) = disk
                 .log
                 .iter()
                 .enumerate()
-                .find(|(position, entry)| entry.index != *position as u64 + 1)
+                .find(|(position, entry)| entry.index != base + *position as u64 + 1)
             {
                 return Err(format!(
                     "node {node}'s disk holds index {} at position {}: a conflicting suffix was kept",
@@ -397,6 +464,9 @@ impl World<'_> {
                 self.became_leader(node, term)?;
                 self.record_commits(node, term)?;
             }
+            if let Some(snapshot) = &ready.snapshot {
+                self.restore(node, snapshot)?;
+            }
             for envelope in ready.messages {
                 self.send(envelope);
             }
@@ -406,7 +476,59 @@ impl World<'_> {
             if let Some(raft) = self.nodes.get_mut(&node) {
                 raft.advance();
             }
+            self.maybe_compact(node);
         }
+        Err(format!(
+            "node {node} kept asking for more: 10,000 readies for one event"
+        ))
+    }
+
+    /// A node's state machine is replaced by a snapshot from its leader.
+    fn restore(&mut self, node: NodeId, snapshot: &Snapshot) -> Result<(), String> {
+        let state = State::decode(&snapshot.data)
+            .ok_or_else(|| format!("node {node} was sent a snapshot that does not decode"))?;
+        if state.index != snapshot.index {
+            return Err(format!(
+                "node {node} was sent a snapshot of index {} that holds index {}",
+                snapshot.index, state.index
+            ));
+        }
+        if let Some(expected) = self.digest_at.get(&state.index)
+            && *expected != state.digest
+        {
+            return Err(format!(
+                "snapshot safety: node {node} installed a snapshot of index {} that differs from the state applied there",
+                state.index
+            ));
+        }
+        self.digest_at.insert(state.index, state.digest);
+        self.states.insert(node, state);
+        self.report.installs += 1;
+        Ok(())
+    }
+
+    /// Sometimes, a node compacts what it has applied into a snapshot: often enough that followers
+    /// fall behind it and need one.
+    fn maybe_compact(&mut self, node: NodeId) {
+        let Some(raft) = self.nodes.get_mut(&node) else {
+            return;
+        };
+        let state = self.states[&node];
+        if state.index < raft.snapshot_index() + 4 || !self.rng.chance(300_000) {
+            return;
+        }
+        // The driver persists its snapshot before the node drops the log it replaces.
+        raft.compact(state.index, state.encode());
+        let Some(snapshot) = raft.snapshot().cloned() else {
+            return;
+        };
+        if snapshot.index != state.index {
+            return;
+        }
+        let disk = self.disks.entry(node).or_default();
+        disk.log.retain(|e| e.index > snapshot.index);
+        disk.snapshot = Some(snapshot);
+        self.report.compactions += 1;
     }
 
     fn became_leader(&mut self, node: NodeId, term: u64) -> Result<(), String> {
@@ -423,13 +545,16 @@ impl World<'_> {
         // Leader completeness: it holds every entry committed in an earlier term (thesis 3.6.3). A
         // leader of an earlier term can still come to power after a later one has committed: delayed
         // votes do that, and it need not hold those.
-        let log = self.nodes[&node].log();
+        let raft = &self.nodes[&node];
         for (index, (committed_term, entry)) in &self.committed_in {
             if *committed_term >= term {
                 continue;
             }
-            let held = log.get(usize::try_from(*index - 1).unwrap_or(usize::MAX));
-            if held != Some(entry) {
+            // What its snapshot replaced, it holds as state: the snapshot checks say it is the same.
+            if *index <= raft.snapshot_index() {
+                continue;
+            }
+            if raft.entry(*index) != Some(entry) {
                 return Err(format!(
                     "leader completeness: node {node}, leader of term {term}, lacks {entry:?}, committed at {index} in term {committed_term}"
                 ));
@@ -450,10 +575,7 @@ impl World<'_> {
             .next_back()
             .map_or(1, |last| last + 1);
         for index in first..=commit {
-            let Some(entry) = raft
-                .log()
-                .get(usize::try_from(index - 1).unwrap_or(usize::MAX))
-            else {
+            let Some(entry) = raft.entry(index) else {
                 return Err(format!(
                     "node {node} committed index {index} it does not hold"
                 ));
@@ -464,13 +586,11 @@ impl World<'_> {
     }
 
     fn apply(&mut self, node: NodeId, entry: Entry) -> Result<(), String> {
-        let applied = self.applied.entry(node).or_default();
-        let expected = applied.len() as u64 + 1;
-        if entry.index != expected {
+        let state = self.states.get(&node).copied().unwrap_or_default();
+        if entry.index != state.index + 1 {
             return Err(format!(
                 "node {node} applied index {} after {}",
-                entry.index,
-                expected - 1
+                entry.index, state.index
             ));
         }
         if let Some(earlier) = self.applied_at.get(&entry.index)
@@ -490,7 +610,17 @@ impl World<'_> {
                 self.acked.insert(value, entry.index);
             }
         }
-        applied.push(entry);
+        let state = state.apply(&entry);
+        if let Some(expected) = self.digest_at.get(&state.index)
+            && *expected != state.digest
+        {
+            return Err(format!(
+                "state machine safety: node {node}'s state after index {} differs from another's",
+                state.index
+            ));
+        }
+        self.digest_at.insert(state.index, state.digest);
+        self.states.insert(node, state);
         Ok(())
     }
 
@@ -547,35 +677,44 @@ impl World<'_> {
 
     /// The invariants that hold after every event.
     fn check(&self) -> Result<(), String> {
-        // Log matching: two logs that share an entry agree up to it.
+        // Log matching: two logs that share an entry agree up to it, where both still hold it.
         let logs: Vec<(NodeId, &[Entry])> = self
             .nodes
             .iter()
             .map(|(id, raft)| (*id, raft.log()))
             .collect();
         for (i, (a, left)) in logs.iter().enumerate() {
+            let by_index: BTreeMap<u64, &Entry> = left.iter().map(|e| (e.index, e)).collect();
             for (b, right) in &logs[i + 1..] {
-                let shared = left.len().min(right.len());
-                if let Some(last) = (0..shared).rev().find(|k| left[*k].term == right[*k].term)
-                    && left[..=last] != right[..=last]
+                let shared: Vec<(&Entry, &Entry)> = right
+                    .iter()
+                    .filter_map(|r| by_index.get(&r.index).map(|l| (*l, r)))
+                    .collect();
+                if let Some(last) = shared.iter().rposition(|(l, r)| l.term == r.term)
+                    && shared[..=last].iter().any(|(l, r)| l != r)
                 {
                     return Err(format!(
                         "log matching: nodes {a} and {b} share index {} and term {} but differ before it",
-                        last + 1,
-                        left[last].term
+                        shared[last].0.index, shared[last].0.term
                     ));
                 }
             }
         }
-        // Durability: what a node applied is on its disk.
-        for (node, applied) in &self.applied {
-            let disk = &self.disks[node].log;
-            if let Some(last) = applied.last()
-                && disk.get(usize::try_from(last.index - 1).unwrap_or(usize::MAX)) != Some(last)
-            {
+        // Durability: what a node applied is on its disk, in its snapshot or its log.
+        for (node, state) in &self.states {
+            if state.index == 0 || !self.nodes.contains_key(node) {
+                continue;
+            }
+            let disk = &self.disks[node];
+            let in_snapshot = disk
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.index >= state.index);
+            let in_log = disk.log.iter().any(|e| e.index == state.index);
+            if !in_snapshot && !in_log {
                 return Err(format!(
                     "durability: node {node} applied index {} that its disk does not hold",
-                    last.index
+                    state.index
                 ));
             }
         }
@@ -594,29 +733,32 @@ impl World<'_> {
             return false;
         };
         let commit = leader.commit();
-        commit == leader.log().len() as u64
-            && self
-                .applied
-                .values()
-                .all(|applied| applied.len() as u64 == commit)
+        commit
+            == leader
+                .log()
+                .last()
+                .map_or(leader.snapshot_index(), |e| e.index)
+            && self.states.values().all(|state| state.index == commit)
     }
 
     fn final_checks(&mut self) -> Result<(), String> {
-        let reference = self.applied.values().next().cloned().unwrap_or_default();
-        for (node, applied) in &self.applied {
-            if *applied != reference {
-                return Err(format!("node {node} applied a different log at the end"));
+        let reference = self.states.values().next().copied().unwrap_or_default();
+        for (node, state) in &self.states {
+            if *state != reference {
+                return Err(format!("node {node}'s state machine differs at the end"));
             }
         }
         for (value, index) in &self.acked {
-            let entry = reference.get(usize::try_from(*index - 1).unwrap_or(usize::MAX));
-            if entry.map(|e| e.data.as_slice()) != Some(value.to_be_bytes().as_slice()) {
+            let entry = self.applied_at.get(index);
+            if *index > reference.index
+                || entry.map(|e| e.data.as_slice()) != Some(value.to_be_bytes().as_slice())
+            {
                 return Err(format!(
                     "proposal {value}, seen applied at {index}, was lost"
                 ));
             }
         }
-        self.report.applied = reference.len() as u64;
+        self.report.applied = reference.index;
         Ok(())
     }
 }
