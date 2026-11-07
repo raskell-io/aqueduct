@@ -1,6 +1,6 @@
 //! Object storage (ADR 0061): a directory, or an S3-compatible bucket (AWS S3, MinIO, Cloudflare R2, ...)
 //! reached with our own small client: four operations, signed with AWS Signature Version 4
-//! ([`crate::sigv4`]), over the server's HTTP stack.
+//! (the `sigv4` module), over the server's HTTP stack.
 
 use std::path::PathBuf;
 use std::time::Duration;
