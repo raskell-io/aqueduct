@@ -279,7 +279,15 @@ pub struct Replication {
     /// The node that should lead this partition when it can (ADR 0058): the leader hands over to it
     /// once it is caught up, so that leaders spread over the nodes.
     pub preferred_leader: Option<u64>,
+    /// Entries applied between snapshots. Default 1,000.
+    pub snapshot_every: u64,
+    /// Called with every snapshot this replica takes, after it is on disk (ADR 0062): to copy it to
+    /// object storage, for example.
+    pub on_snapshot: Option<SnapshotHook>,
 }
+
+/// What a replica does with a snapshot it took.
+pub type SnapshotHook = Arc<dyn Fn(&aqueduct_raft::Snapshot) + Send + Sync>;
 
 impl std::fmt::Debug for Replication {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -582,6 +590,8 @@ impl Builder {
             released: Vec::new(),
             preferred: replication.preferred_leader,
             ticks: 0,
+            snapshot_every: replication.snapshot_every.max(1),
+            on_snapshot: replication.on_snapshot,
         })
     }
 
@@ -1462,6 +1472,8 @@ pub(crate) struct Replicated {
     released: Vec<Outbound>,
     preferred: Option<u64>,
     ticks: u64,
+    snapshot_every: u64,
+    on_snapshot: Option<SnapshotHook>,
 }
 
 /// How a replica sends a Raft message to another.
@@ -1470,8 +1482,8 @@ pub type Transport = Arc<dyn Fn(aqueduct_raft::Envelope) + Send + Sync>;
 /// Ticks between a leader's checks that it is the preferred one (ADR 0058).
 const PREFER_EVERY: u64 = 40;
 
-/// Entries applied between snapshots of a replicated engine.
-const COMPACT_EVERY: u64 = 1_000;
+/// Entries applied between snapshots of a replicated engine, by default.
+pub const SNAPSHOT_EVERY: u64 = 1_000;
 
 impl Replicated {
     /// Does what the replica's readies ask: persists, sends, and collects what is released.
@@ -1514,12 +1526,15 @@ impl Host for Replicated {
     }
 
     fn checkpoint(&mut self, _force: bool) -> Result<(), String> {
-        if self.replica.applied() >= self.replica.raft().snapshot_index() + COMPACT_EVERY {
+        if self.replica.applied() >= self.replica.raft().snapshot_index() + self.snapshot_every {
             self.replica.compact();
             if let Some(snapshot) = self.replica.raft().snapshot().cloned() {
                 self.store
                     .save_snapshot(&snapshot)
                     .map_err(|e| format!("storage failed: {e}"))?;
+                if let Some(hook) = &self.on_snapshot {
+                    hook(&snapshot);
+                }
             }
         }
         Ok(())

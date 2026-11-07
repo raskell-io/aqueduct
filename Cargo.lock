@@ -293,6 +293,7 @@ dependencies = [
  "aqueduct-procedure",
  "aqueduct-protocol",
  "aqueduct-raft",
+ "aqueduct-storage",
  "axum",
  "getrandom 0.3.4",
  "http-body-util",
