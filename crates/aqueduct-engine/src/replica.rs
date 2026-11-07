@@ -388,6 +388,37 @@ impl Replica {
         self.flush()
     }
 
+    /// Whether this replica leads and has built its partition: it takes requests.
+    pub fn leads(&self) -> bool {
+        self.partition.is_some() && self.raft.role() == Role::Leader
+    }
+
+    /// The Raft index the committed records reach.
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
+
+    /// The workflows a partition built here decides with: changing them changes the next one built,
+    /// and the current one's are the driver's to change too.
+    pub fn deciders_mut(&mut self) -> &mut Deciders {
+        &mut self.deciders
+    }
+
+    /// On the leader: proposes an empty entry and returns its index. Once it is committed, everything
+    /// this leader wrote before is, and it still led when it was: answers read from its memory can go.
+    pub fn barrier(&mut self) -> Option<u64> {
+        if !self.leads() {
+            return None;
+        }
+        match self.raft.propose(Vec::new()) {
+            Ok(index) => Some(index),
+            Err(_) => {
+                self.lose_leadership();
+                None
+            }
+        }
+    }
+
     /// On the leader, moves the group one membership change towards `desired` (the metadata store's
     /// replicas for this partition, ADR 0053): one change at a time, adding before removing.
     pub fn reconcile(&mut self, desired: &[NodeId]) {

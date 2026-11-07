@@ -36,7 +36,17 @@ partition is always there, and that finished runs live on in a checkpoint.
 
 ## Consequences
 
-- This change is the refactor alone: the processor is generic over its host, with `Local` the only one,
-  and every existing test passes unchanged.
-- The replicated host, an in-process test of several engines with failover, and the server's cluster
-  mode follow.
+- The processor is generic over its host; `Local` keeps every existing test passing unchanged.
+- **The replicated host** (`Builder::replicated`) keeps its Raft state in `raft/` with `RaftStore`
+  (ADR 0054), ticks Raft's clock in the processor loop, takes messages from other replicas through
+  `Engine::raft_inbox`, and sends through a `Transport` the caller provides. Replies gated behind an
+  entry of its own wait in the processor until that index commits. A caller turned away gets
+  `EngineError::NotLeader`, with the leader when known. Snapshots replace checkpoints every 1,000
+  applied entries.
+- **Tested** with three engines in one process (`tests/replicated.rs`): runs survive the leader's loss,
+  a follower says who leads, a node that returns from its disk catches up, and after every machine stops
+  and starts again nothing acknowledged is lost. Not persisting fails the last check.
+- **Not caught by that test:** answering reads without the barrier. A stale read needs a leader cut
+  off while it still believes it leads; the simulator covers that case for the replica itself, not for
+  the engine's reads.
+- The server's cluster mode (a network transport, and routing to the leader) follows.

@@ -523,7 +523,9 @@ impl From<EngineError> for Failure {
             | EngineError::HandlerFailed(_)
             | EngineError::Unsupported(_) => Kind::Rejected,
             EngineError::InvalidPayload(_) => Kind::Invalid,
-            EngineError::Stopped(_) | EngineError::Overloaded(_) => Kind::Unavailable,
+            EngineError::Stopped(_) | EngineError::Overloaded(_) | EngineError::NotLeader(_) => {
+                Kind::Unavailable
+            }
             EngineError::Open(_) => Kind::Internal,
         };
         let message = match error {

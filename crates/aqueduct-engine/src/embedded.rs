@@ -36,7 +36,7 @@
 //! Not yet: loading only active runs at startup (recovery still folds every run in the checkpoint)
 //! (recovery replays the whole log; checkpoints in redb come with ADR 0009's state store).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -174,6 +174,10 @@ pub enum EngineError {
     /// The engine stopped, for example after a storage failure. Reopen it to recover.
     #[error("the engine has stopped: {0}")]
     Stopped(String),
+    /// A replicated engine that does not lead its partition (ADR 0055): ask the leader, if one is
+    /// known (its node id), or try again.
+    #[error("this node does not lead the partition{}", .0.map(|n| format!("; node {n} does")).unwrap_or_default())]
+    NotLeader(Option<u64>),
     /// A run with this key exists with another workflow or input.
     #[error("run `{0}` exists with another workflow or input")]
     KeyConflict(String),
@@ -248,9 +252,49 @@ pub struct Builder {
     max_running: Option<usize>,
     namespace_running: BTreeMap<String, usize>,
     weights: BTreeMap<String, f64>,
+    replication: Option<Replication>,
+}
+
+/// How a replicated engine takes part in its partition's Raft group (ADR 0055).
+#[derive(Clone)]
+pub struct Replication {
+    /// This replica's node id.
+    pub id: u64,
+    /// The group it starts in: its node id among them, or none if a leader will add it.
+    pub members: Vec<u64>,
+    /// How it sends messages to the others.
+    pub transport: Transport,
+    /// How often Raft's clock ticks.
+    pub tick: Duration,
+    /// Raft's timing, in ticks.
+    pub config: aqueduct_raft::Config,
+}
+
+impl std::fmt::Debug for Replication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Replication")
+            .field("id", &self.id)
+            .field("members", &self.members)
+            .field("tick", &self.tick)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a processor is opened on. Built once, so the size of its variants does not matter.
+#[allow(clippy::large_enum_variant)]
+enum Opened {
+    Local(Local),
+    Replicated(Replicated),
 }
 
 impl Builder {
+    /// Runs the partition as a replica of a Raft group (ADR 0055): its log is the group's, kept in
+    /// `raft/` under the data directory, and it takes requests only while it leads. Imports are refused.
+    pub fn replicated(mut self, replication: Replication) -> Self {
+        self.replication = Some(replication);
+        self
+    }
+
     /// Hands every step without a function of its own to remote step workers (ADR 0038), through the
     /// engine's [`StepQueue`](crate::queue::StepQueue), with leases of `lease`. A step that no worker
     /// implements waits until one connects. Without this, such a step is retried as a deployment
@@ -451,6 +495,50 @@ impl Builder {
         self
     }
 
+    /// The replica a replicated engine runs: its Raft state from `raft/`, and a setup that gives every
+    /// partition it builds what [`Builder::open`] gives a local one.
+    fn open_replica(&self, replication: Replication) -> Result<Replicated, EngineError> {
+        let (store, recovered) = aqueduct_storage::RaftStore::open(self.dir.join("raft"))
+            .map_err(|e| EngineError::Open(e.to_string()))?;
+        let default_retry = self.default_retry;
+        let policies = self.retry_policies.clone();
+        let observer = self.observer.clone();
+        let setup: crate::replica::Setup = Arc::new(move |partition, _term| {
+            partition.set_default_retry_policy(default_retry);
+            for (step, policy) in &policies {
+                partition.set_retry_policy(step, *policy);
+            }
+            if let Some(observer) = &observer {
+                partition.set_observer(Arc::clone(observer));
+            }
+        });
+        let seed = {
+            use std::hash::{BuildHasher, Hasher};
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u64(replication.id);
+            hasher.finish()
+        };
+        let replica = crate::replica::Replica::restart(
+            replication.id,
+            &replication.members,
+            replication.config,
+            seed,
+            recovered.hard_state,
+            recovered.snapshot,
+            recovered.entries,
+            self.deciders.clone(),
+            setup,
+        )
+        .map_err(EngineError::Open)?;
+        Ok(Replicated {
+            replica,
+            store,
+            send: replication.transport,
+            tick: replication.tick,
+            released: Vec::new(),
+        })
+    }
+
     /// Opens the engine: recovers the log, resumes every run, and starts the threads.
     pub fn open(mut self) -> Result<Engine, EngineError> {
         if let Some(frozen) = crate::import::frozen(&self.dir) {
@@ -466,27 +554,39 @@ impl Builder {
         deployments
             .apply(&mut self.deciders)
             .map_err(EngineError::Open)?;
-        let log = FileLog::open(self.dir.join("log"), self.log)
-            .map_err(|e| EngineError::Open(e.to_string()))?;
-        let state = RedbStateStore::open(&self.dir.join("state.redb"))
-            .map_err(|e| EngineError::Open(e.to_string()))?;
-        let mut partition = Partition::load_with_state(log, state, self.deciders)
-            .map_err(|e| EngineError::Open(e.to_string()))?;
-        // Before any run acts: an import is applied whole (ADR 0047).
-        let import =
-            crate::import::apply_pending(&mut partition, &self.dir).map_err(EngineError::Open)?;
-        partition
-            .resume()
-            .map_err(|e| EngineError::Open(e.to_string()))?;
-        partition.inject_ack_before_sync(self.ack_before_sync);
-        partition.set_default_retry_policy(self.default_retry);
-        partition.set_evict_finished(true);
-        if let Some(observer) = &self.observer {
-            partition.set_observer(Arc::clone(observer));
-        }
-        for (step, policy) in &self.retry_policies {
-            partition.set_retry_policy(step, *policy);
-        }
+        let (opened, import) = match self.replication.take() {
+            None => {
+                let log = FileLog::open(self.dir.join("log"), self.log)
+                    .map_err(|e| EngineError::Open(e.to_string()))?;
+                let state = RedbStateStore::open(&self.dir.join("state.redb"))
+                    .map_err(|e| EngineError::Open(e.to_string()))?;
+                let mut partition = Partition::load_with_state(log, state, self.deciders)
+                    .map_err(|e| EngineError::Open(e.to_string()))?;
+                // Before any run acts: an import is applied whole (ADR 0047).
+                let import = crate::import::apply_pending(&mut partition, &self.dir)
+                    .map_err(EngineError::Open)?;
+                partition
+                    .resume()
+                    .map_err(|e| EngineError::Open(e.to_string()))?;
+                partition.inject_ack_before_sync(self.ack_before_sync);
+                partition.set_default_retry_policy(self.default_retry);
+                partition.set_evict_finished(true);
+                if let Some(observer) = &self.observer {
+                    partition.set_observer(Arc::clone(observer));
+                }
+                for (step, policy) in &self.retry_policies {
+                    partition.set_retry_policy(step, *policy);
+                }
+                let last_checkpoint = partition.log().next_lsn();
+                let host = Local {
+                    partition,
+                    checkpoint_every: self.checkpoint_every,
+                    last_checkpoint,
+                };
+                (Opened::Local(host), import)
+            }
+            Some(replication) => (Opened::Replicated(self.open_replica(replication)?), None),
+        };
 
         let (requests, inbox) = mpsc::channel::<Request>();
         let (jobs, job_inbox) = mpsc::channel::<Job>();
@@ -519,33 +619,41 @@ impl Builder {
                 })
             })
             .collect();
-        let last_checkpoint = partition.log().next_lsn();
-        let processor = Processor {
-            host: Local {
-                partition,
-                checkpoint_every: self.checkpoint_every,
-                last_checkpoint,
-            },
-            jobs,
-            waiters: BTreeMap::new(),
-            starts: BTreeMap::new(),
-            signals: BTreeMap::new(),
-            updates: Vec::new(),
-            answers: Vec::new(),
-            deferred: Vec::new(),
-            remote: queue.clone().map(|queue| (queue, local)),
-            activations: activation_queue.clone(),
-            deployments,
-            dir: self.dir.clone(),
-            max_running: self.max_running,
-            running: 0,
-            namespace_max: self.namespace_running,
-            namespace_count: BTreeMap::new(),
-        };
+        // A replicated engine leads only once its processor says so.
+        let leading = Arc::new(Mutex::new((matches!(opened, Opened::Local(_)), None)));
         let redispatch = self.redispatch;
-        let thread = std::thread::spawn(move || processor.run(&inbox, redispatch));
+        macro_rules! spawn {
+            ($host:expr) => {{
+                let processor = Processor {
+                    host: $host,
+                    gated: VecDeque::new(),
+                    leading: Arc::clone(&leading),
+                    jobs,
+                    waiters: BTreeMap::new(),
+                    starts: BTreeMap::new(),
+                    signals: BTreeMap::new(),
+                    updates: Vec::new(),
+                    answers: Vec::new(),
+                    deferred: Vec::new(),
+                    remote: queue.clone().map(|queue| (queue, local)),
+                    activations: activation_queue.clone(),
+                    deployments,
+                    dir: self.dir.clone(),
+                    max_running: self.max_running,
+                    running: 0,
+                    namespace_max: self.namespace_running,
+                    namespace_count: BTreeMap::new(),
+                };
+                std::thread::spawn(move || processor.run(&inbox, redispatch))
+            }};
+        }
+        let thread = match opened {
+            Opened::Local(host) => spawn!(host),
+            Opened::Replicated(host) => spawn!(host),
+        };
         Ok(Engine {
             requests,
+            leading,
             thread: Some(thread),
             workers,
             queue,
@@ -559,6 +667,8 @@ impl Builder {
 /// An embedded engine. Dropping it stops the threads; the log keeps everything acknowledged.
 pub struct Engine {
     requests: Sender<Request>,
+    /// Whether the partition is here, and who leads it if not (a replicated engine).
+    leading: Arc<Mutex<(bool, Option<u64>)>>,
     thread: Option<JoinHandle<Result<(), String>>>,
     workers: Vec<JoinHandle<()>>,
     queue: Option<Arc<crate::queue::StepQueue>>,
@@ -713,6 +823,7 @@ impl Engine {
             max_running: None,
             namespace_running: BTreeMap::new(),
             weights: BTreeMap::new(),
+            replication: None,
         }
     }
 
@@ -993,7 +1104,46 @@ impl Engine {
     }
 
     fn stopped(&self) -> EngineError {
+        let running = self.thread.as_ref().is_some_and(|t| !t.is_finished());
+        if running
+            && let Ok(leading) = self.leading.lock()
+            && !leading.0
+        {
+            return EngineError::NotLeader(leading.1);
+        }
         EngineError::Stopped("the partition thread is no longer running".into())
+    }
+
+    /// A Raft message for this replica, from another (a replicated engine, ADR 0055).
+    pub fn raft_message(&self, envelope: aqueduct_raft::Envelope) {
+        let _ = self.requests.send(Request::Raft(envelope));
+    }
+
+    /// Where Raft messages for this replica go: for a transport to deliver into.
+    pub fn raft_inbox(&self) -> RaftInbox {
+        RaftInbox(self.requests.clone())
+    }
+
+    /// Whether this engine has its partition here: it leads, or is not replicated.
+    pub fn leads(&self) -> bool {
+        self.leading.lock().is_ok_and(|leading| leading.0)
+    }
+}
+
+/// Delivers Raft messages to a replicated engine; holds no more than its request channel.
+#[derive(Clone)]
+pub struct RaftInbox(Sender<Request>);
+
+impl std::fmt::Debug for RaftInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RaftInbox")
+    }
+}
+
+impl RaftInbox {
+    /// Delivers a message; dropped if the engine has stopped, as the network may drop it.
+    pub fn deliver(&self, envelope: aqueduct_raft::Envelope) {
+        let _ = self.0.send(Request::Raft(envelope));
     }
 }
 
@@ -1111,6 +1261,8 @@ enum Request {
     Stats {
         reply: Sender<EngineStats>,
     },
+    /// A Raft message from another replica (ADR 0055).
+    Raft(aqueduct_raft::Envelope),
     Shutdown,
 }
 
@@ -1139,8 +1291,32 @@ pub(crate) trait Host: Send + 'static {
     fn flush(&mut self) -> Result<Vec<Outbound>, String>;
     /// Saves a checkpoint if one is due. Only called right after a flush.
     fn checkpoint(&mut self, force: bool) -> Result<(), String>;
-    /// The workflows and builds the partition decides with.
-    fn deciders_mut(&mut self) -> &mut Deciders;
+    /// Changes the workflows and builds the partition decides with.
+    fn update_deciders(
+        &mut self,
+        change: &mut dyn FnMut(&mut Deciders) -> Result<(), String>,
+    ) -> Result<(), String>;
+    /// How often the host's clock ticks, if it has one (Raft).
+    fn tick_every(&self) -> Option<Duration> {
+        None
+    }
+    /// One tick.
+    fn tick(&mut self) {}
+    /// A message from another replica.
+    fn step(&mut self, _envelope: aqueduct_raft::Envelope) {}
+    /// An index that, once committed, proves everything written so far is durable and this host still
+    /// led then: `None` where a flush already proves it (a local log).
+    fn barrier(&mut self) -> Option<u64> {
+        None
+    }
+    /// How far the log is committed.
+    fn committed(&self) -> u64 {
+        u64::MAX
+    }
+    /// The leader, as far as this host knows, when it does not lead.
+    fn leader(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A partition on a local log: the embedded engine and the single server.
@@ -1179,13 +1355,127 @@ impl Host for Local {
         Ok(())
     }
 
-    fn deciders_mut(&mut self) -> &mut Deciders {
-        self.partition.deciders_mut()
+    fn update_deciders(
+        &mut self,
+        change: &mut dyn FnMut(&mut Deciders) -> Result<(), String>,
+    ) -> Result<(), String> {
+        change(self.partition.deciders_mut())
     }
 }
 
+/// A partition whose log is a Raft group (ADR 0055): here only while this replica leads.
+pub(crate) struct Replicated {
+    replica: crate::replica::Replica,
+    store: aqueduct_storage::RaftStore,
+    send: Transport,
+    tick: Duration,
+    released: Vec<Outbound>,
+}
+
+/// How a replica sends a Raft message to another.
+pub type Transport = Arc<dyn Fn(aqueduct_raft::Envelope) + Send + Sync>;
+
+/// Entries applied between snapshots of a replicated engine.
+const COMPACT_EVERY: u64 = 1_000;
+
+impl Replicated {
+    /// Does what the replica's readies ask: persists, sends, and collects what is released.
+    fn pump(&mut self) -> Result<(), String> {
+        while self.replica.has_ready() {
+            let ready = self.replica.ready()?;
+            self.store
+                .persist(&ready.raft)
+                .map_err(|e| format!("storage failed: {e}"))?;
+            for envelope in ready.raft.messages {
+                (self.send)(envelope);
+            }
+            self.released.extend(ready.released);
+            self.replica.advance()?;
+        }
+        Ok(())
+    }
+}
+
+impl Host for Replicated {
+    type Log = crate::replica::BatchLog;
+    type State = aqueduct_storage::NoStateStore;
+
+    fn partition(&self) -> Option<&crate::replica::ReplicaPartition> {
+        if self.replica.leads() {
+            self.replica.partition()
+        } else {
+            None
+        }
+    }
+
+    fn partition_mut(&mut self) -> Option<&mut crate::replica::ReplicaPartition> {
+        self.replica.partition_mut().ok()
+    }
+
+    fn flush(&mut self) -> Result<Vec<Outbound>, String> {
+        self.replica.flush()?;
+        self.pump()?;
+        Ok(std::mem::take(&mut self.released))
+    }
+
+    fn checkpoint(&mut self, _force: bool) -> Result<(), String> {
+        if self.replica.applied() >= self.replica.raft().snapshot_index() + COMPACT_EVERY {
+            self.replica.compact();
+            if let Some(snapshot) = self.replica.raft().snapshot().cloned() {
+                self.store
+                    .save_snapshot(&snapshot)
+                    .map_err(|e| format!("storage failed: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn update_deciders(
+        &mut self,
+        change: &mut dyn FnMut(&mut Deciders) -> Result<(), String>,
+    ) -> Result<(), String> {
+        change(self.replica.deciders_mut())?;
+        if let Ok(partition) = self.replica.partition_mut() {
+            change(partition.deciders_mut())?;
+        }
+        Ok(())
+    }
+
+    fn tick_every(&self) -> Option<Duration> {
+        Some(self.tick)
+    }
+
+    fn tick(&mut self) {
+        self.replica.tick();
+    }
+
+    fn step(&mut self, envelope: aqueduct_raft::Envelope) {
+        self.replica.step(envelope.from, envelope.message);
+    }
+
+    fn barrier(&mut self) -> Option<u64> {
+        // Not leading: nothing can be answered, and the callers are let go.
+        Some(self.replica.barrier().unwrap_or(u64::MAX))
+    }
+
+    fn committed(&self) -> u64 {
+        self.replica.raft().commit()
+    }
+
+    fn leader(&self) -> Option<u64> {
+        self.replica.raft().leader()
+    }
+}
+
+/// A reply to send once what it reflects is committed.
+type Reply = Box<dyn FnOnce() + Send>;
+
 struct Processor<H: Host> {
     host: H,
+    /// Replies waiting for an index to commit (a replicated host), oldest first.
+    gated: VecDeque<(u64, Vec<Reply>)>,
+    /// Whether this engine leads its partition, and who does if not: for callers turned away.
+    leading: Arc<Mutex<(bool, Option<u64>)>>,
     jobs: Sender<Job>,
     waiters: BTreeMap<String, Vec<Sender<Result<RunResult, EngineError>>>>,
     starts: BTreeMap<String, Vec<Sender<Result<(), EngineError>>>>,
@@ -1233,6 +1523,8 @@ impl<H: Host> Processor<H> {
         }
         self.flush()?;
         let mut next_redispatch = now_ms().saturating_add(millis(redispatch));
+        let tick = self.host.tick_every();
+        let mut next_tick = tick.map(|t| now_ms().saturating_add(millis(t)));
         loop {
             let now = now_ms();
             let wake = self
@@ -1240,12 +1532,19 @@ impl<H: Host> Processor<H> {
                 .partition()
                 .and_then(Partition::next_timer)
                 .map_or(next_redispatch, |t| t.min(next_redispatch));
+            let wake = next_tick.map_or(wake, |t| t.min(wake));
             let first = match inbox.recv_timeout(Duration::from_millis(wake.saturating_sub(now))) {
                 Ok(request) => Some(request),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             };
             let now = now_ms();
+            if let (Some(every), Some(at)) = (tick, next_tick)
+                && now >= at
+            {
+                self.host.tick();
+                next_tick = Some(now.saturating_add(millis(every)));
+            }
             if let Some(partition) = self.host.partition_mut() {
                 partition.set_time(now);
                 if now >= next_redispatch {
@@ -1271,6 +1570,24 @@ impl<H: Host> Processor<H> {
 
     /// Applies one request; false on shutdown.
     fn handle(&mut self, request: Request) -> Result<bool, String> {
+        let request = match request {
+            Request::Raft(envelope) => {
+                self.host.step(envelope);
+                return Ok(true);
+            }
+            Request::Shutdown => return Ok(false),
+            Request::Stats { reply } if self.host.partition().is_none() => {
+                let _ = reply.send(EngineStats {
+                    runs_in_memory: 0,
+                    pending_timers: 0,
+                    log_lsn: 0,
+                });
+                return Ok(true);
+            }
+            // Not here: the caller's reply is dropped, and it is told who leads.
+            _ if self.host.partition().is_none() => return Ok(true),
+            request => request,
+        };
         match request {
             Request::Start {
                 key,
@@ -1572,7 +1889,7 @@ impl<H: Host> Processor<H> {
                     log_lsn: self.part()?.log().next_lsn(),
                 });
             }
-            Request::Shutdown => return Ok(false),
+            Request::Shutdown | Request::Raft(_) => return Ok(false),
         }
         // Only non-empty under the injected acknowledge-before-sync bug.
         let early = self.part()?.take_unsynced();
@@ -1641,7 +1958,14 @@ impl<H: Host> Processor<H> {
         build: &str,
         force: bool,
     ) -> Result<(), EngineError> {
-        if !self.host.deciders_mut().is_remote(workflow) {
+        let mut remote = false;
+        self.host
+            .update_deciders(&mut |deciders| {
+                remote = deciders.is_remote(workflow);
+                Ok(())
+            })
+            .map_err(EngineError::Deployment)?;
+        if !remote {
             return Err(EngineError::UnknownWorkflow(workflow.to_owned()));
         }
         if build.is_empty() {
@@ -1662,8 +1986,11 @@ impl<H: Host> Processor<H> {
             .activate(&self.dir, workflow, build)
             .map_err(EngineError::Deployment)?;
         self.host
-            .deciders_mut()
-            .activate_build(workflow, build)
+            .update_deciders(&mut |deciders| {
+                deciders
+                    .activate_build(workflow, build)
+                    .map_err(|e| e.to_string())
+            })
             .map_err(|_| EngineError::UnknownWorkflow(workflow.to_owned()))
     }
 
@@ -1679,7 +2006,12 @@ impl<H: Host> Processor<H> {
         self.deployments
             .retire(&self.dir, workflow, build, open)
             .map_err(EngineError::Deployment)?;
-        self.host.deciders_mut().forbid_build(workflow, build);
+        self.host
+            .update_deciders(&mut |deciders| {
+                deciders.forbid_build(workflow, build);
+                Ok(())
+            })
+            .map_err(EngineError::Deployment)?;
         Ok(())
     }
 
@@ -1692,8 +2024,39 @@ impl<H: Host> Processor<H> {
             self.namespace_count.clone_from(partition.running());
             self.running = self.namespace_count.values().sum();
         }
-        self.answer_waiters();
-        self.answer_updates().map_err(|e| e.to_string())?;
+        let leads = self.host.partition().is_some();
+        *self.leading.lock().map_err(|_| "a lock was poisoned")? = (leads, self.host.leader());
+        if !leads {
+            // Whoever waits is let go, and told who leads; their requests can be repeated there.
+            self.starts.clear();
+            self.signals.clear();
+            self.waiters.clear();
+            self.updates.clear();
+            self.answers.clear();
+            self.deferred.clear();
+            self.gated.clear();
+            return Ok(());
+        }
+        let mut replies: Vec<Reply> = Vec::new();
+        self.answer_waiters(&mut replies);
+        self.answer_updates(&mut replies)
+            .map_err(|e| e.to_string())?;
+        if !replies.is_empty() {
+            match self.host.barrier() {
+                None => replies.into_iter().for_each(|reply| reply()),
+                Some(index) => self.gated.push_back((index, replies)),
+            }
+        }
+        let committed = self.host.committed();
+        while self
+            .gated
+            .front()
+            .is_some_and(|(index, _)| *index <= committed)
+        {
+            if let Some((_, replies)) = self.gated.pop_front() {
+                replies.into_iter().for_each(|reply| reply());
+            }
+        }
         Ok(())
     }
 
@@ -1738,13 +2101,13 @@ impl<H: Host> Processor<H> {
 
     /// Called right after a flush: sends the answers computed before it, and answers accepted updates
     /// whose run has answered them, or has ended without doing so.
-    fn answer_updates(&mut self) -> Result<(), PartitionError> {
+    fn answer_updates(&mut self, replies: &mut Vec<Reply>) -> Result<(), PartitionError> {
         for (reply, answer) in self.answers.drain(..) {
-            let _ = reply.send(answer);
+            replies.push(Box::new(move || {
+                let _ = reply.send(answer);
+            }));
         }
-        for reply in self.deferred.drain(..) {
-            reply();
-        }
+        replies.append(&mut self.deferred);
         let Some(partition) = self.host.partition_mut() else {
             return Ok(());
         };
@@ -1758,9 +2121,9 @@ impl<H: Host> Processor<H> {
                     .and_then(|state| update_answer(&state, cmd)),
             };
             match answer {
-                Some(answer) => {
+                Some(answer) => replies.push(Box::new(move || {
                     let _ = reply.send(answer);
-                }
+                })),
                 None => waiting.push((run, cmd, reply)),
             }
         }
@@ -1874,7 +2237,7 @@ impl<H: Host> Processor<H> {
 
     /// Called right after a flush, when everything in memory is durable: answers waiters whose runs
     /// have ended.
-    fn answer_waiters(&mut self) {
+    fn answer_waiters(&mut self, replies: &mut Vec<Reply>) {
         // Waiters of a run that continued as new wait for its successor (perhaps continued again).
         loop {
             let continued: Vec<String> = self
@@ -1921,7 +2284,10 @@ impl<H: Host> Processor<H> {
                 version: state.version().map(str::to_owned),
             };
             for reply in self.waiters.remove(&key).unwrap_or_default() {
-                let _ = reply.send(Ok(result.clone()));
+                let result = result.clone();
+                replies.push(Box::new(move || {
+                    let _ = reply.send(Ok(result));
+                }));
             }
         }
     }
