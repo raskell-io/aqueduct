@@ -53,6 +53,9 @@ pub struct Config {
     /// directory laid out for another number is refused.
     #[serde(default)]
     pub partitions: Option<u32>,
+    /// History archival to object storage (ADR 0061).
+    #[serde(default)]
+    pub archive: Option<crate::archive::ArchiveConfig>,
 }
 
 impl Config {
