@@ -14,9 +14,9 @@
 > **Status: single server (phase 3 of the [build brief](BRIEF.md)).** The embedded engine, procedures, agent steps
 > and the version registry are built. So is a server with workers in Rust, Python and TypeScript, deployments,
 > priorities, tokens, TLS, an audit log, namespaces and overload protection: every item of phase 3. Work on a
-> replicated cluster has begun (phase 4, [ADR 0051](docs/adr/0051-cluster-and-raft.md)): its Raft, replicated partitions,
-> messages between partitions and a metadata store that moves replicas run in a simulator; the server
-> does not use them yet.
+> replicated cluster has begun (phase 4, [ADR 0051](docs/adr/0051-cluster-and-raft.md)): three or more servers can
+> replicate one partition with our own Raft and survive losing their leader ([ADR 0056](docs/adr/0056-cluster-server.md));
+> many partitions, messages between them and moving replicas run in the simulator so far.
 >
 > You can try it, but do not depend on it yet: the APIs and the history format will still change, and nothing
 > is published on crates.io. See [what is not done](#what-is-not-done), the [docs](docs/README.md) and the
@@ -45,7 +45,7 @@ one journal format and one set of guarantees.
 |---|---|---|---|
 | **Embedded** | the engine, inside your program (`aqueduct` crate) | CLIs, desktop apps, single binary services, tests | built |
 | **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built |
-| **Cluster** | several servers, replicated | production platforms | started: Raft, replicated partitions and messages between them, simulated |
+| **Cluster** | several servers, replicated | production platforms | started: one replicated partition across servers; many partitions simulated |
 
 An embedded directory and a server's are the same format, and
 `aqueduct migrate --from ./data --to https://server` moves one to a running server
@@ -296,7 +296,9 @@ engine, not the server, whose transports have tests of their own, which are narr
 
 ## What is not done
 
-- **A cluster:** no replication. A single server does not survive losing its disk.
+- **A production cluster:** servers replicate one partition (ADR 0056), but not yet many partitions per
+  server, forwarding to the leader, moving replicas between servers, mutual TLS between nodes, or the
+  failover drill and measurements on real machines. Not production-ready.
 - **Stable formats:** the protocol and the history format are drafts until phase 5.
 - **Packages:** nothing on crates.io, PyPI or npm. Depend on the repository.
 - **Identity beyond static tokens:** no OIDC or JWT, and no mutual TLS.

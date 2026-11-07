@@ -18,6 +18,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod cluster;
 mod deployments;
 mod imports;
 mod limits;
@@ -93,7 +94,11 @@ pub async fn serve_with(
     };
     let security = security.with_limits(config.limits.clone());
     tls::serve(
-        router_secured(engine, security),
+        with_cluster(
+            router_secured(Arc::clone(&engine), security),
+            &engine,
+            config,
+        ),
         listener,
         None,
         connections,
@@ -118,7 +123,11 @@ pub async fn serve_tls(
     };
     let security = security.with_limits(config.limits.clone());
     tls::serve(
-        router_secured(engine, security),
+        with_cluster(
+            router_secured(Arc::clone(&engine), security),
+            &engine,
+            config,
+        ),
         listener,
         Some(tls),
         connections,
@@ -171,6 +180,14 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
         .merge(workers::routes(api.clone()))
         .merge(deployments::routes(api.clone()))
         .layer(axum::middleware::from_fn_with_state(api, authorize))
+}
+
+/// The router, with the route other nodes send Raft messages to, in cluster mode.
+fn with_cluster(router: Router, engine: &Engine, config: &Config) -> Router {
+    match &config.cluster {
+        Some(cluster) => router.merge(cluster::routes(engine, cluster)),
+        None => router,
+    }
 }
 
 /// Why a call failed, in terms both transports can say.
