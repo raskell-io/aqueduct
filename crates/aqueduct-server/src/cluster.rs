@@ -376,22 +376,49 @@ async fn receive_remote(State(peer): State<Peer>, headers: HeaderMap, body: Byte
 struct Forward {
     peers: Arc<BTreeMap<u64, String>>,
     client: crate::push::Client,
+    grpc: crate::push::Client,
 }
 
-/// Forwards HTTP/JSON requests (`/v1/...`) that reach a partition this server does not lead to the
-/// server that does, and returns its answer: clients may ask any server. The request is tried here
-/// first; an *unavailable* answer naming the leader ([`LEADER_HEADER`]) sends it there. Applied outside
-/// authentication, so that the leader authenticates it; every server needs the same tokens. gRPC calls
-/// are not forwarded.
+/// The gRPC service whose calls are forwarded: every one of its calls is unary, so a call can be held
+/// whole and sent again. Workers' streams are not forwarded: workers connect to every server.
+const FORWARDED_SERVICE: &str = "/aqueduct.v1.Ingress/";
+
+/// Forwards requests that reach a partition this server does not lead to the server that does, and
+/// returns its answer: clients may ask any server. HTTP/JSON (`/v1/...`) and the unary gRPC ingress
+/// calls are tried here first; an *unavailable* answer naming the leader ([`LEADER_HEADER`]) sends them
+/// there. Applied outside authentication, so that the leader authenticates them; every server needs the
+/// same tokens.
 pub(crate) fn forwarding(router: Router, cluster: &Cluster) -> Result<Router, String> {
     let forward = Forward {
         peers: Arc::new(cluster.peers.clone()),
         client: crate::push::client()?,
+        grpc: crate::push::grpc_client()?,
     };
     Ok(router.layer(axum::middleware::from_fn_with_state(
         forward,
         forward_request,
     )))
+}
+
+/// The leader an answer names, if it is a refusal by a server that does not lead: HTTP 503, or gRPC
+/// status 14 (`UNAVAILABLE`), with [`LEADER_HEADER`].
+fn named_leader(answer: &axum::response::Response, grpc: bool) -> Option<u64> {
+    let refused = if grpc {
+        answer
+            .headers()
+            .get("grpc-status")
+            .is_some_and(|status| status.as_bytes() == b"14")
+    } else {
+        answer.status() == StatusCode::SERVICE_UNAVAILABLE
+    };
+    if !refused {
+        return None;
+    }
+    answer
+        .headers()
+        .get(LEADER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 async fn forward_request(
@@ -404,10 +431,13 @@ async fn forward_request(
         .headers()
         .get("content-type")
         .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
-    if grpc
-        || !request.uri().path().starts_with("/v1/")
-        || request.headers().contains_key(FORWARDED_HEADER)
-    {
+    let path = request.uri().path();
+    let forwardable = if grpc {
+        path.starts_with(FORWARDED_SERVICE)
+    } else {
+        path.starts_with("/v1/")
+    };
+    if !forwardable || request.headers().contains_key(FORWARDED_HEADER) {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
@@ -424,13 +454,8 @@ async fn forward_request(
             axum::body::Body::from(body.clone()),
         ))
         .await;
-    let leader = here
-        .headers()
-        .get(LEADER_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    let target = leader.and_then(|leader| forward.peers.get(&leader));
-    let (Some(target), StatusCode::SERVICE_UNAVAILABLE) = (target, here.status()) else {
+    let Some(target) = named_leader(&here, grpc).and_then(|leader| forward.peers.get(&leader))
+    else {
         return here;
     };
     let path = parts
@@ -448,7 +473,8 @@ async fn forward_request(
     let Ok(outgoing) = outgoing.header(FORWARDED_HEADER, "1").body(Full::new(body)) else {
         return here;
     };
-    match forward.client.request(outgoing).await {
+    let client = if grpc { &forward.grpc } else { &forward.client };
+    match client.request(outgoing).await {
         Ok(answer) => answer.map(axum::body::Body::new),
         Err(_) => here,
     }

@@ -23,9 +23,11 @@ must provide one between machines, and clients must find the node that leads.
 - **Clients** may ask any node. Over HTTP/JSON, a node that does not lead forwards the request to the
   node that does and returns its answer, marked `aqueduct-forwarded` so that it is never forwarded
   twice. Forwarding happens before authentication: the leader authenticates, so every node needs the
-  same tokens. Over gRPC, and when no leader is known, a node that does not lead answers *unavailable*
-  (HTTP 503, gRPC `UNAVAILABLE`), naming the leader's node id when it knows it; the client asks another
-  node. gRPC forwarding, and SDK clients that follow the leader on their own, are later.
+  same tokens. The unary gRPC calls of `aqueduct.v1.Ingress` are forwarded the same way, over HTTP/2 (a
+  refusal is status 14 with `aqueduct-leader` metadata); the streaming calls of workers and imports
+  are not, and workers connect to every node. When no leader is known, a node that does not lead
+  answers *unavailable* (HTTP 503, gRPC `UNAVAILABLE`), and the client asks again. SDK clients that
+  follow the leader on their own are later.
 - **Workers** connect to every node: steps are dispatched by whichever node leads.
 
 ## Consequences

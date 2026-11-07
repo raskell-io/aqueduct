@@ -576,7 +576,14 @@ impl From<Failure> for tonic::Status {
             Kind::Forbidden => tonic::Code::PermissionDenied,
             Kind::RateLimited => tonic::Code::ResourceExhausted,
         };
-        tonic::Status::new(code, failure.message)
+        let mut status = tonic::Status::new(code, failure.message);
+        // Which server leads, for a client or a forwarding server to ask instead (ADR 0056).
+        if let Kind::NotLeader(Some(leader)) = failure.kind
+            && let Ok(value) = leader.to_string().parse()
+        {
+            status.metadata_mut().insert(cluster::LEADER_HEADER, value);
+        }
+        status
     }
 }
 
