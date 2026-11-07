@@ -36,6 +36,17 @@ pub struct Entry {
     pub data: Vec<u8>,
 }
 
+/// A state machine's state as of an index, standing in for the log up to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The last entry it includes.
+    pub index: u64,
+    /// That entry's term.
+    pub term: u64,
+    /// The state machine's state, as the driver encoded it.
+    pub data: Vec<u8>,
+}
+
 /// What a node must persist before it acts on it: its term, its vote in that term, and how far it knows
 /// the log is committed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,7 +95,14 @@ pub enum Message {
         /// The leader's commit index.
         commit: u64,
     },
-    /// The answer to a [`Message::Append`].
+    /// A snapshot, for a follower that needs entries the leader no longer has.
+    InstallSnapshot {
+        /// The leader's term.
+        term: u64,
+        /// The snapshot.
+        snapshot: Snapshot,
+    },
+    /// The answer to a [`Message::Append`] or a [`Message::InstallSnapshot`].
     AppendReply {
         /// The follower's term.
         term: u64,
@@ -120,6 +138,9 @@ pub struct Ready {
     pub messages: Vec<Envelope>,
     /// Entries committed and durable on this node, to apply in order.
     pub committed: Vec<Entry>,
+    /// A snapshot from the leader, to persist before anything else: the state machine is replaced by it,
+    /// and persisted entries up to its index are dropped. Committed entries in the same ready follow it.
+    pub snapshot: Option<Snapshot>,
 }
 
 impl Ready {
@@ -130,6 +151,7 @@ impl Ready {
             && self.entries.is_empty()
             && self.messages.is_empty()
             && self.committed.is_empty()
+            && self.snapshot.is_none()
     }
 }
 
@@ -184,8 +206,15 @@ pub struct RaftNode {
     term: u64,
     vote: Option<NodeId>,
     commit: u64,
-    /// The log; entry `i` is at `log[i - 1]`.
+    /// The log after the snapshot: entry `i` is at `log[i - snapshot_index - 1]`.
     log: Vec<Entry>,
+    /// The last entry the snapshot includes, and its term: 0 and 0 without one.
+    snapshot_index: u64,
+    snapshot_term: u64,
+    /// The snapshot, to send to followers that need what it replaced.
+    snapshot: Option<Snapshot>,
+    /// A snapshot from the leader that the driver has not been given yet.
+    incoming: Option<Snapshot>,
     applied: u64,
     role: Role,
     leader: Option<NodeId>,
@@ -217,23 +246,29 @@ impl RaftNode {
             config,
             seed,
             HardState::default(),
+            None,
             Vec::new(),
             0,
         )
     }
 
-    /// A member restarted from what it persisted: its hard state and log. `applied` is how far its state
-    /// machine has durably applied the log; entries after it are applied again.
+    /// A member restarted from what it persisted: its hard state, its snapshot and the log after it.
+    /// `applied` is how far its state machine has durably applied the log (at least the snapshot);
+    /// entries after it are applied again.
+    #[allow(clippy::too_many_arguments)]
     pub fn restart(
         id: NodeId,
         members: &[NodeId],
         config: Config,
         seed: u64,
         hard_state: HardState,
+        snapshot: Option<Snapshot>,
         log: Vec<Entry>,
         applied: u64,
     ) -> RaftNode {
-        let last = log.last().map_or(0, |e| e.index);
+        let (snapshot_index, snapshot_term) =
+            snapshot.as_ref().map_or((0, 0), |s| (s.index, s.term));
+        let last = log.last().map_or(snapshot_index, |e| e.index);
         let mut node = RaftNode {
             id,
             members: members.to_vec(),
@@ -241,9 +276,13 @@ impl RaftNode {
             rng: seed ^ 0x9e37_79b9_7f4a_7c15 ^ id.wrapping_mul(0xbf58_476d_1ce4_e5b9),
             term: hard_state.term,
             vote: hard_state.vote,
-            commit: hard_state.commit.min(last),
+            commit: hard_state.commit.min(last).max(snapshot_index),
             log,
-            applied: applied.min(last),
+            snapshot_index,
+            snapshot_term,
+            snapshot,
+            incoming: None,
+            applied: applied.max(snapshot_index).min(last),
             role: Role::Follower,
             leader: None,
             elapsed: 0,
@@ -288,26 +327,69 @@ impl RaftNode {
         self.commit
     }
 
-    /// Its log.
+    /// Its log after its snapshot.
     pub fn log(&self) -> &[Entry] {
         &self.log
     }
 
+    /// The last entry its snapshot includes: 0 without one.
+    pub fn snapshot_index(&self) -> u64 {
+        self.snapshot_index
+    }
+
+    /// Its snapshot, if it has one.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// The entry at `index`, unless the snapshot replaced it (or there is none).
+    pub fn entry(&self, index: u64) -> Option<&Entry> {
+        self.log.get(self.position(index)?)
+    }
+
+    fn position(&self, index: u64) -> Option<usize> {
+        if index <= self.snapshot_index {
+            return None;
+        }
+        usize::try_from(index - self.snapshot_index - 1).ok()
+    }
+
     fn last_index(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.index)
+        self.log.last().map_or(self.snapshot_index, |e| e.index)
     }
 
     fn last_term(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.term)
+        self.log.last().map_or(self.snapshot_term, |e| e.term)
     }
 
+    /// An entry's term: known for the snapshot's last entry, and unknown for those it replaced.
     fn term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return Some(0);
         }
-        self.log
-            .get(usize::try_from(index - 1).ok()?)
-            .map(|e| e.term)
+        if index == self.snapshot_index {
+            return Some(self.snapshot_term);
+        }
+        self.entry(index).map(|e| e.term)
+    }
+
+    /// The driver has persisted a snapshot of its state machine as of `index`, which it has applied: the
+    /// log up to it can go. The driver may then drop its persisted entries up to `index` too. Ignored for
+    /// an index not applied, or already compacted.
+    pub fn compact(&mut self, index: u64, data: Vec<u8>) {
+        if index <= self.snapshot_index || index > self.applied {
+            return;
+        }
+        let Some(term) = self.term_at(index) else {
+            return;
+        };
+        let Some(position) = self.position(index) else {
+            return;
+        };
+        self.log.drain(..=position);
+        self.snapshot_index = index;
+        self.snapshot_term = term;
+        self.snapshot = Some(Snapshot { index, term, data });
     }
 
     fn quorum(&self) -> usize {
@@ -550,6 +632,9 @@ impl RaftNode {
                 entries,
                 commit,
             } => self.on_append(from, term, prev_index, prev_term, entries, commit),
+            Message::InstallSnapshot { term, snapshot } => {
+                self.on_install_snapshot(from, term, snapshot);
+            }
             Message::AppendReply {
                 term,
                 success,
@@ -640,8 +725,12 @@ impl RaftNode {
             );
             return;
         }
-        let last_new = prev_index + entries.len() as u64;
+        let last_new = (prev_index + entries.len() as u64).max(self.snapshot_index);
         for entry in entries {
+            // The snapshot holds what it replaced, committed: nothing to compare or append.
+            if entry.index <= self.snapshot_index {
+                continue;
+            }
             match self.term_at(entry.index) {
                 Some(term) if term == entry.term => {}
                 Some(_) => {
@@ -664,12 +753,74 @@ impl RaftNode {
     }
 
     fn truncate(&mut self, from: u64) {
-        self.log.truncate(usize::try_from(from - 1).unwrap_or(0));
+        if let Some(position) = self.position(from) {
+            self.log.truncate(position);
+        }
         if from <= self.persisted {
             self.truncate_from = Some(self.truncate_from.map_or(from, |t| t.min(from)));
             self.persisted = from - 1;
         }
         self.unstable_from = self.unstable_from.min(from);
+    }
+
+    fn on_install_snapshot(&mut self, from: NodeId, term: u64, snapshot: Snapshot) {
+        if term < self.term {
+            let (term, index) = (self.term, self.last_index());
+            self.send(
+                from,
+                Message::AppendReply {
+                    term,
+                    success: false,
+                    index,
+                },
+            );
+            return;
+        }
+        self.become_follower(term, Some(from));
+        if snapshot.index <= self.commit {
+            // It has all that, and more.
+            let (term, index) = (self.term, self.commit);
+            self.send(
+                from,
+                Message::AppendReply {
+                    term,
+                    success: true,
+                    index,
+                },
+            );
+            return;
+        }
+        // The log after the snapshot is kept if it agrees with it; otherwise none of it is.
+        if self.term_at(snapshot.index) == Some(snapshot.term) {
+            if let Some(position) = self.position(snapshot.index) {
+                self.log.drain(..=position);
+            }
+        } else {
+            if self.persisted > snapshot.index {
+                self.truncate_from = Some(snapshot.index + 1);
+            }
+            self.log.clear();
+            self.persisted = snapshot.index;
+            self.unstable_from = snapshot.index + 1;
+        }
+        self.persisted = self.persisted.max(snapshot.index);
+        self.unstable_from = self.unstable_from.max(snapshot.index + 1);
+        self.snapshot_index = snapshot.index;
+        self.snapshot_term = snapshot.term;
+        self.commit = self.commit.max(snapshot.index);
+        self.applied = self.applied.max(snapshot.index);
+        self.snapshot = Some(snapshot.clone());
+        let index = snapshot.index;
+        self.incoming = Some(snapshot);
+        let term = self.term;
+        self.send(
+            from,
+            Message::AppendReply {
+                term,
+                success: true,
+                index,
+            },
+        );
     }
 
     fn on_append_reply(&mut self, from: NodeId, term: u64, success: bool, index: u64) {
@@ -728,9 +879,17 @@ impl RaftNode {
 
     fn send_append(&mut self, to: NodeId) {
         let next = self.next.get(&to).copied().unwrap_or(1).max(1);
+        // What it needs is in the snapshot now.
+        if next <= self.snapshot_index
+            && let Some(snapshot) = self.snapshot.clone()
+        {
+            let term = self.term;
+            self.send(to, Message::InstallSnapshot { term, snapshot });
+            return;
+        }
         let prev_index = next - 1;
         let prev_term = self.term_at(prev_index).unwrap_or(0);
-        let start = usize::try_from(prev_index).unwrap_or(usize::MAX);
+        let start = usize::try_from(prev_index - self.snapshot_index).unwrap_or(usize::MAX);
         let end = start
             .saturating_add(self.config.max_entries)
             .min(self.log.len());
@@ -760,27 +919,28 @@ impl RaftNode {
             commit: self.commit,
         };
         let entries = self
-            .log
-            .get(usize::try_from(self.unstable_from - 1).unwrap_or(usize::MAX)..)
+            .position(self.unstable_from)
+            .and_then(|position| self.log.get(position..))
             .map(<[Entry]>::to_vec)
             .unwrap_or_default();
         // Everything in this ready is persisted before anything is applied, so the whole log is durable.
         let durable = self.last_index();
         let apply_to = self.commit.min(durable);
-        let committed = self
-            .log
-            .get(
-                usize::try_from(self.applied).unwrap_or(usize::MAX)
-                    ..usize::try_from(apply_to).unwrap_or(0),
-            )
-            .map(<[Entry]>::to_vec)
-            .unwrap_or_default();
+        let committed = match (self.position(self.applied + 1), self.position(apply_to)) {
+            (Some(first), Some(last)) => self
+                .log
+                .get(first..=last)
+                .map(<[Entry]>::to_vec)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let ready = Ready {
             hard_state: (hard_state != self.stable).then_some(hard_state),
             truncate_from: self.truncate_from.take(),
             entries,
             messages: std::mem::take(&mut self.messages),
             committed,
+            snapshot: self.incoming.take(),
         };
         self.stable = hard_state;
         self.unstable_from = self.last_index() + 1;
@@ -800,6 +960,7 @@ impl RaftNode {
     /// Whether [`RaftNode::ready`] has anything to do.
     pub fn has_ready(&self) -> bool {
         !self.messages.is_empty()
+            || self.incoming.is_some()
             || self.truncate_from.is_some()
             || self.unstable_from <= self.last_index()
             || self.applied < self.commit.min(self.last_index())
@@ -898,6 +1059,7 @@ mod tests {
                 vote: None,
                 commit: 0,
             },
+            None,
             vec![
                 Entry {
                     term: 1,
@@ -996,6 +1158,7 @@ mod tests {
                 vote: None,
                 commit: 1,
             },
+            None,
             vec![entry(1, 1), entry(2, 2)],
             1,
         );
@@ -1052,8 +1215,16 @@ mod tests {
         assert_eq!(persisted.vote, Some(1));
         node.advance();
         // Restarted from what it persisted, it does not vote again in that term.
-        let mut node =
-            RaftNode::restart(2, &members, Config::default(), 4, persisted, Vec::new(), 0);
+        let mut node = RaftNode::restart(
+            2,
+            &members,
+            Config::default(),
+            4,
+            persisted,
+            None,
+            Vec::new(),
+            0,
+        );
         node.step(
             3,
             Message::RequestVote {
@@ -1074,6 +1245,156 @@ mod tests {
         ));
     }
 
+    fn snapshot(index: u64, term: u64) -> Snapshot {
+        Snapshot {
+            index,
+            term,
+            data: b"state".to_vec(),
+        }
+    }
+
+    fn follower_with(log: Vec<Entry>, commit: u64) -> RaftNode {
+        RaftNode::restart(
+            2,
+            &[1, 2, 3],
+            Config::default(),
+            1,
+            HardState {
+                term: 2,
+                vote: None,
+                commit,
+            },
+            None,
+            log,
+            commit,
+        )
+    }
+
+    #[test]
+    fn compaction_keeps_what_was_not_applied() {
+        let mut node = follower_with(vec![entry(1, 1), entry(1, 2), entry(2, 3)], 2);
+        node.compact(3, b"too far".to_vec());
+        assert_eq!(node.snapshot_index(), 0, "index 3 is not applied");
+        node.compact(2, b"state".to_vec());
+        assert_eq!(node.snapshot_index(), 2);
+        assert_eq!(node.log(), [entry(2, 3)]);
+        assert_eq!(node.entry(2), None);
+        assert_eq!(node.entry(3), Some(&entry(2, 3)));
+        node.compact(1, b"older".to_vec());
+        assert_eq!(node.snapshot_index(), 2, "a snapshot does not go back");
+    }
+
+    #[test]
+    fn an_installed_snapshot_keeps_the_log_that_agrees_with_it() {
+        let mut node = follower_with(vec![entry(1, 1), entry(1, 2), entry(2, 3)], 1);
+        node.step(
+            1,
+            Message::InstallSnapshot {
+                term: 2,
+                snapshot: snapshot(2, 1),
+            },
+        );
+        let ready = node.ready();
+        assert_eq!(ready.snapshot.map(|s| s.index), Some(2));
+        assert_eq!(ready.truncate_from, None, "index 3 agrees, and is kept");
+        assert_eq!(node.log(), [entry(2, 3)]);
+        assert!(matches!(
+            ready.messages[0].message,
+            Message::AppendReply {
+                success: true,
+                index: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_installed_snapshot_discards_a_log_that_disagrees() {
+        let mut node = follower_with(vec![entry(1, 1), entry(1, 2), entry(1, 3)], 1);
+        node.step(
+            1,
+            Message::InstallSnapshot {
+                term: 3,
+                snapshot: snapshot(2, 2),
+            },
+        );
+        let ready = node.ready();
+        assert_eq!(
+            ready.truncate_from,
+            Some(3),
+            "index 3 came from another history"
+        );
+        assert!(node.log().is_empty());
+        assert_eq!(node.commit(), 2);
+        // What it already has, it does not install again.
+        node.advance();
+        node.step(
+            1,
+            Message::InstallSnapshot {
+                term: 3,
+                snapshot: snapshot(1, 1),
+            },
+        );
+        assert!(node.ready().snapshot.is_none());
+    }
+
+    #[test]
+    fn an_append_right_after_the_snapshot_is_accepted() {
+        let mut node = follower_with(vec![entry(1, 1), entry(1, 2)], 2);
+        node.compact(2, b"state".to_vec());
+        let _ = node.ready();
+        node.advance();
+        // The leader's previous entry is the snapshot's last: its term is known, and it agrees.
+        node.step(
+            1,
+            Message::Append {
+                term: 2,
+                prev_index: 2,
+                prev_term: 1,
+                entries: vec![entry(2, 3)],
+                commit: 3,
+            },
+        );
+        let ready = node.ready();
+        assert!(matches!(
+            ready.messages[0].message,
+            Message::AppendReply {
+                success: true,
+                index: 3,
+                ..
+            }
+        ));
+        assert_eq!(ready.committed, [entry(2, 3)]);
+    }
+
+    #[test]
+    fn a_node_restarts_from_its_snapshot_and_the_log_after_it() {
+        let node = RaftNode::restart(
+            2,
+            &[1, 2, 3],
+            Config::default(),
+            1,
+            HardState {
+                term: 2,
+                vote: None,
+                commit: 5,
+            },
+            Some(snapshot(4, 2)),
+            vec![entry(2, 5), entry(2, 6)],
+            4,
+        );
+        assert_eq!((node.snapshot_index(), node.commit()), (4, 5));
+        assert_eq!(node.entry(5), Some(&entry(2, 5)));
+        let mut node = node;
+        let ready = node.ready();
+        let applied: Vec<u64> = ready.committed.iter().map(|e| e.index).collect();
+        assert_eq!(
+            applied,
+            [5],
+            "only what follows the snapshot, up to the commit index"
+        );
+    }
+
     #[test]
     fn a_vote_is_not_given_to_a_candidate_behind() {
         let mut node = RaftNode::restart(
@@ -1086,6 +1407,7 @@ mod tests {
                 vote: None,
                 commit: 0,
             },
+            None,
             vec![Entry {
                 term: 3,
                 index: 1,
