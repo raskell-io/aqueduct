@@ -58,6 +58,29 @@ The algorithm follows the Raft paper and thesis (Ongaro, 2014):
 7. Leadership balancing, snapshots to object storage, history archival and retention, rolling upgrades.
 8. The web console, the 100,000-seed nightly simulation, cluster measurements and a failover drill.
 
+**The replicated partition (step 4)** is `aqueduct_engine::replica::Replica`, sans-I/O like the partition and the
+Raft node it pairs:
+
+- Each batch the partition writes becomes one Raft entry, holding the batch's records as they are written to a local
+  log today. Everything the batch releases (start and result acknowledgements, dispatches) is held until the entry
+  is committed: nothing is acknowledged or dispatched that a majority does not hold.
+- A follower's state machine is the committed records. It runs no partition.
+- A new leader builds its partition from the committed records, as crash recovery does, but only once its own no-op
+  is committed: then everything in its log is committed, and it never acts on an entry a majority might not have.
+  Until then it answers *not ready*, and a replica that does not lead answers *not leader*, with the leader if it
+  knows one.
+- A leader that loses its leadership, or sees a newer term, drops its partition and everything it holds: none of it
+  was acknowledged. Whoever leads next rebuilds from what was committed.
+- A snapshot holds the committed records; a replica restored from one rebuilds from them.
+
+`cargo xtask sim --replicas 3` runs the simulator's workloads on such a group, with crashes, restarts from what each
+replica persisted, network splits, pauses, clock skew, and lost, duplicated and reordered messages. After every
+event, replicas must agree on every committed record they share, and a leader's partition must be the fold of its
+journals. At the end, every acknowledged start is a run, every acknowledged result is recorded once (or its run ended
+without it), every run ends as the sequential reference says, the leader's partition equals one rebuilt from the
+committed records, and every replica has applied the same records. Workloads with signals, escalations, updates,
+child runs and objects are not run replicated yet: their client side in the simulator assumes one node.
+
 **Reads** go to the leader and confirm leadership with a round of heartbeats (read index, thesis 6.4) rather than a
 lease, so that correctness does not depend on bounded clock drift. **Timers** keep their meaning (BRIEF.md section 5.3):
 they fire no earlier than their wake time by the current leader's clock. After a failover, a new leader whose clock is

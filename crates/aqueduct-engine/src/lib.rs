@@ -21,6 +21,7 @@ mod observe;
 mod partition;
 pub mod queue;
 pub mod replay;
+pub mod replica;
 mod schema;
 
 pub use agent::{AgentAttempt, AgentCall, AgentExecutor};

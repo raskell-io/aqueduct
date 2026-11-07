@@ -9,14 +9,14 @@ use aqueduct_engine::{Deciders, Outbound, Partition, PartitionRun, RetryPolicy};
 
 /// Retries never run out in the simulation, so every run still ends as the fault-free reference.
 /// The agent call's retry policy: two answers that do not match the output schema escalate it.
-const SIM_AGENT_RETRY: RetryPolicy = RetryPolicy {
+pub(crate) const SIM_AGENT_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 2,
     initial_backoff_ms: 20,
     multiplier: 2,
     max_backoff_ms: 200,
 };
 
-const SIM_RETRY: RetryPolicy = RetryPolicy {
+pub(crate) const SIM_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: u32::MAX,
     initial_backoff_ms: 20,
     multiplier: 2,
@@ -56,7 +56,7 @@ impl StateStore for SimState {
 
 /// The seed of recorded values in a simulation: fixed, so a seed replays exactly. A restarted node
 /// draws other values, as a real restart would.
-const SIM_SEED: u64 = 0x5eed_a9ed_0c70;
+pub(crate) const SIM_SEED: u64 = 0x5eed_a9ed_0c70;
 
 static NO_RUNS: BTreeMap<String, PartitionRun> = BTreeMap::new();
 
