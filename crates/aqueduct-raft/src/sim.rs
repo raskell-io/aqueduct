@@ -106,6 +106,8 @@ pub struct SimReport {
     pub installs: u64,
     /// Membership changes committed.
     pub changes: u64,
+    /// Leadership transfers the operator started.
+    pub transfers: u64,
 }
 
 /// A world that broke an invariant, with the seed that reproduces it.
@@ -195,12 +197,19 @@ impl State {
 
 #[derive(Clone, Debug)]
 enum Event {
-    Tick { node: NodeId, incarnation: u64 },
+    Tick {
+        node: NodeId,
+        incarnation: u64,
+    },
     Deliver(Envelope),
-    Restart { node: NodeId },
+    Restart {
+        node: NodeId,
+    },
     Propose,
     Heal,
     Change,
+    /// The operator hands leadership to another member.
+    Transfer,
 }
 
 struct World<'c> {
@@ -310,6 +319,7 @@ impl World<'_> {
         if self.config.changes {
             self.schedule(100, Event::Change);
         }
+        self.schedule(150, Event::Transfer);
         loop {
             let Some(((time, _), event)) = self.queue.pop_first() else {
                 return Err("the event queue ran dry".into());
@@ -414,8 +424,41 @@ impl World<'_> {
             Event::Propose => self.propose(),
             Event::Heal => self.sides = None,
             Event::Change => self.change(),
+            Event::Transfer => self.transfer(),
         }
         Ok(())
+    }
+
+    /// The operator, while faults last: asks whichever member leads to hand leadership to another
+    /// member, which it may or may not manage before an election timeout.
+    fn transfer(&mut self) {
+        if !self.faults {
+            return;
+        }
+        let leader = self
+            .nodes
+            .values()
+            .find(|n| n.role() == Role::Leader && n.members().contains(&n.id()))
+            .map(RaftNode::id);
+        if let Some(leader) = leader {
+            let others: Vec<NodeId> = self.nodes[&leader]
+                .members()
+                .iter()
+                .copied()
+                .filter(|m| *m != leader)
+                .collect();
+            if !others.is_empty() {
+                let to = others[self.rng.below(others.len() as u64) as usize];
+                if let Some(raft) = self.nodes.get_mut(&leader)
+                    && raft.transfer_leadership(to).is_ok()
+                {
+                    self.report.transfers += 1;
+                }
+                let _ = self.drive(leader);
+            }
+        }
+        let delay = 150 + self.rng.below(500);
+        self.schedule(delay, Event::Transfer);
     }
 
     /// The operator: while faults last, adds or removes a node through whichever member leads, keeping

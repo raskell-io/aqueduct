@@ -107,6 +107,12 @@ pub enum Message {
         /// The snapshot.
         snapshot: Snapshot,
     },
+    /// From a leader handing over its leadership: stand for election now, without a pre-vote (thesis
+    /// 3.10).
+    TimeoutNow {
+        /// The leader's term.
+        term: u64,
+    },
     /// The answer to a [`Message::Append`] or a [`Message::InstallSnapshot`].
     AppendReply {
         /// The follower's term.
@@ -225,6 +231,15 @@ pub struct NotLeader {
     pub leader: Option<NodeId>,
 }
 
+/// Why a leadership transfer was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferError {
+    /// This node is not the leader.
+    NotLeader(NotLeader),
+    /// The target is this node, or not in the group.
+    NotAMember,
+}
+
 /// One member of a Raft group.
 #[derive(Clone, Debug)]
 pub struct RaftNode {
@@ -254,6 +269,8 @@ pub struct RaftNode {
     elapsed: u32,
     timeout: u32,
     heartbeat_elapsed: u32,
+    /// A leadership transfer under way: its target, and the ticks it has left.
+    transfer: Option<(NodeId, u32)>,
     votes: BTreeMap<NodeId, bool>,
     next: BTreeMap<NodeId, u64>,
     matched: BTreeMap<NodeId, u64>,
@@ -322,6 +339,7 @@ impl RaftNode {
             elapsed: 0,
             timeout: 0,
             heartbeat_elapsed: 0,
+            transfer: None,
             votes: BTreeMap::new(),
             next: BTreeMap::new(),
             matched: BTreeMap::new(),
@@ -501,6 +519,11 @@ impl RaftNode {
     pub fn tick(&mut self) {
         self.elapsed = self.elapsed.saturating_add(1);
         if self.role == Role::Leader {
+            // A transfer that has not happened within an election timeout is given up: this node leads
+            // on, and takes proposals again.
+            if let Some((target, left)) = self.transfer {
+                self.transfer = (left > 1).then_some((target, left - 1));
+            }
             self.heartbeat_elapsed += 1;
             if self.heartbeat_elapsed >= self.config.heartbeat_ticks {
                 self.heartbeat_elapsed = 0;
@@ -529,7 +552,7 @@ impl RaftNode {
     /// Proposes a membership change: its index, if this node leads and may change the group now. The new
     /// group counts from the moment the entry is in a log, committed or not.
     pub fn propose_change(&mut self, change: Change) -> Result<u64, ChangeError> {
-        if self.role != Role::Leader {
+        if self.role != Role::Leader || self.transfer.is_some() {
             return Err(ChangeError::NotLeader(NotLeader {
                 leader: self.leader,
             }));
@@ -572,9 +595,47 @@ impl RaftNode {
                 leader: self.leader,
             });
         }
+        // Handing over: new entries would only keep the target behind.
+        if let Some((target, _)) = self.transfer {
+            return Err(NotLeader {
+                leader: Some(target),
+            });
+        }
         let index = self.append_own(data);
         self.broadcast_append();
         Ok(index)
+    }
+
+    /// Hands leadership to `to`, a member (thesis 3.10): this node stops taking proposals, brings `to`'s
+    /// log up to date, and tells it to stand for election at once. Given up after an election timeout,
+    /// if `to` has not taken over by then.
+    pub fn transfer_leadership(&mut self, to: NodeId) -> Result<(), TransferError> {
+        if self.role != Role::Leader {
+            return Err(TransferError::NotLeader(NotLeader {
+                leader: self.leader,
+            }));
+        }
+        if to == self.id || !self.members.contains(&to) {
+            return Err(TransferError::NotAMember);
+        }
+        self.transfer = Some((to, self.config.election_ticks));
+        self.nudge_transfer(to);
+        Ok(())
+    }
+
+    /// The target of a transfer under way, if any.
+    pub fn transferring(&self) -> Option<NodeId> {
+        self.transfer.map(|(target, _)| target)
+    }
+
+    /// Sends the transfer's target what it lacks, or, once it has everything, `TimeoutNow`.
+    fn nudge_transfer(&mut self, target: NodeId) {
+        if self.matched.get(&target).copied().unwrap_or(0) >= self.last_index() {
+            let term = self.term;
+            self.send(target, Message::TimeoutNow { term });
+        } else {
+            self.send_append(target);
+        }
     }
 
     fn append_own(&mut self, data: Vec<u8>) -> u64 {
@@ -649,6 +710,7 @@ impl RaftNode {
     }
 
     fn become_follower(&mut self, term: u64, leader: Option<NodeId>) {
+        self.transfer = None;
         if term > self.term {
             self.term = term;
             self.vote = None;
@@ -660,6 +722,7 @@ impl RaftNode {
     }
 
     fn become_leader(&mut self) {
+        self.transfer = None;
         self.role = Role::Leader;
         self.leader = Some(self.id);
         self.heartbeat_elapsed = 0;
@@ -765,6 +828,16 @@ impl RaftNode {
                 success,
                 index,
             } => self.on_append_reply(from, term, success, index),
+            Message::TimeoutNow { term } => {
+                // Only from this term's leader, to a member: a stale one could unseat a newer leader.
+                if term == self.term
+                    && self.role == Role::Follower
+                    && self.leader == Some(from)
+                    && self.members.contains(&self.id)
+                {
+                    self.campaign();
+                }
+            }
         }
     }
 
@@ -966,7 +1039,9 @@ impl RaftNode {
             let next = self.next.get(&from).copied().unwrap_or(1).max(matched + 1);
             self.next.insert(from, next);
             self.maybe_commit();
-            if next <= self.last_index() {
+            if self.transfer.is_some_and(|(target, _)| target == from) {
+                self.nudge_transfer(from);
+            } else if next <= self.last_index() {
                 self.send_append(from);
             }
         } else {
@@ -1152,6 +1227,60 @@ mod tests {
             }
         }
         panic!("no leader");
+    }
+
+    #[test]
+    fn a_leader_hands_over_to_a_follower_it_has_brought_up_to_date() {
+        let mut nodes = cluster(3);
+        let mut applied = vec![Vec::new(); 3];
+        elect(&mut nodes, &mut applied, 0);
+        // The target lags: it misses an entry before the transfer.
+        nodes[0].propose(b"one".to_vec()).unwrap();
+        let lost: Vec<Envelope> = nodes[0].ready().messages;
+        nodes[0].advance();
+        for envelope in lost.into_iter().filter(|e| e.to == 3) {
+            nodes[1].step(envelope.from, envelope.message);
+        }
+        settle(&mut nodes, &mut applied);
+        let term = nodes[0].term();
+        nodes[0].transfer_leadership(3).unwrap();
+        assert_eq!(nodes[0].transferring(), Some(3));
+        // While it hands over, it takes no proposals.
+        assert_eq!(
+            nodes[0].propose(b"two".to_vec()),
+            Err(NotLeader { leader: Some(3) })
+        );
+        settle(&mut nodes, &mut applied);
+        assert_eq!(nodes[2].role(), Role::Leader);
+        assert_eq!(nodes[2].term(), term + 1);
+        assert_eq!(nodes[0].role(), Role::Follower);
+        assert_eq!(nodes[0].transferring(), None);
+        // Nothing committed is lost.
+        assert!(nodes[2].log().iter().any(|e| e.data == b"one"));
+        assert_eq!(
+            nodes[0].transfer_leadership(2),
+            Err(TransferError::NotLeader(NotLeader { leader: Some(3) }))
+        );
+        assert_eq!(
+            nodes[2].transfer_leadership(9),
+            Err(TransferError::NotAMember)
+        );
+    }
+
+    #[test]
+    fn a_transfer_that_does_not_happen_is_given_up() {
+        let mut nodes = cluster(3);
+        let mut applied = vec![Vec::new(); 3];
+        elect(&mut nodes, &mut applied, 0);
+        nodes[0].transfer_leadership(2).unwrap();
+        // The target never hears of it.
+        let _ = nodes[0].ready();
+        nodes[0].advance();
+        for _ in 0..Config::default().election_ticks {
+            nodes[0].tick();
+        }
+        assert_eq!(nodes[0].transferring(), None);
+        assert!(nodes[0].propose(b"again".to_vec()).is_ok());
     }
 
     #[test]

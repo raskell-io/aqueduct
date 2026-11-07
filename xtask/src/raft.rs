@@ -47,12 +47,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.compactions += report.compactions;
         total.installs += report.installs;
         total.changes += report.changes;
+        total.transfers += report.transfers;
     }
     println!(
         "{count} seeds ({from}..{}, {nodes} nodes) passed in {:.1} s\n\
          events {}, crashes {}, network splits {}, clock pauses {}, terms with a leader {}\n\
          messages dropped {}, duplicated {}, entries applied on every node {}\n\
-         logs compacted {}, snapshots installed by followers {}, membership changes committed {}",
+         logs compacted {}, snapshots installed by followers {}, membership changes committed {}, leadership transfers started {}",
         from + count,
         started.elapsed().as_secs_f64(),
         total.events,
@@ -66,6 +67,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.compactions,
         total.installs,
         total.changes,
+        total.transfers,
     );
     Ok(())
 }
