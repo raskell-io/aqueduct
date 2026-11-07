@@ -34,6 +34,8 @@ pub struct Entry {
     pub index: u64,
     /// What it carries; empty for the no-op a leader appends when its term starts.
     pub data: Vec<u8>,
+    /// For a membership change: the group from this entry on (thesis 4.1).
+    pub members: Option<Vec<NodeId>>,
 }
 
 /// A state machine's state as of an index, standing in for the log up to it.
@@ -45,6 +47,8 @@ pub struct Snapshot {
     pub term: u64,
     /// The state machine's state, as the driver encoded it.
     pub data: Vec<u8>,
+    /// The group as of its last entry.
+    pub members: Vec<NodeId>,
 }
 
 /// What a node must persist before it acts on it: its term, its vote in that term, and how far it knows
@@ -189,6 +193,30 @@ impl Default for Config {
     }
 }
 
+/// A change to the group's membership: one node at a time, so any majority of the old group overlaps
+/// any majority of the new one (thesis 4.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A node joins.
+    Add(NodeId),
+    /// A node leaves.
+    Remove(NodeId),
+}
+
+/// Why a membership change was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeError {
+    /// This node is not the leader.
+    NotLeader(NotLeader),
+    /// Another change is not committed yet: one at a time.
+    Pending,
+    /// The leader has not committed an entry of its own term yet: until it has, a change could be
+    /// overwritten (the correction to the single-server algorithm, Ongaro 2015).
+    NotReady,
+    /// It would change nothing, or leave no one.
+    Pointless,
+}
+
 /// A proposal was refused: this node is not the leader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotLeader {
@@ -200,6 +228,10 @@ pub struct NotLeader {
 #[derive(Clone, Debug)]
 pub struct RaftNode {
     id: NodeId,
+    /// The group as the node was started with, before any change in its log or snapshot.
+    bootstrap: Vec<NodeId>,
+    /// The group now: the newest change in its log, committed or not, else its snapshot's, else the
+    /// bootstrap.
     members: Vec<NodeId>,
     config: Config,
     rng: u64,
@@ -237,8 +269,8 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    /// A new member of the group `members` (which includes `id`), with an empty log. `seed` drives its
-    /// random election timeouts.
+    /// A new member of the group `members`, with an empty log. `seed` drives its random election timeouts.
+    /// A node joining a running group starts with no members: it takes its group from the leader's log.
     pub fn new(id: NodeId, members: &[NodeId], config: Config, seed: u64) -> RaftNode {
         RaftNode::restart(
             id,
@@ -271,6 +303,7 @@ impl RaftNode {
         let last = log.last().map_or(snapshot_index, |e| e.index);
         let mut node = RaftNode {
             id,
+            bootstrap: members.to_vec(),
             members: members.to_vec(),
             config,
             rng: seed ^ 0x9e37_79b9_7f4a_7c15 ^ id.wrapping_mul(0xbf58_476d_1ce4_e5b9),
@@ -298,8 +331,37 @@ impl RaftNode {
             truncate_from: None,
             persisted: last,
         };
+        node.refresh_members();
         node.reset_timeout();
         node
+    }
+
+    /// The group as it is now.
+    pub fn members(&self) -> &[NodeId] {
+        &self.members
+    }
+
+    /// The group as of `index`: the newest change at or before it.
+    fn members_at(&self, index: u64) -> Vec<NodeId> {
+        self.log
+            .iter()
+            .rev()
+            .filter(|e| e.index <= index)
+            .find_map(|e| e.members.clone())
+            .or_else(|| self.snapshot.as_ref().map(|s| s.members.clone()))
+            .unwrap_or_else(|| self.bootstrap.clone())
+    }
+
+    /// Takes the group from the log, after it changed. A leader starts replicating to a node that joins.
+    fn refresh_members(&mut self) {
+        self.members = self.members_at(u64::MAX);
+        if self.role == Role::Leader {
+            let next = self.last_index() + 1;
+            for peer in self.others() {
+                self.next.entry(peer).or_insert(next);
+                self.matched.entry(peer).or_insert(0);
+            }
+        }
     }
 
     /// This node's id.
@@ -386,10 +448,16 @@ impl RaftNode {
         let Some(position) = self.position(index) else {
             return;
         };
+        let members = self.members_at(index);
         self.log.drain(..=position);
         self.snapshot_index = index;
         self.snapshot_term = term;
-        self.snapshot = Some(Snapshot { index, term, data });
+        self.snapshot = Some(Snapshot {
+            index,
+            term,
+            data,
+            members,
+        });
     }
 
     fn quorum(&self) -> usize {
@@ -440,16 +508,60 @@ impl RaftNode {
             // Check quorum: a leader cut off from a majority steps down rather than lead alone.
             if self.elapsed >= self.timeout {
                 self.active.insert(self.id);
-                let heard = self.active.len();
+                let heard = self
+                    .active
+                    .iter()
+                    .filter(|id| self.members.contains(id))
+                    .count();
                 self.active.clear();
                 self.elapsed = 0;
                 if heard < self.quorum() {
                     self.become_follower(self.term, None);
                 }
             }
-        } else if self.elapsed >= self.timeout {
+        } else if self.elapsed >= self.timeout && self.members.contains(&self.id) {
+            // Only a member stands: a node removed, or not yet added, waits to be told.
             self.pre_campaign();
         }
+    }
+
+    /// Proposes a membership change: its index, if this node leads and may change the group now. The new
+    /// group counts from the moment the entry is in a log, committed or not.
+    pub fn propose_change(&mut self, change: Change) -> Result<u64, ChangeError> {
+        if self.role != Role::Leader {
+            return Err(ChangeError::NotLeader(NotLeader {
+                leader: self.leader,
+            }));
+        }
+        if self
+            .log
+            .iter()
+            .any(|e| e.members.is_some() && e.index > self.commit)
+        {
+            return Err(ChangeError::Pending);
+        }
+        if self.term_at(self.commit) != Some(self.term) {
+            return Err(ChangeError::NotReady);
+        }
+        let mut members = self.members.clone();
+        match change {
+            Change::Add(id) if !members.contains(&id) => members.push(id),
+            Change::Remove(id) if members.contains(&id) && members.len() > 1 => {
+                members.retain(|m| *m != id);
+            }
+            _ => return Err(ChangeError::Pointless),
+        }
+        members.sort_unstable();
+        let index = self.last_index() + 1;
+        self.log.push(Entry {
+            term: self.term,
+            index,
+            data: Vec::new(),
+            members: Some(members),
+        });
+        self.refresh_members();
+        self.broadcast_append();
+        Ok(index)
     }
 
     /// Proposes data for the log: its index, if this node leads. It is committed once a majority has it.
@@ -470,6 +582,7 @@ impl RaftNode {
             term: self.term,
             index,
             data,
+            members: None,
         });
         index
     }
@@ -525,7 +638,13 @@ impl RaftNode {
     }
 
     fn won(&self, _pre_vote: bool) -> bool {
-        self.votes.values().filter(|granted| **granted).count() >= self.quorum()
+        // Only members' votes count, in the group as this node knows it.
+        let granted = self
+            .votes
+            .iter()
+            .filter(|(id, granted)| **granted && self.members.contains(id))
+            .count();
+        granted >= self.quorum()
     }
 
     fn become_follower(&mut self, term: u64, leader: Option<NodeId>) {
@@ -545,6 +664,10 @@ impl RaftNode {
         self.heartbeat_elapsed = 0;
         self.active.clear();
         self.elapsed = 0;
+        // Nothing about followers survives from an earlier term: a node outside the group then, added
+        // back later, would otherwise be probed from where it once was, past the end of this log.
+        self.next.clear();
+        self.matched.clear();
         let next = self.last_index() + 1;
         for peer in self.others() {
             self.next.insert(peer, next);
@@ -562,7 +685,8 @@ impl RaftNode {
 
     /// Handles a message from another node.
     pub fn step(&mut self, from: NodeId, message: Message) {
-        if from == self.id || !self.members.contains(&from) {
+        // From anyone: a node joining hears from a leader before its log says who is in the group.
+        if from == self.id {
             return;
         }
         match message {
@@ -740,6 +864,7 @@ impl RaftNode {
                 None => self.log.push(entry),
             }
         }
+        self.refresh_members();
         self.commit = self.commit.max(commit.min(last_new));
         let term = self.term;
         self.send(
@@ -812,6 +937,7 @@ impl RaftNode {
         self.snapshot = Some(snapshot.clone());
         let index = snapshot.index;
         self.incoming = Some(snapshot);
+        self.refresh_members();
         let term = self.term;
         self.send(
             from,
@@ -868,6 +994,15 @@ impl RaftNode {
             self.commit = majority;
             // Followers learn it with the next append.
             self.broadcast_append();
+        }
+        // A leader that removed itself leads until the change is committed, then steps down
+        // (thesis 4.2.2). Nothing it leads after that would count it.
+        let change_committed = !self
+            .log
+            .iter()
+            .any(|e| e.members.is_some() && e.index > self.commit);
+        if self.role == Role::Leader && !self.members.contains(&self.id) && change_committed {
+            self.become_follower(self.term, None);
         }
     }
 
@@ -1065,11 +1200,13 @@ mod tests {
                     term: 1,
                     index: 1,
                     data: b"a".to_vec(),
+                    members: None,
                 },
                 Entry {
                     term: 1,
                     index: 2,
                     data: b"stale".to_vec(),
+                    members: None,
                 },
             ],
             0,
@@ -1084,6 +1221,7 @@ mod tests {
                     term: 2,
                     index: 2,
                     data: b"b".to_vec(),
+                    members: None,
                 }],
                 commit: 2,
             },
@@ -1108,6 +1246,7 @@ mod tests {
             term,
             index,
             data: vec![u8::try_from(index).unwrap_or(0)],
+            members: None,
         }
     }
 
@@ -1250,6 +1389,7 @@ mod tests {
             index,
             term,
             data: b"state".to_vec(),
+            members: vec![1, 2, 3],
         }
     }
 
@@ -1396,6 +1536,248 @@ mod tests {
     }
 
     #[test]
+    fn the_group_changes_one_node_at_a_time() {
+        let mut nodes = cluster(3);
+        // Node 4 joins with no group of its own: it learns it from the leader.
+        nodes.push(RaftNode::new(4, &[], Config::default(), 11));
+        let mut applied = vec![Vec::new(); 4];
+        elect(&mut nodes, &mut applied, 0);
+        assert_eq!(nodes[0].propose_change(Change::Add(4)), Ok(2));
+        // One at a time: the next waits until this one commits.
+        assert_eq!(
+            nodes[0].propose_change(Change::Remove(2)),
+            Err(ChangeError::Pending)
+        );
+        settle(&mut nodes, &mut applied);
+        assert_eq!(nodes[0].members(), [1, 2, 3, 4]);
+        assert_eq!(
+            nodes[3].members(),
+            [1, 2, 3, 4],
+            "the new node knows its group"
+        );
+        assert_eq!(
+            nodes[0].propose_change(Change::Add(4)),
+            Err(ChangeError::Pointless)
+        );
+        assert!(nodes[0].propose_change(Change::Remove(2)).is_ok());
+        settle(&mut nodes, &mut applied);
+        assert_eq!(nodes[3].members(), [1, 3, 4]);
+        assert_eq!(
+            nodes[1].propose_change(Change::Remove(3)),
+            Err(ChangeError::NotLeader(NotLeader { leader: Some(1) }))
+        );
+    }
+
+    #[test]
+    fn a_leader_changes_the_group_only_after_committing_in_its_term() {
+        let mut leader = RaftNode::restart(
+            1,
+            &[1, 2, 3],
+            Config::default(),
+            9,
+            HardState {
+                term: 3,
+                vote: None,
+                commit: 1,
+            },
+            None,
+            vec![entry(1, 1)],
+            1,
+        );
+        lead(&mut leader, &[2, 3]);
+        assert_eq!(
+            leader.propose_change(Change::Add(4)),
+            Err(ChangeError::NotReady)
+        );
+        for follower in [2, 3] {
+            leader.step(
+                follower,
+                Message::AppendReply {
+                    term: 4,
+                    success: true,
+                    index: 2,
+                },
+            );
+        }
+        assert_eq!(leader.commit(), 2, "its no-op");
+        assert!(leader.propose_change(Change::Add(4)).is_ok());
+    }
+
+    #[test]
+    fn a_leader_that_removes_itself_steps_down_once_that_commits() {
+        let mut nodes = cluster(3);
+        let mut applied = vec![Vec::new(); 3];
+        elect(&mut nodes, &mut applied, 0);
+        nodes[0].propose_change(Change::Remove(1)).unwrap();
+        assert_eq!(
+            nodes[0].role(),
+            Role::Leader,
+            "it leads until the change commits"
+        );
+        settle(&mut nodes, &mut applied);
+        assert_eq!(nodes[0].role(), Role::Follower);
+        // It is not in the group, so it does not stand again; the others elect a leader without it.
+        for _ in 0..60 {
+            nodes[0].tick();
+        }
+        assert_eq!(nodes[0].role(), Role::Follower);
+        // Both remaining nodes' clocks run, so both notice the old leader is gone.
+        for _ in 0..200 {
+            nodes[1].tick();
+            nodes[2].tick();
+            settle(&mut nodes, &mut applied);
+            if nodes[1..].iter().any(|n| n.role() == Role::Leader) {
+                break;
+            }
+        }
+        let leader = nodes[1..].iter().find(|n| n.role() == Role::Leader);
+        assert_eq!(leader.map(RaftNode::members), Some([2, 3].as_slice()));
+    }
+
+    #[test]
+    fn a_node_added_back_is_probed_from_this_terms_log() {
+        // Node 1 led term 4, with node 4 caught up to index 6; then lost it and led term 6 with a
+        // shorter log, in a group without node 4.
+        let mut leader = RaftNode::restart(
+            1,
+            &[1, 2, 3, 4],
+            Config::default(),
+            9,
+            HardState {
+                term: 3,
+                vote: None,
+                commit: 0,
+            },
+            None,
+            Vec::new(),
+            0,
+        );
+        lead(&mut leader, &[2, 3]);
+        for value in [b"v", b"w", b"x", b"y", b"z"] {
+            leader.propose(value.to_vec()).unwrap();
+        }
+        // Node 4 is caught up to index 6, far past the log node 1 will lead with next.
+        leader.step(
+            4,
+            Message::AppendReply {
+                term: 4,
+                success: true,
+                index: 6,
+            },
+        );
+        leader.step(
+            2,
+            Message::Append {
+                term: 5,
+                prev_index: 0,
+                prev_term: 0,
+                entries: Vec::new(),
+                commit: 0,
+            },
+        );
+        assert_eq!(leader.role(), Role::Follower);
+        leader.step(
+            2,
+            Message::Append {
+                term: 5,
+                prev_index: 0,
+                prev_term: 0,
+                entries: vec![Entry {
+                    term: 5,
+                    index: 1,
+                    data: Vec::new(),
+                    members: Some(vec![1, 2, 3]),
+                }],
+                commit: 1,
+            },
+        );
+        let _ = leader.ready();
+        leader.advance();
+        assert_eq!(leader.members(), [1, 2, 3]);
+        lead(&mut leader, &[2, 3]);
+        let _ = leader.ready();
+        for follower in [2, 3] {
+            leader.step(
+                follower,
+                Message::AppendReply {
+                    term: 6,
+                    success: true,
+                    index: 2,
+                },
+            );
+        }
+        assert!(leader.propose_change(Change::Add(4)).is_ok());
+        // Node 4 is probed from this log's end, not from where it was in term 4.
+        let probes: Vec<u64> = leader
+            .ready()
+            .messages
+            .iter()
+            .filter(|m| m.to == 4)
+            .filter_map(|m| match m.message {
+                Message::Append { prev_index, .. } => Some(prev_index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !probes.is_empty() && probes.iter().all(|p| *p <= 3),
+            "{probes:?}"
+        );
+    }
+
+    #[test]
+    fn votes_from_outside_the_group_do_not_count() {
+        let mut node = RaftNode::new(1, &[1, 2, 3], Config::default(), 5);
+        while node.role() != Role::PreCandidate {
+            node.tick();
+        }
+        // Nodes 4 and 5 are not in its group: removed, or never added. Their votes elect nobody.
+        for outsider in [4, 5] {
+            node.step(
+                outsider,
+                Message::Vote {
+                    term: 1,
+                    granted: true,
+                    pre_vote: true,
+                },
+            );
+        }
+        assert_eq!(node.role(), Role::PreCandidate);
+        node.step(
+            2,
+            Message::Vote {
+                term: 1,
+                granted: true,
+                pre_vote: true,
+            },
+        );
+        assert_eq!(node.role(), Role::Candidate);
+        for outsider in [4, 5] {
+            node.step(
+                outsider,
+                Message::Vote {
+                    term: 1,
+                    granted: true,
+                    pre_vote: false,
+                },
+            );
+        }
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "only its own vote counts so far"
+        );
+        node.step(
+            3,
+            Message::Vote {
+                term: 1,
+                granted: true,
+                pre_vote: false,
+            },
+        );
+        assert_eq!(node.role(), Role::Leader);
+    }
+
+    #[test]
     fn a_vote_is_not_given_to_a_candidate_behind() {
         let mut node = RaftNode::restart(
             2,
@@ -1412,6 +1794,7 @@ mod tests {
                 term: 3,
                 index: 1,
                 data: Vec::new(),
+                members: None,
             }],
             0,
         );
