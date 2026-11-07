@@ -37,6 +37,5 @@ must provide one between machines, and clients must find the node that leads.
 - The secret is a shared bearer secret, not mutual TLS: the cluster network must be private, or the
   servers behind TLS (ADR 0042) with the peers' URLs on `https://`. Mutual TLS between nodes is part of
   the security review before 1.0.
-- One partition per server for now: several partitions on one node (ADR 0052) need the server to host
-  several engines and route by slot.
+- Several partitions per server: ADR 0057.
 - The membership is the configuration's; moving replicas (ADR 0053) is not wired into the server yet.

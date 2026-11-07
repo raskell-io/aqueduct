@@ -190,14 +190,9 @@ fn with_cluster(router: Router, shards: &Arc<Shards>, config: &Config) -> std::i
     let Some(cluster) = &config.cluster else {
         return Ok(router);
     };
-    let [engine] = shards.engines() else {
-        return Err(std::io::Error::other(
-            "cluster mode runs one partition per server so far (ADR 0056)",
-        ));
-    };
-    Ok(cluster::forwarding(router, engine, cluster)
+    Ok(cluster::forwarding(router, cluster)
         .map_err(std::io::Error::other)?
-        .merge(cluster::routes(engine, cluster)))
+        .merge(cluster::routes(shards, cluster)))
 }
 
 /// Why a call failed, in terms both transports can say.
@@ -215,6 +210,8 @@ enum Kind {
     Timeout,
     Rejected,
     Unavailable,
+    /// Unavailable here: this server does not lead the partition; the leader, if known.
+    NotLeader(Option<u64>),
     Internal,
     Unauthenticated,
     Forbidden,
@@ -550,9 +547,8 @@ impl From<EngineError> for Failure {
             | EngineError::HandlerFailed(_)
             | EngineError::Unsupported(_) => Kind::Rejected,
             EngineError::InvalidPayload(_) => Kind::Invalid,
-            EngineError::Stopped(_) | EngineError::Overloaded(_) | EngineError::NotLeader(_) => {
-                Kind::Unavailable
-            }
+            EngineError::Stopped(_) | EngineError::Overloaded(_) => Kind::Unavailable,
+            EngineError::NotLeader(leader) => Kind::NotLeader(*leader),
             EngineError::Open(_) => Kind::Internal,
         };
         let message = match error {
@@ -571,7 +567,7 @@ impl From<Failure> for tonic::Status {
             Kind::Invalid => tonic::Code::InvalidArgument,
             Kind::Timeout => tonic::Code::DeadlineExceeded,
             Kind::Rejected => tonic::Code::FailedPrecondition,
-            Kind::Unavailable => tonic::Code::Unavailable,
+            Kind::Unavailable | Kind::NotLeader(_) => tonic::Code::Unavailable,
             Kind::Internal => tonic::Code::Internal,
             Kind::Unauthenticated => tonic::Code::Unauthenticated,
             Kind::Forbidden => tonic::Code::PermissionDenied,
@@ -583,14 +579,14 @@ impl From<Failure> for tonic::Status {
 
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
-        let retry = self.kind == Kind::Unavailable;
+        let retry = matches!(self.kind, Kind::Unavailable | Kind::NotLeader(_));
         let status = match self.kind {
             Kind::NotFound => StatusCode::NOT_FOUND,
             Kind::Conflict => StatusCode::CONFLICT,
             Kind::Invalid => StatusCode::BAD_REQUEST,
             Kind::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Kind::Rejected => StatusCode::UNPROCESSABLE_ENTITY,
-            Kind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Kind::Unavailable | Kind::NotLeader(_) => StatusCode::SERVICE_UNAVAILABLE,
             Kind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Kind::Unauthenticated => StatusCode::UNAUTHORIZED,
             Kind::Forbidden => StatusCode::FORBIDDEN,
@@ -601,6 +597,11 @@ impl IntoResponse for Failure {
             response
                 .headers_mut()
                 .insert(axum::http::header::RETRY_AFTER, 1.into());
+        }
+        if let Kind::NotLeader(Some(leader)) = self.kind {
+            response
+                .headers_mut()
+                .insert(cluster::LEADER_HEADER, leader.into());
         }
         response
     }

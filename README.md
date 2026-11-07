@@ -297,7 +297,8 @@ engine, not the server, whose transports have tests of their own, which are narr
 ## What is not done
 
 - **A production cluster:** servers replicate one partition (ADR 0056) and forward HTTP requests to the
-  leader, but not yet many partitions per server, gRPC forwarding, moving replicas between servers, mutual TLS between nodes, or the
+  leader, with many partitions per server (ADR 0057), but not yet gRPC forwarding, leadership balancing,
+  moving replicas between servers, mutual TLS between nodes, or the
   failover drill and measurements on real machines. Not production-ready.
 - **Stable formats:** the protocol and the history format are drafts until phase 5.
 - **Packages:** nothing on crates.io, PyPI or npm. Depend on the repository.

@@ -74,8 +74,27 @@ async fn ask(
     panic!("no node answered {method} {path} within 30 s");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn three_servers_replicate_and_survive_their_leader() {
+const PARENT: &str = r#"
+def run(n):
+    shared = call("double", n % 2, key = "shared-" + str(n % 2))
+    send("counter", "c" + str(n % 3), "add", 1)
+    return shared + n
+"#;
+
+const ADD: &str = r#"
+def run(call):
+    n = call["state"].get("n", 0) + call["args"]
+    return {"output": n, "writes": {"n": n}}
+"#;
+
+struct Servers {
+    addrs: BTreeMap<u64, SocketAddr>,
+    stops: BTreeMap<u64, tokio::sync::oneshot::Sender<()>>,
+    dirs: Vec<std::path::PathBuf>,
+}
+
+/// Three servers on this machine, each with `partitions` partitions replicated with the others.
+async fn servers(name: &str, partitions: u32) -> Servers {
     let mut listeners = BTreeMap::new();
     for id in 1..=3u64 {
         listeners.insert(
@@ -94,23 +113,45 @@ async fn three_servers_replicate_and_survive_their_leader() {
     let mut stops = BTreeMap::new();
     let mut dirs = Vec::new();
     for (id, listener) in listeners {
-        let dir =
-            std::env::temp_dir().join(format!("aqueduct-cluster-{id}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "aqueduct-cluster-{name}-{id}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let config: Config = serde_json::from_value(json!({
+            "partitions": partitions,
+            "objects": ["counter"],
             "cluster": {"id": id, "peers": peers, "secret": "a secret for the test", "tick_ms": 20}
         }))
         .unwrap();
         config.check().unwrap();
-        let builder = Engine::builder(&dir).workflow(
-            "double",
-            Arc::new(Procedure::compile("double.star", DOUBLE).unwrap()),
-        );
-        let engine = Arc::new(config.apply(builder).unwrap().open().unwrap());
+        let cluster = config.cluster.clone().unwrap();
+        let shards = cluster
+            .open(&dir, partitions, |path, _| {
+                config
+                    .apply(
+                        Engine::builder(path)
+                            .workflow(
+                                "double",
+                                Arc::new(Procedure::compile("double.star", DOUBLE).unwrap()),
+                            )
+                            .workflow(
+                                "parent",
+                                Arc::new(Procedure::compile("parent.star", PARENT).unwrap()),
+                            )
+                            .object_handler(
+                                "counter",
+                                "add",
+                                Arc::new(Procedure::compile("add.star", ADD).unwrap()),
+                            ),
+                    )
+                    .map_err(aqueduct_engine::embedded::EngineError::Open)
+            })
+            .unwrap();
         let security = Security::for_dir(&dir).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            aqueduct_server::serve_with(engine, listener, &config, security, async {
+            aqueduct_server::serve_shards(shards, listener, &config, security, None, async {
                 let _ = stopped.await;
             })
             .await
@@ -118,6 +159,16 @@ async fn three_servers_replicate_and_survive_their_leader() {
         stops.insert(id, stop);
         dirs.push(dir);
     }
+    Servers { addrs, stops, dirs }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn three_servers_replicate_and_survive_their_leader() {
+    let Servers {
+        addrs,
+        mut stops,
+        dirs,
+    } = servers("one", 1).await;
     let mut nodes = addrs.clone();
 
     let (leader, _) = ask(
@@ -179,6 +230,62 @@ async fn three_servers_replicate_and_survive_their_leader() {
     let (_, result) = ask(&nodes, "GET", "/v1/runs/c/result", Value::Null).await;
     assert_eq!(result["output"], json!(100), "{result}");
 
+    for stop in stops.into_values() {
+        let _ = stop.send(());
+    }
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitions_replicate_on_three_servers_and_send_each_other_work() {
+    let Servers {
+        addrs,
+        mut stops,
+        dirs,
+    } = servers("two", 2).await;
+    let mut nodes = addrs.clone();
+    for i in 0..8 {
+        ask(
+            &nodes,
+            "POST",
+            "/v1/runs",
+            json!({"key": format!("p{i}"), "workflow": "parent", "input": i}),
+        )
+        .await;
+    }
+    for i in 0..8 {
+        let (_, result) = ask(&nodes, "GET", &format!("/v1/runs/p{i}/result"), Value::Null).await;
+        assert_eq!(result["output"], json!((i % 2) * 2 + i), "p{i}: {result}");
+    }
+    // One server stops; the others still have every partition, and every message counted once.
+    let first = *nodes.keys().next().unwrap();
+    let _ = stops.remove(&first).unwrap().send(());
+    nodes.remove(&first);
+    for k in 0..3 {
+        let sent = (0..8).filter(|i| i % 3 == k).count();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (_, state) = ask(
+                &nodes,
+                "GET",
+                &format!("/v1/objects/counter/c{k}"),
+                Value::Null,
+            )
+            .await;
+            let n = state["state"]["n"]
+                .as_u64()
+                .or_else(|| state["n"].as_u64())
+                .unwrap_or(0);
+            if n == sent as u64 {
+                break;
+            }
+            assert!(n < sent as u64, "counter c{k}: {state}");
+            assert!(Instant::now() < deadline, "counter c{k}: {state}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     for stop in stops.into_values() {
         let _ = stop.send(());
     }

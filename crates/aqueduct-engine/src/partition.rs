@@ -419,7 +419,129 @@ pub enum Remote {
     },
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return Err("bytes in hex of odd length".into());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
 impl Remote {
+    /// The message as JSON, for the network between servers (ADR 0057). Payloads are hex.
+    pub fn encode(&self) -> Vec<u8> {
+        use serde_json::json;
+        let value = match self {
+            Remote::StartChild {
+                parent,
+                cmd,
+                child,
+                workflow,
+                input,
+                priority,
+            } => json!({"start_child": {"parent": parent, "cmd": cmd.0, "child": child,
+                "workflow": workflow, "input": hex(input.as_bytes()), "priority": priority}}),
+            Remote::ChildResult {
+                parent,
+                cmd,
+                outcome,
+            } => {
+                let outcome = match outcome {
+                    StepOutcome::Completed(output) => json!({"completed": hex(output.as_bytes())}),
+                    StepOutcome::Failed(error) => json!({"failed": error}),
+                };
+                json!({"child_result": {"parent": parent, "cmd": cmd.0, "outcome": outcome}})
+            }
+            Remote::CancelChild { parent, cmd, child } => {
+                json!({"cancel_child": {"parent": parent, "cmd": cmd.0, "child": child}})
+            }
+            Remote::Deliver {
+                sender,
+                cmd,
+                object,
+                key,
+                handler,
+                args,
+            } => json!({"deliver": {"sender": sender, "cmd": cmd.0, "object": object, "key": key,
+                "handler": handler, "args": hex(args.as_bytes())}}),
+            Remote::Delivered { sender, cmd } => {
+                json!({"delivered": {"sender": sender, "cmd": cmd.0}})
+            }
+        };
+        value.to_string().into_bytes()
+    }
+
+    /// A message from [`Remote::encode`].
+    pub fn decode(data: &[u8]) -> Result<Remote, String> {
+        let value: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+        let (kind, body) = value
+            .as_object()
+            .and_then(|object| object.iter().next())
+            .ok_or("a message between partitions that is not an object")?;
+        let text = |name: &str| {
+            body[name]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("a message between partitions without `{name}`"))
+        };
+        let cmd = || {
+            body["cmd"]
+                .as_u64()
+                .and_then(|cmd| u32::try_from(cmd).ok())
+                .map(CommandIndex)
+                .ok_or_else(|| "a message between partitions without `cmd`".to_owned())
+        };
+        Ok(match kind.as_str() {
+            "start_child" => Remote::StartChild {
+                parent: text("parent")?,
+                cmd: cmd()?,
+                child: text("child")?,
+                workflow: text("workflow")?,
+                input: Payload::new(unhex(&text("input")?)?),
+                priority: body["priority"]
+                    .as_u64()
+                    .and_then(|p| u32::try_from(p).ok())
+                    .unwrap_or(0),
+            },
+            "child_result" => Remote::ChildResult {
+                parent: text("parent")?,
+                cmd: cmd()?,
+                outcome: match (
+                    body["outcome"]["completed"].as_str(),
+                    body["outcome"]["failed"].as_str(),
+                ) {
+                    (Some(output), _) => StepOutcome::Completed(Payload::new(unhex(output)?)),
+                    (None, Some(error)) => StepOutcome::Failed(error.to_owned()),
+                    (None, None) => return Err("a child result without its outcome".into()),
+                },
+            },
+            "cancel_child" => Remote::CancelChild {
+                parent: text("parent")?,
+                cmd: cmd()?,
+                child: text("child")?,
+            },
+            "deliver" => Remote::Deliver {
+                sender: text("sender")?,
+                cmd: cmd()?,
+                object: text("object")?,
+                key: text("key")?,
+                handler: text("handler")?,
+                args: Payload::new(unhex(&text("args")?)?),
+            },
+            "delivered" => Remote::Delivered {
+                sender: text("sender")?,
+                cmd: cmd()?,
+            },
+            other => return Err(format!("an unknown message between partitions: `{other}`")),
+        })
+    }
+
     /// The home of the message's target: where it must go.
     pub fn to(&self) -> String {
         use crate::placement::home;
@@ -2509,5 +2631,55 @@ fn dispatch_message(key: &str, effect: Effect) -> Option<Outbound> {
             budget_tokens,
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn messages_between_partitions_survive_encoding() {
+        let messages = [
+            Remote::StartChild {
+                parent: "p#1".into(),
+                cmd: CommandIndex(3),
+                child: "shared".into(),
+                workflow: "child".into(),
+                input: Payload::new(*b"\"x\""),
+                priority: 7,
+            },
+            Remote::ChildResult {
+                parent: "p".into(),
+                cmd: CommandIndex(1),
+                outcome: StepOutcome::Completed(Payload::new(vec![0, 255])),
+            },
+            Remote::ChildResult {
+                parent: "p".into(),
+                cmd: CommandIndex(1),
+                outcome: StepOutcome::Failed("no".into()),
+            },
+            Remote::CancelChild {
+                parent: "p".into(),
+                cmd: CommandIndex(2),
+                child: "c".into(),
+            },
+            Remote::Deliver {
+                sender: "s".into(),
+                cmd: CommandIndex(0),
+                object: "counter".into(),
+                key: "$ns/acme/c".into(),
+                handler: "add".into(),
+                args: Payload::new(*b"1"),
+            },
+            Remote::Delivered {
+                sender: "s".into(),
+                cmd: CommandIndex(0),
+            },
+        ];
+        for message in messages {
+            assert_eq!(Remote::decode(&message.encode()), Ok(message));
+        }
+        assert!(Remote::decode(b"{\"deliver\": {}}").is_err());
     }
 }
