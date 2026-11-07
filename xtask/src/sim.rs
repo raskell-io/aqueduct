@@ -10,6 +10,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut single = None;
     let mut workload = WorkloadKind::Pipeline;
     let mut replicas = 0usize;
+    let mut partitions = 0usize;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = || -> Result<u64, String> {
@@ -23,6 +24,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--seeds" => count = value()?,
             "--from" => from = value()?,
             "--replicas" => replicas = usize::try_from(value()?).map_err(|e| e.to_string())?,
+            "--partitions" => {
+                partitions = usize::try_from(value()?).map_err(|e| e.to_string())?;
+            }
             "--workload" => {
                 workload = match iter.next().map(String::as_str) {
                     Some("native") => WorkloadKind::Pipeline,
@@ -30,16 +34,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     Some("timers") => WorkloadKind::StarlarkTimers,
                     Some("rust") => WorkloadKind::RustPipeline,
                     Some("composite") => WorkloadKind::Composite,
+                    Some("fanout") => WorkloadKind::Fanout,
                     other => {
                         return Err(format!(
-                            "--workload must be native, starlark, timers, rust or composite, not {other:?}"
+                            "--workload must be native, starlark, timers, rust, composite or fanout, not {other:?}"
                         ));
                     }
                 }
             }
             other => {
                 return Err(format!(
-                    "unknown argument {other}; use --seed N, or --seeds N [--from S], with --workload W and --replicas R"
+                    "unknown argument {other}; use --seed N, or --seeds N [--from S], with --workload W, --replicas R and --partitions P"
                 ));
             }
         }
@@ -48,6 +53,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let config = Config {
         workload,
         replicas,
+        partitions,
         ..Config::default()
     };
     if let Some(seed) = single {

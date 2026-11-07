@@ -168,3 +168,32 @@ fn a_leader_cut_off_from_its_followers_acknowledges_nothing() {
             .is_none()
     );
 }
+
+#[test]
+fn a_deposed_leader_does_not_answer_from_its_old_state() {
+    let mut replicas = group(&[1, 2, 3]);
+    let leader = elect(&mut replicas);
+    // Everything it holds is committed when it is cut off. A result for a run it does not know arrives:
+    // "no longer needed", from a state a newer leader may have moved past, is no answer to give.
+    let mut alone = replicas.remove(&leader).unwrap();
+    alone
+        .partition_mut()
+        .unwrap()
+        .step_result(
+            "ghost",
+            aqueduct_core::CommandIndex(0),
+            aqueduct_core::StepOutcome::Completed(Payload::new(*b"1")),
+        )
+        .unwrap();
+    alone.flush().unwrap();
+    let mut released = Vec::new();
+    for _ in 0..1_000 {
+        alone.tick();
+        while alone.has_ready() {
+            let ready = alone.ready().unwrap();
+            released.extend(ready.released);
+            alone.advance().unwrap();
+        }
+    }
+    assert!(released.is_empty(), "{released:?}");
+}

@@ -19,6 +19,7 @@ pub mod namespaces;
 pub mod objects;
 mod observe;
 mod partition;
+pub mod placement;
 pub mod queue;
 pub mod replay;
 pub mod replica;
@@ -28,6 +29,6 @@ pub use agent::{AgentAttempt, AgentCall, AgentExecutor};
 pub use aqueduct_storage::Durability;
 pub use observe::{Observer, StepEnd};
 pub use partition::{
-    Deciders, Outbound, Partition, PartitionError, PartitionRun, RetryPolicy, ReusePolicy,
+    Deciders, Outbound, Partition, PartitionError, PartitionRun, Remote, RetryPolicy, ReusePolicy,
     StartOptions, UpdateStatus,
 };

@@ -72,6 +72,11 @@ Raft node it pairs:
 - A leader that loses its leadership, or sees a newer term, drops its partition and everything it holds: none of it
   was acknowledged. Whoever leads next rebuilds from what was committed.
 - A snapshot holds the committed records; a replica restored from one rebuilds from them.
+- **A deposed leader that does not know it yet still holds its partition.** What it answers from its own
+  state without writing anything (a result no longer needed, a start that already exists) could be
+  answered from an old state: a newer leader may have dispatched the command it does not know. Such
+  answers wait for an empty entry of their own to commit, which proves the replica still leads.
+  Dispatches need no proof. Found by the simulator with several partitions (ADR 0052).
 
 `cargo xtask sim --replicas 3` runs the simulator's workloads on such a group, with crashes, restarts from what each
 replica persisted, network splits, pauses, clock skew, and lost, duplicated and reordered messages. After every

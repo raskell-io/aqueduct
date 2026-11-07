@@ -9,6 +9,7 @@ use aqueduct_storage::frame;
 use crate::disk::SimDisk;
 use aqueduct_engine::Outbound;
 
+use crate::WorkloadKind;
 use crate::node::Node;
 use crate::rng::Rng;
 use crate::workflow::{self, Workload};
@@ -281,7 +282,10 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     if config.bugs.release_stale_dispatches {
         world.node.inject_release_stale_dispatches();
     }
-    if config.cancel_every > 0 {
+    // A cancelled run cancels the children only it waits for: a child shared under a chosen key that
+    // no other run waits for yet is cancelled too, and runs that come to it later fail, which the
+    // sequential reference cannot know. The fanout workload is not cancelled.
+    if config.cancel_every > 0 && config.workload != WorkloadKind::Fanout {
         world.to_cancel = (0..config.runs)
             .filter(|i| i % config.cancel_every == config.cancel_every - 1)
             .map(|i| format!("run-{i}"))
@@ -744,7 +748,9 @@ impl World<'_> {
                 Outbound::ResultRecorded { key, cmd } => Ev::WorkerResultAck { key, cmd },
                 Outbound::AttemptRecorded { key, cmd } => Ev::WorkerAttemptAck { key, cmd },
                 // The simulator's workloads decide their runs in the partition, not remotely.
-                Outbound::Finished { .. } | Outbound::Activation { .. } => continue,
+                Outbound::Finished { .. }
+                | Outbound::Activation { .. }
+                | Outbound::Remote { .. } => continue,
             };
             self.send(ev);
         }

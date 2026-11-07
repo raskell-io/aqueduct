@@ -52,6 +52,10 @@ pub enum WorkloadKind {
     /// it, and sends a message to a virtual object: exercises child runs, updates and exactly-once
     /// delivery to objects under faults.
     Composite,
+    /// A Starlark procedure that calls a child of its own, a child shared under a chosen key, and sends
+    /// to a virtual object: with several partitions, the shared child and the object may live on
+    /// other partitions (ADR 0052).
+    Fanout,
 }
 
 /// Deliberately injected bugs, used to check that the simulator catches them.
@@ -117,6 +121,9 @@ pub struct Config {
     /// Replicas of the partition: 0 runs one node with its own disk; more run a Raft group
     /// replicating its log.
     pub replicas: usize,
+    /// Partitions (ADR 0052), each a Raft group of `replicas` replicas (at least one): more than one runs
+    /// the cluster world, with children and messages crossing partitions.
+    pub partitions: usize,
 }
 
 impl Default for Config {
@@ -142,6 +149,7 @@ impl Default for Config {
             bugs: Bugs::default(),
             workload: WorkloadKind::default(),
             replicas: 0,
+            partitions: 0,
         }
     }
 }
@@ -225,6 +233,7 @@ impl std::fmt::Display for Failure {
             WorkloadKind::StarlarkTimers => "timers",
             WorkloadKind::RustPipeline => "rust",
             WorkloadKind::Composite => "composite",
+            WorkloadKind::Fanout => "fanout",
         };
         write!(
             f,
@@ -238,7 +247,7 @@ impl std::error::Error for Failure {}
 
 /// Runs one seed.
 pub fn run_seed(seed: u64, config: &Config) -> Result<Report, Failure> {
-    if config.replicas > 0 {
+    if config.replicas > 0 || config.partitions > 1 {
         return cluster::run(seed, config);
     }
     world::run(seed, config)

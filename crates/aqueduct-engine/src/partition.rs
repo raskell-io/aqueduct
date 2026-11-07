@@ -348,6 +348,90 @@ pub enum Outbound {
         /// The terminal status.
         status: Status,
     },
+    /// A message for the partition where `to` lives (ADR 0052): the host routes it by the slot table and
+    /// hands it to that partition's [`Partition::receive`].
+    Remote {
+        /// The home of the message's target ([`crate::placement::home`]).
+        to: String,
+        /// The message.
+        message: Remote,
+    },
+}
+
+/// A message between partitions (ADR 0052). Each is safe to repeat; senders repeat until answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Remote {
+    /// Start a parent's child under a key that lives elsewhere, or find the run the key has. Answered by
+    /// [`Remote::ChildResult`] once the child has ended.
+    StartChild {
+        /// The parent's run id.
+        parent: String,
+        /// The parent's command.
+        cmd: CommandIndex,
+        /// The child's run key.
+        child: String,
+        /// The child's workflow.
+        workflow: String,
+        /// The child's input.
+        input: Payload,
+        /// The parent's priority, which the child takes.
+        priority: u32,
+    },
+    /// A child's outcome, for a parent that waits for it; also the answer to [`Remote::CancelChild`].
+    ChildResult {
+        /// The parent's run id.
+        parent: String,
+        /// The parent's command.
+        cmd: CommandIndex,
+        /// The child's outcome.
+        outcome: StepOutcome,
+    },
+    /// A parent was cancelled while it waited: cancel the child, unless another parent waits for it.
+    CancelChild {
+        /// The parent's run id.
+        parent: String,
+        /// The parent's command.
+        cmd: CommandIndex,
+        /// The child's run key.
+        child: String,
+    },
+    /// Put a message to an object in its inbox (ADR 0044). Answered by [`Remote::Delivered`].
+    Deliver {
+        /// The sender's run id.
+        sender: String,
+        /// The sender's command.
+        cmd: CommandIndex,
+        /// The object.
+        object: String,
+        /// The object key, in the sender's namespace.
+        key: String,
+        /// The handler.
+        handler: String,
+        /// The handler's arguments (JSON).
+        args: Payload,
+    },
+    /// A message is in its object's inbox, durably.
+    Delivered {
+        /// The sender's run id.
+        sender: String,
+        /// The sender's command.
+        cmd: CommandIndex,
+    },
+}
+
+impl Remote {
+    /// The home of the message's target: where it must go.
+    pub fn to(&self) -> String {
+        use crate::placement::home;
+        match self {
+            Remote::StartChild { child, .. } | Remote::CancelChild { child, .. } => {
+                home(child).to_owned()
+            }
+            Remote::ChildResult { parent, .. } => home(parent).to_owned(),
+            Remote::Deliver { object, key, .. } => crate::objects::object_run_key(object, key),
+            Remote::Delivered { sender, .. } => home(sender).to_owned(),
+        }
+    }
 }
 
 /// Errors from the partition.
@@ -487,6 +571,19 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     /// in turn by the outermost call, so a chain of children does not deepen the stack.
     queued: VecDeque<(String, Vec<Effect>)>,
     performing: bool,
+    /// Which homes are this partition's (ADR 0052); all, without one.
+    placement: Option<crate::placement::Placement>,
+    /// Remote children parents wait for, by (parent run id, command): repeated until answered.
+    remote_children: BTreeMap<(String, CommandIndex), Remote>,
+    /// Cancellations of remote children, repeated until answered.
+    remote_cancels: BTreeMap<(String, CommandIndex), Remote>,
+    /// Messages to objects elsewhere, by (sender run id, command): repeated until delivered.
+    remote_sends: BTreeMap<(String, CommandIndex), Remote>,
+    /// Runs whose activation waits for their messages to be delivered.
+    held_activations: BTreeSet<String>,
+    /// Parents elsewhere waiting for this partition's runs, by the child's run key. In memory only:
+    /// parents ask again.
+    remote_waiters: BTreeMap<String, BTreeSet<(String, CommandIndex)>>,
 }
 
 impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
@@ -610,6 +707,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             children: BTreeMap::new(),
             queued: VecDeque::new(),
             performing: false,
+            placement: None,
+            remote_children: BTreeMap::new(),
+            remote_cancels: BTreeMap::new(),
+            remote_sends: BTreeMap::new(),
+            held_activations: BTreeSet::new(),
+            remote_waiters: BTreeMap::new(),
         })
         .map(|mut partition| {
             let keys: Vec<String> = partition.runs.keys().cloned().collect();
@@ -796,6 +899,21 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 }
             },
         };
+        // An object's calls live with its loop.
+        if !child.starts_with("$call/") && !self.is_local(&child) {
+            let message = Remote::StartChild {
+                parent: parent.to_owned(),
+                cmd,
+                child,
+                workflow: workflow.to_owned(),
+                input,
+                priority: self.runs.get(parent).map_or(0, |run| run.state.priority()),
+            };
+            self.remote_children
+                .insert((parent.to_owned(), cmd), message.clone());
+            self.send_remote(message);
+            return Ok(());
+        }
         self.children
             .entry(child.clone())
             .or_default()
@@ -873,6 +991,17 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     /// A run ended: the parents waiting for its key get its outcome.
     fn child_ended(&mut self, id: &str) -> Result<(), PartitionError> {
         let key = split_run_id(id).0;
+        if self.remote_waiters.contains_key(key)
+            && let Some(outcome) = self.child_outcome(key)?
+        {
+            for (parent, cmd) in self.remote_waiters.remove(key).unwrap_or_default() {
+                self.send_remote(Remote::ChildResult {
+                    parent,
+                    cmd,
+                    outcome: outcome.clone(),
+                });
+            }
+        }
         if !self.children.contains_key(key) {
             return Ok(());
         }
@@ -903,10 +1032,27 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             None => child_key(parent, cmd),
         };
         self.forget_child(&child, parent, cmd);
-        if self.children.contains_key(&child) {
+        if !child.starts_with("$call/") && !self.is_local(&child) {
+            self.remote_children.remove(&(parent.to_owned(), cmd));
+            let message = Remote::CancelChild {
+                parent: parent.to_owned(),
+                cmd,
+                child,
+            };
+            self.remote_cancels
+                .insert((parent.to_owned(), cmd), message.clone());
+            self.send_remote(message);
             return Ok(());
         }
-        let Some(id) = self.latest(&child)? else {
+        self.cancel_unwaited(&child, parent)
+    }
+
+    /// Cancels a child key's latest run, if no parent waits for it any more.
+    fn cancel_unwaited(&mut self, child: &str, parent: &str) -> Result<(), PartitionError> {
+        if self.children.contains_key(child) || self.remote_waiters.contains_key(child) {
+            return Ok(());
+        }
+        let Some(id) = self.latest(child)? else {
             return Ok(());
         };
         let Some(run) = self.runs.get(&id) else {
@@ -1703,6 +1849,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         for dispatch in dispatches {
             self.send(dispatch);
         }
+        let waiting: Vec<Remote> = self
+            .remote_children
+            .values()
+            .chain(self.remote_cancels.values())
+            .chain(self.remote_sends.values())
+            .cloned()
+            .collect();
+        for message in waiting {
+            self.send_remote(message);
+        }
     }
 
     /// Whether there is anything to write or release.
@@ -1973,6 +2129,148 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         std::mem::take(&mut self.immediate)
     }
 
+    fn send_remote(&mut self, message: Remote) {
+        let to = message.to();
+        self.send(Outbound::Remote { to, message });
+    }
+
+    /// Whether a key lives on this partition.
+    fn is_local(&self, key: &str) -> bool {
+        self.placement
+            .as_ref()
+            .is_none_or(|own| own(crate::placement::home(key)))
+    }
+
+    /// Whether a run has messages not yet delivered.
+    fn sending(&self, run: &str) -> bool {
+        self.remote_sends
+            .range((run.to_owned(), CommandIndex(0))..)
+            .next()
+            .is_some_and(|((sender, _), _)| sender == run)
+    }
+
+    /// Tells the partition which homes are its own (ADR 0052). Children and messages for others become
+    /// [`Outbound::Remote`]. Set it before [`Partition::resume`].
+    pub fn set_placement(&mut self, placement: crate::placement::Placement) {
+        self.placement = Some(placement);
+    }
+
+    /// A message from another partition (ADR 0052). Repeats are harmless.
+    pub fn receive(&mut self, message: Remote) -> Result<(), PartitionError> {
+        match message {
+            Remote::StartChild {
+                parent,
+                cmd,
+                child,
+                workflow,
+                input,
+                priority,
+            } => {
+                let options = StartOptions {
+                    priority: Some(priority),
+                    ..StartOptions::default()
+                };
+                match self.start_run(&child, &workflow, input, options) {
+                    Ok(()) => {}
+                    Err(
+                        e @ (PartitionError::UnknownWorkflow(_)
+                        | PartitionError::UnknownVersion { .. }
+                        | PartitionError::KeyConflict(_)
+                        | PartitionError::AlreadyStarted(_)
+                        | PartitionError::InvalidKey(_)),
+                    ) => {
+                        let error = format!("child run `{child}` could not be started: {e}");
+                        self.send_remote(Remote::ChildResult {
+                            parent,
+                            cmd,
+                            outcome: StepOutcome::Failed(error),
+                        });
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
+                match self.child_outcome(&child)? {
+                    Some(outcome) => self.send_remote(Remote::ChildResult {
+                        parent,
+                        cmd,
+                        outcome,
+                    }),
+                    None => {
+                        self.remote_waiters
+                            .entry(child)
+                            .or_default()
+                            .insert((parent, cmd));
+                    }
+                }
+            }
+            Remote::ChildResult {
+                parent,
+                cmd,
+                outcome,
+            } => {
+                self.remote_children.remove(&(parent.clone(), cmd));
+                self.remote_cancels.remove(&(parent.clone(), cmd));
+                let waiting = self.runs.get(&parent).is_some_and(|run| {
+                    !run.state.status().is_terminal()
+                        && usize::try_from(cmd.0)
+                            .ok()
+                            .and_then(|index| run.state.steps().get(index))
+                            .is_some_and(|step| {
+                                step.kind == CommandKind::Child && step.outcome.is_none()
+                            })
+                });
+                if waiting {
+                    self.deliver_child(&parent, cmd, outcome)?;
+                }
+            }
+            Remote::CancelChild { parent, cmd, child } => {
+                if let Some(waiting) = self.remote_waiters.get_mut(&child) {
+                    waiting.remove(&(parent.clone(), cmd));
+                    if waiting.is_empty() {
+                        self.remote_waiters.remove(&child);
+                    }
+                }
+                self.cancel_unwaited(&child, &parent)?;
+                let outcome = StepOutcome::Failed("cancelled".to_owned());
+                self.send_remote(Remote::ChildResult {
+                    parent,
+                    cmd,
+                    outcome,
+                });
+            }
+            Remote::Deliver {
+                sender,
+                cmd,
+                object,
+                key,
+                handler,
+                args,
+            } => {
+                let id = child_key(&sender, cmd);
+                let args = serde_json::from_slice(args.as_bytes()).unwrap_or_default();
+                match self.call_object(&object, &key, &handler, &id, &args) {
+                    // Not deployed: as within one partition, delivered again if the sender recovers
+                    // while it runs.
+                    Ok(_)
+                    | Err(
+                        PartitionError::UnknownWorkflow(_)
+                        | PartitionError::InvalidKey(_)
+                        | PartitionError::KeyConflict(_),
+                    ) => {}
+                    Err(error) => return Err(error),
+                }
+                self.send_remote(Remote::Delivered { sender, cmd });
+            }
+            Remote::Delivered { sender, cmd } => {
+                self.remote_sends.remove(&(sender.clone(), cmd));
+                if !self.sending(&sender) && self.held_activations.remove(&sender) {
+                    self.perform(&sender, vec![Effect::Activate])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn send(&mut self, message: Outbound) {
         if self.ack_before_sync {
             self.immediate.push(message);
@@ -2055,6 +2353,11 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::Activate => {
+                    // Its messages first: the decision may end the run.
+                    if self.sending(key) {
+                        self.held_activations.insert(key.to_owned());
+                        continue;
+                    }
                     let env = Env {
                         now_ms: self.now_ms,
                         seed: self.next_seed(),
@@ -2117,6 +2420,20 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                     let Some(target) = crate::namespaces::chosen_key(key, &target) else {
                         continue;
                     };
+                    if !self.is_local(&crate::objects::object_run_key(&object, &target)) {
+                        let message = Remote::Deliver {
+                            sender: key.to_owned(),
+                            cmd,
+                            object,
+                            key: target,
+                            handler,
+                            args,
+                        };
+                        self.remote_sends
+                            .insert((key.to_owned(), cmd), message.clone());
+                        self.send_remote(message);
+                        continue;
+                    }
                     let id = child_key(key, cmd);
                     let args = serde_json::from_slice(args.as_bytes()).unwrap_or_default();
                     match self.call_object(&object, &target, &handler, &id, &args) {
