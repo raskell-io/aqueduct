@@ -381,3 +381,68 @@ async fn a_server_hands_over_before_it_stops_and_other_versions_are_refused() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_calls_to_a_follower_are_forwarded_to_the_leader() {
+    use aqueduct_protocol::v1;
+    use aqueduct_protocol::v1::ingress_client::IngressClient;
+    let Servers {
+        addrs,
+        shards,
+        stops,
+        dirs,
+    } = servers("grpc", 1).await;
+    // Once server 1, the partition's preferred leader (ADR 0058), leads and the others know it: then
+    // server 2 is a follower that stays one.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(shards[&1].engines()[0].leads()
+        && [2, 3]
+            .iter()
+            .all(|id| shards[id].engines()[0].leader() == Some(1)))
+    {
+        assert!(Instant::now() < deadline, "server 1 does not lead");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let follower = 2;
+    let mut client = IngressClient::connect(format!("http://{}", addrs[&follower]))
+        .await
+        .unwrap();
+    // Asked of a follower, as a client that does not know who leads would; retried as clients retry.
+    let mut started = false;
+    for _ in 0..50 {
+        match client
+            .start(v1::StartRequest {
+                key: "g".into(),
+                workflow: "double".into(),
+                input: b"21".to_vec(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => {
+                started = true;
+                break;
+            }
+            Err(status) if status.code() == tonic::Code::Unavailable => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(status) => panic!("{status}"),
+        }
+    }
+    assert!(started, "the follower never forwarded the start");
+    let result = client
+        .wait(v1::WaitRequest {
+            key: "g".into(),
+            timeout_ms: 10_000,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.output, b"42");
+    for stop in stops.into_values() {
+        let _ = stop.send(());
+    }
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -178,6 +178,30 @@ pub(crate) type Client = hyper_util::client::legacy::Client<
 >;
 
 /// An HTTP(S) client: rustls on ring, with the operating system's root certificates (ADR 0038).
+/// An HTTP/2 client, for gRPC calls forwarded to another server: TLS by ALPN, or HTTP/2 without TLS by
+/// prior knowledge.
+pub(crate) fn grpc_client() -> Result<Client, String> {
+    use hyper_rustls::ConfigBuilderExt;
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| e.to_string())?
+    .with_native_roots()
+    .map_err(|e| e.to_string())?
+    .with_no_client_auth();
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http2()
+        .build();
+    Ok(
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .http2_only(true)
+            .build(connector),
+    )
+}
+
 pub(crate) fn client() -> Result<Client, String> {
     use hyper_rustls::ConfigBuilderExt;
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
