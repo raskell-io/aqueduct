@@ -313,6 +313,22 @@ impl Shards {
         Ok(())
     }
 
+    /// Before stopping: every partition this process leads hands over (ADR 0060). Waits up to `within`
+    /// for them to have done so; returns how many still lead here.
+    pub fn step_down(&self, within: Duration) -> usize {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let leading: Vec<&Arc<Engine>> = self.engines.iter().filter(|e| e.leads()).collect();
+            if leading.is_empty() || std::time::Instant::now() >= deadline {
+                return leading.len();
+            }
+            for engine in leading {
+                engine.step_down();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Every partition's statistics, added up.
     pub fn stats(&self) -> Result<EngineStats, EngineError> {
         let mut total = EngineStats {

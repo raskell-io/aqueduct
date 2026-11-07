@@ -108,6 +108,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0057: Many partitions in one process](adr/0057-partitions-in-a-process.md)
 - [0058: Leadership transfer and balancing](adr/0058-leadership-balancing.md)
 - [0059: The web console](adr/0059-web-console.md)
+- [0060: Rolling upgrades](adr/0060-rolling-upgrades.md)
 
 ### Observability
 

@@ -96,6 +96,7 @@ def run(call):
 
 struct Servers {
     addrs: BTreeMap<u64, SocketAddr>,
+    shards: BTreeMap<u64, Arc<aqueduct_engine::shards::Shards>>,
     stops: BTreeMap<u64, tokio::sync::oneshot::Sender<()>>,
     dirs: Vec<std::path::PathBuf>,
 }
@@ -119,6 +120,7 @@ async fn servers(name: &str, partitions: u32) -> Servers {
         .collect();
     let mut stops = BTreeMap::new();
     let mut dirs = Vec::new();
+    let mut all = BTreeMap::new();
     for (id, listener) in listeners {
         let dir = std::env::temp_dir().join(format!(
             "aqueduct-cluster-{name}-{id}-{}",
@@ -156,6 +158,7 @@ async fn servers(name: &str, partitions: u32) -> Servers {
             })
             .unwrap();
         let security = Security::for_dir(&dir).unwrap();
+        all.insert(id, Arc::clone(&shards));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             aqueduct_server::serve_shards(shards, listener, &config, security, None, async {
@@ -166,7 +169,12 @@ async fn servers(name: &str, partitions: u32) -> Servers {
         stops.insert(id, stop);
         dirs.push(dir);
     }
-    Servers { addrs, stops, dirs }
+    Servers {
+        addrs,
+        shards: all,
+        stops,
+        dirs,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -175,6 +183,7 @@ async fn three_servers_replicate_and_survive_their_leader() {
         addrs,
         mut stops,
         dirs,
+        ..
     } = servers("one", 1).await;
     let mut nodes = addrs.clone();
 
@@ -252,6 +261,7 @@ async fn partitions_replicate_on_three_servers_and_send_each_other_work() {
         addrs,
         mut stops,
         dirs,
+        ..
     } = servers("two", 2).await;
     let mut nodes = addrs.clone();
     for i in 0..8 {
@@ -294,6 +304,76 @@ async fn partitions_replicate_on_three_servers_and_send_each_other_work() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+    for stop in stops.into_values() {
+        let _ = stop.send(());
+    }
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_hands_over_before_it_stops_and_other_versions_are_refused() {
+    let Servers {
+        addrs,
+        shards,
+        stops,
+        dirs,
+    } = servers("drain", 1).await;
+    ask(
+        &addrs,
+        "POST",
+        "/v1/runs",
+        json!({"key": "a", "workflow": "double", "input": 1}),
+    )
+    .await;
+    let leading = |shards: &BTreeMap<u64, Arc<aqueduct_engine::shards::Shards>>| {
+        shards
+            .iter()
+            .find(|(_, s)| s.engines()[0].leads())
+            .map(|(id, _)| *id)
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let leader = loop {
+        if let Some(leader) = leading(&shards) {
+            break leader;
+        }
+        assert!(Instant::now() < deadline, "no leader");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // The leader's server hands over: another leads before any election would have.
+    let draining = Arc::clone(&shards[&leader]);
+    let began = Instant::now();
+    let left = tokio::task::spawn_blocking(move || draining.step_down(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let next = loop {
+        if let Some(next) = leading(&shards).filter(|id| *id != leader) {
+            break next;
+        }
+        assert!(Instant::now() < deadline, "no one took over");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_ne!(next, leader);
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    let (_, result) = ask(&addrs, "GET", "/v1/runs/a/result", Value::Null).await;
+    assert_eq!(result["output"], json!(2), "{result}");
+    // A server of an incompatible version is refused.
+    let (status, _) = http_with(
+        addrs[&leader],
+        "POST",
+        "/cluster/v1/raft",
+        Value::Null,
+        "aqueduct-cluster-secret: a secret for the test\r\naqueduct-version: 9.0.0\r\n",
+    )
+    .await;
+    assert_eq!(status, 409);
     for stop in stops.into_values() {
         let _ = stop.send(());
     }

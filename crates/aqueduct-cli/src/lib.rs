@@ -561,8 +561,14 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
             if tls.is_some() { "https" } else { "http" },
             listener.local_addr().map_err(|e| e.to_string())?
         );
-        // Ctrl-C, or SIGTERM (how service managers and containers stop a process).
-        let stop = async {
+        // Ctrl-C, or SIGTERM (how service managers and containers stop a process). In a cluster, the
+        // partitions this server leads are handed over first, so that none waits for an election
+        // (ADR 0060): how a cluster is upgraded one server at a time.
+        let draining = config
+            .cluster
+            .is_some()
+            .then(|| std::sync::Arc::clone(&shards));
+        let stop = async move {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{SignalKind, signal};
@@ -581,6 +587,17 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
             #[cfg(not(unix))]
             {
                 let _ = tokio::signal::ctrl_c().await;
+            }
+            if let Some(shards) = draining {
+                eprintln!("handing over the partitions this server leads");
+                let left = tokio::task::spawn_blocking(move || {
+                    shards.step_down(std::time::Duration::from_secs(5))
+                })
+                .await
+                .unwrap_or(0);
+                if left > 0 {
+                    eprintln!("{left} partitions still led here: they will elect a new leader");
+                }
             }
         };
         aqueduct_server::serve_shards(shards, listener, &config, security, tls, stop)
