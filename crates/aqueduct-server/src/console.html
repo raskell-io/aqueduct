@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aqueduct console</title>
+<style>
+  :root { color-scheme: light dark; --line: #8884; --muted: #888; --accent: #2a6fdb; }
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; }
+  header { display: flex; gap: 1rem; align-items: center; padding: .6rem 1rem; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 1rem; margin: 0 1rem 0 0; }
+  nav a { margin-right: .8rem; color: inherit; text-decoration: none; padding: .2rem .4rem; border-radius: 4px; }
+  nav a.on { background: var(--accent); color: white; }
+  main { padding: 1rem; max-width: 1100px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); }
+  tr.link { cursor: pointer; }
+  tr.link:hover { background: #8881; }
+  code, pre, textarea, input { font: 13px ui-monospace, monospace; }
+  pre { white-space: pre-wrap; word-break: break-all; margin: 0; }
+  input, textarea, button { padding: .25rem .4rem; }
+  .muted { color: var(--muted); }
+  .status { font-weight: 600; }
+  .status.completed { color: #2a9d4b; } .status.failed, .status.parked { color: #d1453b; }
+  .status.running { color: var(--accent); }
+  .error { color: #d1453b; margin: .5rem 0; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .5rem 0; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; }
+  dt { color: var(--muted); }
+  h2 code { font-size: 1.1rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Aqueduct</h1>
+  <nav id="nav">
+    <a href="#/runs" data-tab="runs">Runs</a>
+    <a href="#/escalations" data-tab="escalations">Escalations</a>
+    <a href="#/deployments" data-tab="deployments">Deployments</a>
+  </nav>
+  <span class="row">
+    <input id="token" type="password" placeholder="token (if the server has tokens)" size="28">
+    <input id="namespace" placeholder="namespace" size="12">
+  </span>
+</header>
+<main id="main"></main>
+<script>
+"use strict";
+// Every value from the server is inserted as text, never as HTML.
+const main = document.getElementById("main");
+const token = document.getElementById("token");
+const namespace = document.getElementById("namespace");
+token.value = sessionStorage.getItem("aqueduct-token") || "";
+namespace.value = sessionStorage.getItem("aqueduct-namespace") || "";
+for (const [input, name] of [[token, "aqueduct-token"], [namespace, "aqueduct-namespace"]]) {
+  input.addEventListener("change", () => { sessionStorage.setItem(name, input.value); route(); });
+}
+
+function el(tag, attributes = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attributes)) {
+    if (name === "onclick") node.addEventListener("click", value);
+    else if (name === "class") node.className = value;
+    else node.setAttribute(name, value);
+  }
+  for (const child of children) {
+    node.append(child instanceof Node ? child : document.createTextNode(child === undefined || child === null ? "" : String(child)));
+  }
+  return node;
+}
+
+function show(...nodes) { main.replaceChildren(...nodes); }
+
+function json(value) { return value === undefined || value === null ? "" : JSON.stringify(value, null, 2); }
+
+async function call(method, path, body) {
+  const headers = { "content-type": "application/json" };
+  if (token.value) headers.authorization = "Bearer " + token.value;
+  if (namespace.value) headers["aqueduct-namespace"] = namespace.value;
+  const response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const text = await response.text();
+  let answer = {};
+  try { answer = text ? JSON.parse(text) : {}; } catch { answer = { error: text }; }
+  if (!response.ok) throw new Error(answer.error || response.status + " " + response.statusText);
+  return answer;
+}
+
+function failed(error) { show(el("p", { class: "error" }, error.message)); }
+
+function status(name) { return el("span", { class: "status " + name }, name); }
+
+async function runs() {
+  const filter = el("input", { placeholder: "filter by key, workflow or status", size: "40" });
+  const body = el("tbody");
+  const answer = await call("GET", "/v1/runs?limit=1000");
+  const draw = () => {
+    const words = filter.value.toLowerCase();
+    body.replaceChildren(...answer.runs
+      .filter(run => !words || [run.run_id, run.workflow, run.status].some(v => String(v).toLowerCase().includes(words)))
+      .map(run => {
+        const row = el("tr", { class: "link" }, el("td", {}, el("code", {}, run.run_id)), el("td", {}, run.workflow), el("td", {}, status(run.status)), el("td", {}, run.entries));
+        row.addEventListener("click", () => { location.hash = "#/runs/" + encodeURIComponent(run.run_id); });
+        return row;
+      }));
+  };
+  filter.addEventListener("input", draw);
+  draw();
+  show(el("div", { class: "row" }, filter, el("span", { class: "muted" }, answer.runs.length + " runs")),
+    el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Run"), el("th", {}, "Workflow"), el("th", {}, "Status"), el("th", {}, "Entries"))), body));
+}
+
+async function run(key) {
+  const answer = await call("GET", "/v1/runs/" + encodeURIComponent(key));
+  const reason = el("input", { placeholder: "reason", size: "24" });
+  const signal = el("input", { placeholder: "signal name", size: "16" });
+  const payload = el("input", { placeholder: "payload (JSON)", size: "24" });
+  const note = el("span", { class: "muted" });
+  const act = async (what, path, body) => {
+    try { await call("POST", path, body); note.textContent = what + ": done"; setTimeout(() => run(key), 300); }
+    catch (error) { note.textContent = what + ": " + error.message; }
+  };
+  const commands = (answer.commands || []).map(command => el("tr", {},
+    el("td", {}, command.index), el("td", {}, command.kind), el("td", {}, el("code", {}, command.name)),
+    el("td", {}, el("pre", {}, json(command.input))),
+    el("td", {}, command.pending ? el("span", { class: "muted" }, "pending")
+      : command.failed !== undefined ? el("span", { class: "error" }, command.failed)
+      : el("pre", {}, json(command.completed)))));
+  show(
+    el("p", {}, el("a", { href: "#/runs" }, "← runs")),
+    el("h2", {}, el("code", {}, answer.run_id)),
+    el("dl", {},
+      el("dt", {}, "Workflow"), el("dd", {}, answer.workflow, answer.version ? " (" + answer.version + ")" : ""),
+      el("dt", {}, "Status"), el("dd", {}, status(answer.status)),
+      el("dt", {}, "Input"), el("dd", {}, el("pre", {}, json(answer.input))),
+      el("dt", {}, "Output"), el("dd", {}, el("pre", {}, json(answer.output))),
+      el("dt", {}, "Error"), el("dd", {}, answer.error || "")),
+    el("div", { class: "row" },
+      reason, el("button", { onclick: () => act("cancel", "/v1/runs/" + encodeURIComponent(key) + "/cancel", { reason: reason.value }) }, "Cancel"),
+      signal, payload, el("button", { onclick: () => {
+        let value = null;
+        try { value = payload.value ? JSON.parse(payload.value) : null; } catch { note.textContent = "the payload is not JSON"; return; }
+        act("signal", "/v1/runs/" + encodeURIComponent(key) + "/signals/" + encodeURIComponent(signal.value), { payload: value });
+      } }, "Signal"),
+      note),
+    el("h3", {}, "Commands"),
+    el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "#"), el("th", {}, "Kind"), el("th", {}, "Name"), el("th", {}, "Input"), el("th", {}, "Outcome"))), el("tbody", {}, ...commands)));
+}
+
+async function escalations() {
+  const answer = await call("GET", "/v1/escalations");
+  const rows = answer.escalations.map(escalation => {
+    const outcome = el("input", { placeholder: "outcome (JSON)", size: "20" });
+    const note = el("span", { class: "muted" });
+    const resolve = async () => {
+      let value;
+      try { value = JSON.parse(outcome.value); } catch { note.textContent = "the outcome is not JSON"; return; }
+      try { await call("POST", "/v1/escalations/" + encodeURIComponent(escalation.id), { outcome: value }); escalations(); }
+      catch (error) { note.textContent = error.message; }
+    };
+    return el("tr", {}, el("td", {}, el("code", {}, escalation.id)), el("td", {}, escalation.reason),
+      el("td", {}, el("pre", {}, json(escalation.payload))),
+      el("td", {}, el("div", { class: "row" }, outcome, el("button", { onclick: resolve }, "Resolve"), note)));
+  });
+  show(el("p", { class: "muted" }, answer.escalations.length + " open"),
+    el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Escalation"), el("th", {}, "Reason"), el("th", {}, "Payload"), el("th", {}, "Resolve"))), el("tbody", {}, ...rows)));
+}
+
+async function deployments() {
+  const answer = await call("GET", "/v1/deployments");
+  const rows = answer.deployments.map(d => el("tr", {}, el("td", {}, d.workflow), el("td", {}, el("code", {}, d.build)),
+    el("td", {}, d.state), el("td", {}, d.open_runs), el("td", {}, d.workers)));
+  show(el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Workflow"), el("th", {}, "Build"), el("th", {}, "State"), el("th", {}, "Open runs"), el("th", {}, "Workers"))), el("tbody", {}, ...rows)));
+}
+
+async function route() {
+  const path = location.hash.replace(/^#\/?/, "") || "runs";
+  const [tab, ...rest] = path.split("/");
+  for (const link of document.querySelectorAll("#nav a")) link.classList.toggle("on", link.dataset.tab === tab);
+  try {
+    if (tab === "runs" && rest.length) await run(decodeURIComponent(rest.join("/")));
+    else if (tab === "escalations") await escalations();
+    else if (tab === "deployments") await deployments();
+    else await runs();
+  } catch (error) { failed(error); }
+}
+window.addEventListener("hashchange", route);
+route();
+</script>
+</body>
+</html>

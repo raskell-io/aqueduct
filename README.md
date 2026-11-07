@@ -221,6 +221,9 @@ curl -s 'localhost:7470/v1/runs/greet-1/result?timeout_ms=10000'
 # {"error":"","output":"hello Ada","status":"completed","version":"c98c962e..."}
 ```
 
+The server's web console is at <http://127.0.0.1:7470/console>: runs and their commands, escalations and
+deployments ([ADR 0059](docs/adr/0059-web-console.md)).
+
 A worker holds each step under a lease. If it crashes or its result is lost, the step goes to another worker, and the
 run records one result.
 
