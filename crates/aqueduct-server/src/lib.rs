@@ -19,6 +19,7 @@
 pub mod audit;
 pub mod auth;
 pub mod cluster;
+mod console;
 mod deployments;
 mod imports;
 mod limits;
@@ -183,6 +184,8 @@ pub fn router_shards(engine: Arc<Shards>, security: Security) -> Router {
         .merge(workers::routes(api.clone()))
         .merge(deployments::routes(api.clone()))
         .layer(axum::middleware::from_fn_with_state(api, authorize))
+        // The console's page holds nothing secret; what it shows comes through the API, with a token.
+        .merge(console::routes())
 }
 
 /// The router, with the route other nodes send Raft messages to, in cluster mode.
