@@ -16,6 +16,12 @@ use axum::routing::post;
 use http_body_util::Full;
 use serde::Deserialize;
 
+/// The header a forwarded request carries: it is answered where it arrives, never forwarded again.
+const FORWARDED_HEADER: &str = "aqueduct-forwarded";
+
+/// The largest request body forwarded to the leader (16 MiB).
+const MOST_FORWARDED: usize = 16 << 20;
+
 /// The header that carries the cluster's secret.
 const SECRET_HEADER: &str = "aqueduct-cluster-secret";
 
@@ -174,6 +180,87 @@ pub(crate) fn routes(engine: &Engine, cluster: &Cluster) -> Router {
             id: cluster.id,
             secret: Arc::new(cluster.secret.clone()),
         })
+}
+
+#[derive(Clone)]
+struct Forward {
+    engine: Arc<Engine>,
+    peers: Arc<BTreeMap<u64, String>>,
+    client: crate::push::Client,
+}
+
+/// Forwards HTTP/JSON requests (`/v1/...`) that arrive at a node that does not lead to the node that
+/// does, and returns its answer: clients may ask any node. Applied outside authentication, so the
+/// leader authenticates them; every node needs the same tokens. gRPC calls are not forwarded: a node
+/// that does not lead answers `UNAVAILABLE`.
+pub(crate) fn forwarding(
+    router: Router,
+    engine: &Arc<Engine>,
+    cluster: &Cluster,
+) -> Result<Router, String> {
+    let forward = Forward {
+        engine: Arc::clone(engine),
+        peers: Arc::new(cluster.peers.clone()),
+        client: crate::push::client()?,
+    };
+    Ok(router.layer(axum::middleware::from_fn_with_state(
+        forward,
+        forward_request,
+    )))
+}
+
+async fn forward_request(
+    State(forward): State<Forward>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let grpc = request
+        .headers()
+        .get("content-type")
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
+    let target = forward
+        .engine
+        .leader()
+        .and_then(|leader| forward.peers.get(&leader).cloned());
+    let Some(target) = target.filter(|_| {
+        !grpc
+            && request.uri().path().starts_with("/v1/")
+            && !request.headers().contains_key(FORWARDED_HEADER)
+            && !forward.engine.leads()
+    }) else {
+        return next.run(request).await;
+    };
+    let (parts, body) = request.into_parts();
+    let unavailable = |why: String| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "error": why })),
+        )
+            .into_response()
+    };
+    let Ok(body) = axum::body::to_bytes(body, MOST_FORWARDED).await else {
+        return unavailable("the request is too large to forward to the leader".into());
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    let mut outgoing = axum::http::Request::builder()
+        .method(parts.method)
+        .uri(format!("{}{path}", target.trim_end_matches('/')));
+    for (name, value) in &parts.headers {
+        if name != axum::http::header::HOST {
+            outgoing = outgoing.header(name, value);
+        }
+    }
+    let Ok(outgoing) = outgoing.header(FORWARDED_HEADER, "1").body(Full::new(body)) else {
+        return unavailable("the request could not be forwarded to the leader".into());
+    };
+    match forward.client.request(outgoing).await {
+        Ok(answer) => answer.map(axum::body::Body::new),
+        Err(e) => unavailable(format!("the leader at {target} did not answer: {e}")),
+    }
 }
 
 /// Whether two secrets are equal, in time that does not depend on where they differ.
