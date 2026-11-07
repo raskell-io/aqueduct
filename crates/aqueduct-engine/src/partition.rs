@@ -1451,7 +1451,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             return Err(PartitionError::UnknownWorkflow(workflow));
         }
         let call = call_key(object, key, id);
-        if !valid_key(&call) {
+        if !valid_key(&call) || !crate::objects::valid_object_key(object, key) {
             return Err(PartitionError::InvalidKey(call));
         }
         if self.latest(&call)?.is_some() {

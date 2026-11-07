@@ -16,7 +16,8 @@ reaches its object exactly once; a run's end is never logged before its messages
 ## Decision
 
 **Where a run lives.** A key's *home* is the key up to its first `#` (with the run id's generation
-removed); an object's loop and its calls live at `$object/<object>/<key>`. The home's slot is
+removed); an object key's loop and its calls live at `<object>/<key>` (object names and keys hold
+no `/`, ADR 0057). The home's slot is
 `aqueduct_codec::slot` (ADR 0011), and the slot table maps it to a partition. So:
 
 - derived children (`<parent>#<command>`), awakeables and successors (continued as new) live with their
