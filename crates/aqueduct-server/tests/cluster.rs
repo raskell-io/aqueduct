@@ -144,16 +144,25 @@ async fn three_servers_replicate_and_survive_their_leader() {
     assert!((200..300).contains(&status), "{status}: {answer}");
     let (status, answer) = http(nodes[&follower], "GET", "/v1/runs/b/result", Value::Null).await;
     assert_eq!((status, &answer["output"]), (200, &json!(8)), "{answer}");
-    // A request already forwarded once is answered where it arrives: unavailable, never forwarded on.
-    let (status, answer) = http_with(
-        nodes[&follower],
-        "GET",
-        "/v1/runs/b/result",
-        Value::Null,
-        "aqueduct-forwarded: 1\r\n",
-    )
-    .await;
-    assert_eq!(status, 503, "{answer}");
+    // A request already forwarded once is answered where it arrives, never forwarded on: the leader
+    // answers it, the others are unavailable. (Leadership may move meanwhile: each node is asked.)
+    let mut refused = 0;
+    for addr in nodes.values() {
+        let (status, answer) = http_with(
+            *addr,
+            "GET",
+            "/v1/runs/b/result",
+            Value::Null,
+            "aqueduct-forwarded: 1\r\n",
+        )
+        .await;
+        assert!(status == 200 || status == 503, "{status}: {answer}");
+        refused += usize::from(status == 503);
+    }
+    assert!(
+        refused >= 1,
+        "every node answered a request already forwarded"
+    );
 
     // The leader's server stops; another serves what it acknowledged, and new work.
     let _ = stops.remove(&leader).unwrap().send(());
