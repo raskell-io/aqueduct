@@ -24,6 +24,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let config = SimConfig {
         nodes,
+        initial_members: nodes.min(3),
         ..SimConfig::default()
     };
     let started = std::time::Instant::now();
@@ -45,12 +46,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.duplicated += report.duplicated;
         total.compactions += report.compactions;
         total.installs += report.installs;
+        total.changes += report.changes;
     }
     println!(
         "{count} seeds ({from}..{}, {nodes} nodes) passed in {:.1} s\n\
          events {}, crashes {}, network splits {}, clock pauses {}, terms with a leader {}\n\
          messages dropped {}, duplicated {}, entries applied on every node {}\n\
-         logs compacted {}, snapshots installed by followers {}",
+         logs compacted {}, snapshots installed by followers {}, membership changes committed {}",
         from + count,
         started.elapsed().as_secs_f64(),
         total.events,
@@ -63,6 +65,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.applied,
         total.compactions,
         total.installs,
+        total.changes,
     );
     Ok(())
 }

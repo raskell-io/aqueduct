@@ -13,6 +13,8 @@
 //! - **leader completeness:** a new leader's log holds every entry applied anywhere;
 //! - **state machine safety:** no two nodes apply different entries at one index;
 //! - **durability:** a node's disk holds what it applied: in its snapshot, or its log;
+//! - **membership:** an operator adds and removes nodes one at a time during faults, the leader too;
+//!   removed nodes keep running. The checks above hold throughout, and at the end for the final group;
 //! - **snapshots:** every node's state machine agrees at each index, whether it applied entries or
 //!   restored a snapshot (nodes compact their logs often, and followers catch up from snapshots).
 //!
@@ -21,13 +23,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Config, Entry, Envelope, HardState, NodeId, RaftNode, Role, Snapshot};
+use crate::{Change, Config, Entry, Envelope, HardState, NodeId, RaftNode, Role, Snapshot};
 
 /// Parameters of a simulated world. Probabilities are in parts per million, times in milliseconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SimConfig {
-    /// Nodes in the group.
+    /// Nodes in the world.
     pub nodes: u64,
+    /// How many of them form the group at first; the others wait to be added.
+    pub initial_members: u64,
+    /// Whether an operator changes the group while faults last.
+    pub changes: bool,
     /// Values the client proposes.
     pub proposals: usize,
     /// How long faults are injected.
@@ -56,6 +62,8 @@ impl Default for SimConfig {
     fn default() -> SimConfig {
         SimConfig {
             nodes: 5,
+            initial_members: 3,
+            changes: true,
             proposals: 60,
             fault_window: 4_000,
             max_time: 60_000,
@@ -96,6 +104,8 @@ pub struct SimReport {
     pub compactions: u64,
     /// Snapshots a follower installed from its leader.
     pub installs: u64,
+    /// Membership changes committed.
+    pub changes: u64,
 }
 
 /// A world that broke an invariant, with the seed that reproduces it.
@@ -149,12 +159,19 @@ struct State {
 impl State {
     fn apply(self, entry: &Entry) -> State {
         let mut digest = self.digest ^ 0xcbf2_9ce4_8422_2325;
+        let members: Vec<u8> = entry
+            .members
+            .iter()
+            .flatten()
+            .flat_map(|m| m.to_le_bytes())
+            .collect();
         for byte in entry
             .term
             .to_le_bytes()
             .iter()
             .chain(&entry.index.to_le_bytes())
             .chain(&entry.data)
+            .chain(&members)
         {
             digest ^= u64::from(*byte);
             digest = digest.wrapping_mul(0x0100_0000_01b3);
@@ -183,6 +200,7 @@ enum Event {
     Restart { node: NodeId },
     Propose,
     Heal,
+    Change,
 }
 
 struct World<'c> {
@@ -192,7 +210,10 @@ struct World<'c> {
     now: u64,
     seq: u64,
     queue: BTreeMap<(u64, u64), Event>,
+    /// Every node in the world, member or not.
     members: Vec<NodeId>,
+    /// The group the world starts with.
+    initial: Vec<NodeId>,
     nodes: BTreeMap<NodeId, RaftNode>,
     incarnations: BTreeMap<NodeId, u64>,
     disks: BTreeMap<NodeId, Disk>,
@@ -223,11 +244,15 @@ struct World<'c> {
 pub fn run(seed: u64, config: &SimConfig) -> Result<SimReport, SimFailure> {
     let mut rng = Rng(seed);
     let members: Vec<NodeId> = (1..=config.nodes).collect();
+    let initial: Vec<NodeId> = (1..=config.initial_members.clamp(1, config.nodes)).collect();
     let raft = Config::default();
     let mut nodes = BTreeMap::new();
     let mut tick_ms = BTreeMap::new();
     for id in &members {
-        nodes.insert(*id, RaftNode::new(*id, &members, raft, rng.next()));
+        nodes.insert(
+            *id,
+            RaftNode::new(*id, &bootstrap(*id, &initial), raft, rng.next()),
+        );
         tick_ms.insert(*id, config.tick_ms + rng.below(config.skew + 1));
     }
     let mut world = World {
@@ -238,6 +263,7 @@ pub fn run(seed: u64, config: &SimConfig) -> Result<SimReport, SimFailure> {
         seq: 0,
         queue: BTreeMap::new(),
         members: members.clone(),
+        initial,
         incarnations: members.iter().map(|id| (*id, 0)).collect(),
         disks: members.iter().map(|id| (*id, Disk::default())).collect(),
         states: members.iter().map(|id| (*id, State::default())).collect(),
@@ -281,6 +307,9 @@ impl World<'_> {
             );
         }
         self.schedule(1, Event::Propose);
+        if self.config.changes {
+            self.schedule(100, Event::Change);
+        }
         loop {
             let Some(((time, _), event)) = self.queue.pop_first() else {
                 return Err("the event queue ran dry".into());
@@ -290,8 +319,10 @@ impl World<'_> {
             // A world takes a few thousand events: far more is a storm that never settles.
             if self.report.events > 2_000_000 {
                 return Err(format!(
-                    "liveness: {} events by time {}, and not done: messages without progress",
-                    self.report.events, self.now
+                    "liveness: {} events by time {}, and not done: messages without progress\n{}",
+                    self.report.events,
+                    self.now,
+                    self.summary()
                 ));
             }
             if self.faults && self.now >= self.config.fault_window {
@@ -301,11 +332,12 @@ impl World<'_> {
             }
             if self.now > self.config.max_time {
                 return Err(format!(
-                    "liveness: not done by {}: {} proposals pending, leaders by term {:?}, seed {}",
+                    "liveness: not done by {}: {} proposals pending, leaders by term {:?}, seed {}\n{}",
                     self.config.max_time,
                     self.pending.len(),
                     self.leaders.iter().rev().take(3).collect::<Vec<_>>(),
-                    self.seed
+                    self.seed,
+                    self.summary()
                 ));
             }
             self.handle(event)?;
@@ -365,7 +397,7 @@ impl World<'_> {
                 };
                 let raft = RaftNode::restart(
                     node,
-                    &self.members,
+                    &bootstrap(node, &self.initial),
                     Config::default(),
                     seed,
                     disk.hard_state,
@@ -381,8 +413,49 @@ impl World<'_> {
             }
             Event::Propose => self.propose(),
             Event::Heal => self.sides = None,
+            Event::Change => self.change(),
         }
         Ok(())
+    }
+
+    /// The operator: while faults last, adds or removes a node through whichever member leads, keeping
+    /// the group between three and five (or what the world allows). It is told nothing: a change that
+    /// does not commit is simply not there.
+    fn change(&mut self) {
+        if !self.faults {
+            return;
+        }
+        let leader = self
+            .nodes
+            .values()
+            .find(|n| n.role() == Role::Leader && n.members().contains(&n.id()))
+            .map(RaftNode::id);
+        if let Some(leader) = leader {
+            let group = self.nodes[&leader].members().to_vec();
+            let outside: Vec<NodeId> = self
+                .members
+                .iter()
+                .copied()
+                .filter(|m| !group.contains(m))
+                .collect();
+            let (low, high) = (3.min(self.members.len()), 5.min(self.members.len()));
+            let add = match group.len() {
+                n if n <= low => true,
+                n if n >= high => false,
+                _ => self.rng.below(2) == 0,
+            };
+            let change = if add && !outside.is_empty() {
+                Change::Add(outside[self.rng.below(outside.len() as u64) as usize])
+            } else {
+                Change::Remove(group[self.rng.below(group.len() as u64) as usize])
+            };
+            if let Some(raft) = self.nodes.get_mut(&leader) {
+                let _ = raft.propose_change(change);
+            }
+            let _ = self.drive(leader);
+        }
+        let delay = 100 + self.rng.below(400);
+        self.schedule(delay, Event::Change);
     }
 
     /// The client: proposes the next value, or proposes a pending one again, to the node it thinks leads.
@@ -462,8 +535,11 @@ impl World<'_> {
             }
             if role == Role::Leader {
                 self.became_leader(node, term)?;
-                self.record_commits(node, term)?;
             }
+            // Any node may learn a commit first: a leader removed by a change commits it and steps
+            // down at once. A follower's term is at least the committing leader's, which only makes
+            // the completeness check looser, never wrong.
+            self.record_commits(node, term)?;
             if let Some(snapshot) = &ready.snapshot {
                 self.restore(node, snapshot)?;
             }
@@ -563,7 +639,7 @@ impl World<'_> {
         Ok(())
     }
 
-    /// Notes, for each index a leader has committed, the first term in which one did.
+    /// Notes, for each index known committed, the term of the first node to know it.
     fn record_commits(&mut self, node: NodeId, term: u64) -> Result<(), String> {
         let Some(raft) = self.nodes.get(&node) else {
             return Ok(());
@@ -576,6 +652,10 @@ impl World<'_> {
             .map_or(1, |last| last + 1);
         for index in first..=commit {
             let Some(entry) = raft.entry(index) else {
+                // In its snapshot: the snapshot checks cover it.
+                if index <= raft.snapshot_index() {
+                    continue;
+                }
                 return Err(format!(
                     "node {node} committed index {index} it does not hold"
                 ));
@@ -721,15 +801,42 @@ impl World<'_> {
         Ok(())
     }
 
+    /// Every node's state, for a failure's message.
+    fn summary(&self) -> String {
+        let mut out = String::new();
+        for id in &self.members {
+            match self.nodes.get(id) {
+                None => out.push_str(&format!("  node {id}: down\n")),
+                Some(raft) => out.push_str(&format!(
+                    "  node {id}: {:?} term {} leader {:?} group {:?} commit {} snapshot {} last {} applied {}\n",
+                    raft.role(),
+                    raft.term(),
+                    raft.leader(),
+                    raft.members(),
+                    raft.commit(),
+                    raft.snapshot_index(),
+                    raft.log().last().map_or(raft.snapshot_index(), |e| e.index),
+                    self.states.get(id).map_or(0, |s| s.index),
+                )),
+            }
+        }
+        out
+    }
+
+    /// The group's leader, if a member leads.
+    fn leader(&self) -> Option<&RaftNode> {
+        self.nodes
+            .values()
+            .find(|n| n.role() == Role::Leader && n.members().contains(&n.id()))
+    }
+
     fn done(&self) -> bool {
         if !self.pending.is_empty() || self.next_proposal < self.config.proposals as u64 {
             return false;
         }
-        if self.nodes.len() != self.members.len() {
-            return false;
-        }
-        // Every node has applied everything committed, and the leader's no-op of its term.
-        let Some(leader) = self.nodes.values().find(|n| n.role() == Role::Leader) else {
+        // Every member is up and has applied everything committed, and the leader's no-op of its term.
+        // Nodes outside the group are not waited for.
+        let Some(leader) = self.leader() else {
             return false;
         };
         let commit = leader.commit();
@@ -738,12 +845,26 @@ impl World<'_> {
                 .log()
                 .last()
                 .map_or(leader.snapshot_index(), |e| e.index)
-            && self.states.values().all(|state| state.index == commit)
+            && leader.members().iter().all(|m| {
+                self.nodes.contains_key(m)
+                    && self
+                        .states
+                        .get(m)
+                        .is_some_and(|state| state.index == commit)
+            })
     }
 
     fn final_checks(&mut self) -> Result<(), String> {
-        let reference = self.states.values().next().copied().unwrap_or_default();
-        for (node, state) in &self.states {
+        let group = self
+            .leader()
+            .map(|l| l.members().to_vec())
+            .unwrap_or_default();
+        let reference = group
+            .first()
+            .and_then(|m| self.states.get(m))
+            .copied()
+            .unwrap_or_default();
+        for (node, state) in self.states.iter().filter(|(n, _)| group.contains(n)) {
             if *state != reference {
                 return Err(format!("node {node}'s state machine differs at the end"));
             }
@@ -759,6 +880,21 @@ impl World<'_> {
             }
         }
         self.report.applied = reference.index;
+        self.report.changes = self
+            .applied_at
+            .values()
+            .filter(|e| e.members.is_some())
+            .count() as u64;
         Ok(())
+    }
+}
+
+/// What a node is started with: the initial group if it is in it, otherwise nothing, until a leader's
+/// log adds it.
+fn bootstrap(node: NodeId, initial: &[NodeId]) -> Vec<NodeId> {
+    if initial.contains(&node) {
+        initial.to_vec()
+    } else {
+        Vec::new()
     }
 }
