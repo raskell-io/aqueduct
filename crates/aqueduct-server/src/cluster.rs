@@ -77,6 +77,49 @@ pub struct Cluster {
     /// How often Raft's clock ticks, in milliseconds. Default 50: elections after 0.5 to 1 s of silence.
     #[serde(default = "default_tick")]
     pub tick_ms: u64,
+    /// Where partitions' snapshots are copied (ADR 0062), so that a server starting on an empty data
+    /// directory loads the latest instead of being sent everything.
+    #[serde(default)]
+    pub snapshots: Option<crate::objects::StoreConfig>,
+    /// Entries applied between a partition's snapshots. Default 1,000.
+    #[serde(default)]
+    pub snapshot_every: Option<u64>,
+}
+
+/// Where a partition's latest snapshot is kept in the store.
+pub fn snapshot_key(partition: u32) -> String {
+    format!("snapshots/{partition}/latest")
+}
+
+/// Fills an empty Raft directory with the latest snapshot of `partition` from the store, if there is one
+/// (ADR 0062). A directory that holds anything already is left as it is. Whether it was filled.
+pub fn bootstrap(
+    store: &crate::objects::StoreConfig,
+    raft_dir: &Path,
+    partition: u32,
+) -> Result<bool, String> {
+    let (mut local, recovered) =
+        aqueduct_storage::RaftStore::open(raft_dir).map_err(|e| e.to_string())?;
+    if recovered != aqueduct_storage::Recovered::default() {
+        return Ok(false);
+    }
+    // Its own runtime, on its own thread: this runs while the server is starting, outside any task.
+    let store = store.clone();
+    let fetched = std::thread::spawn(move || -> Result<Option<Vec<u8>>, String> {
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        runtime.block_on(async {
+            let store = crate::objects::Store::open(&store)?;
+            store.get(&snapshot_key(partition)).await
+        })
+    })
+    .join()
+    .map_err(|_| "fetching a snapshot panicked".to_owned())??;
+    let Some(bytes) = fetched else {
+        return Ok(false);
+    };
+    let snapshot = wire::decode_snapshot(&bytes).map_err(|e| e.to_string())?;
+    local.save_snapshot(&snapshot).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn default_tick() -> u64 {
@@ -138,6 +181,24 @@ impl Cluster {
         // Leaders spread over the nodes: partition p prefers the p-th node, round robin (ADR 0058).
         let members: Vec<u64> = self.peers.keys().copied().collect();
         let preferred = members[partition as usize % members.len()];
+        // Snapshots are copied to the store as they are taken; a newer one replaces the last.
+        let on_snapshot = match &self.snapshots {
+            None => None,
+            Some(config) => {
+                let store = Arc::new(crate::objects::Store::open(config)?);
+                let hook: aqueduct_engine::embedded::SnapshotHook =
+                    Arc::new(move |snapshot: &aqueduct_raft::Snapshot| {
+                        let store = Arc::clone(&store);
+                        let bytes = wire::encode_snapshot(snapshot);
+                        runtime.spawn(async move {
+                            if let Err(e) = store.put(&snapshot_key(partition), bytes).await {
+                                eprintln!("snapshot of partition {partition}: {e}");
+                            }
+                        });
+                    });
+                Some(hook)
+            }
+        };
         Ok(Replication {
             id: self.id,
             members,
@@ -145,6 +206,10 @@ impl Cluster {
             tick: Duration::from_millis(self.tick_ms),
             config: aqueduct_raft::Config::default(),
             preferred_leader: Some(preferred),
+            snapshot_every: self
+                .snapshot_every
+                .unwrap_or(aqueduct_engine::embedded::SNAPSHOT_EVERY),
+            on_snapshot,
         })
     }
 
@@ -193,6 +258,9 @@ impl Cluster {
             dir,
             partitions,
             |path, partition| {
+                if let Some(store) = &self.snapshots {
+                    bootstrap(store, &path.join("raft"), partition).map_err(EngineError::Open)?;
+                }
                 let replication = self.replication(partition).map_err(EngineError::Open)?;
                 Ok(build(path, partition)?.replicated(replication))
             },
@@ -529,6 +597,8 @@ mod tests {
                 .collect(),
             secret: "sixteen chars ok".into(),
             tick_ms: 50,
+            snapshots: None,
+            snapshot_every: None,
         };
         assert_eq!(cluster.check(), Ok(()));
         let two = Cluster {
@@ -543,5 +613,36 @@ mod tests {
         assert!(short.check().is_err());
         let elsewhere = Cluster { id: 7, ..cluster };
         assert!(elsewhere.check().is_err());
+    }
+
+    #[test]
+    fn an_empty_directory_starts_from_the_latest_snapshot_and_a_full_one_is_left_alone() {
+        let base = std::env::temp_dir().join(format!("aqueduct-bootstrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = crate::objects::StoreConfig::Dir {
+            path: base.join("objects"),
+        };
+        let snapshot = aqueduct_raft::Snapshot {
+            index: 40,
+            term: 3,
+            data: b"records".to_vec(),
+            members: vec![1, 2, 3],
+        };
+        // Nothing in the store: nothing to load.
+        assert_eq!(bootstrap(&store, &base.join("empty"), 0), Ok(false));
+        let key = std::path::Path::new("snapshots").join("2").join("latest");
+        std::fs::create_dir_all(base.join("objects").join(key.parent().unwrap())).unwrap();
+        std::fs::write(
+            base.join("objects").join(&key),
+            wire::encode_snapshot(&snapshot),
+        )
+        .unwrap();
+        let raft = base.join("fresh");
+        assert_eq!(bootstrap(&store, &raft, 2), Ok(true));
+        let (_, recovered) = aqueduct_storage::RaftStore::open(&raft).unwrap();
+        assert_eq!(recovered.snapshot, Some(snapshot));
+        // A directory with state of its own keeps it.
+        assert_eq!(bootstrap(&store, &raft, 2), Ok(false));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

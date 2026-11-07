@@ -103,6 +103,11 @@ struct Servers {
 
 /// Three servers on this machine, each with `partitions` partitions replicated with the others.
 async fn servers(name: &str, partitions: u32) -> Servers {
+    servers_with(name, partitions, json!({})).await
+}
+
+/// [`servers`], with more settings in each one's cluster section.
+async fn servers_with(name: &str, partitions: u32, more: Value) -> Servers {
     let mut listeners = BTreeMap::new();
     for id in 1..=3u64 {
         listeners.insert(
@@ -127,10 +132,15 @@ async fn servers(name: &str, partitions: u32) -> Servers {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        let mut cluster =
+            json!({"id": id, "peers": peers, "secret": "a secret for the test", "tick_ms": 20});
+        for (name, value) in more.as_object().unwrap() {
+            cluster[name] = value.clone();
+        }
         let config: Config = serde_json::from_value(json!({
             "partitions": partitions,
             "objects": ["counter"],
-            "cluster": {"id": id, "peers": peers, "secret": "a secret for the test", "tick_ms": 20}
+            "cluster": cluster
         }))
         .unwrap();
         config.check().unwrap();
@@ -445,4 +455,54 @@ async fn grpc_calls_to_a_follower_are_forwarded_to_the_leader() {
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitions_copy_their_snapshots_to_object_storage() {
+    let objects = std::env::temp_dir().join(format!("aqueduct-snapshots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&objects);
+    let Servers {
+        addrs, stops, dirs, ..
+    } = servers_with(
+        "snapshots",
+        1,
+        json!({"snapshots": {"kind": "dir", "path": objects}, "snapshot_every": 5}),
+    )
+    .await;
+    for i in 0..10 {
+        ask(
+            &addrs,
+            "POST",
+            "/v1/runs",
+            json!({"key": format!("s{i}"), "workflow": "double", "input": i}),
+        )
+        .await;
+    }
+    let store =
+        aqueduct_server::objects::Store::open(&aqueduct_server::objects::StoreConfig::Dir {
+            path: objects.clone(),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let snapshot = loop {
+        if let Some(bytes) = store
+            .get(&aqueduct_server::cluster::snapshot_key(0))
+            .await
+            .unwrap()
+        {
+            break aqueduct_raft::wire::decode_snapshot(&bytes).unwrap();
+        }
+        assert!(Instant::now() < deadline, "no snapshot in the store");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(snapshot.index >= 5, "{snapshot:?}");
+    assert_eq!(snapshot.members, vec![1, 2, 3]);
+    assert!(!snapshot.data.is_empty());
+    for stop in stops.into_values() {
+        let _ = stop.send(());
+    }
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let _ = std::fs::remove_dir_all(&objects);
 }
