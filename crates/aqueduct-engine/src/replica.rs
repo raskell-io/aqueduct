@@ -244,11 +244,22 @@ impl Replica {
     /// One tick of the driver's clock.
     pub fn tick(&mut self) {
         self.raft.tick();
+        self.follow_role();
     }
 
     /// A message from another replica.
     pub fn step(&mut self, from: NodeId, message: Message) {
         self.raft.step(from, message);
+        self.follow_role();
+    }
+
+    /// A leader can step down without anything to persist or send (check quorum, on a tick): its
+    /// partition goes at once, not at the next ready.
+    fn follow_role(&mut self) {
+        if self.raft.role() != Role::Leader || self.raft.term() != self.term {
+            self.lose_leadership();
+            self.term = self.raft.term();
+        }
     }
 
     /// Writes the partition's batch, if it has one: proposes it, and holds what it released until it is
@@ -336,10 +347,7 @@ impl Replica {
     /// Follows the Raft node: builds the partition once a new leader's no-op is committed, releases what
     /// is committed, and drops everything on losing leadership.
     fn after_change(&mut self) -> Result<(), String> {
-        if self.raft.role() != Role::Leader || self.raft.term() != self.term {
-            self.lose_leadership();
-            self.term = self.raft.term();
-        }
+        self.follow_role();
         if self.raft.role() != Role::Leader {
             return Ok(());
         }
@@ -378,6 +386,18 @@ impl Replica {
         self.partition = Some(partition);
         // Recovery may have work to write: dispatches again, successors repaired.
         self.flush()
+    }
+
+    /// On the leader, moves the group one membership change towards `desired` (the metadata store's
+    /// replicas for this partition, ADR 0053): one change at a time, adding before removing.
+    pub fn reconcile(&mut self, desired: &[NodeId]) {
+        if self.raft.role() != Role::Leader || desired.is_empty() {
+            return;
+        }
+        if let Some(change) = crate::metadata::next_change(self.raft.members(), desired) {
+            // Refused while another change is pending or the leader is new: tried again next time.
+            let _ = self.raft.propose_change(change);
+        }
     }
 
     /// Replaces the log up to what is applied with a snapshot of the committed records.

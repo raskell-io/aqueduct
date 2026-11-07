@@ -124,6 +124,9 @@ pub struct Config {
     /// Partitions (ADR 0052), each a Raft group of `replicas` replicas (at least one): more than one runs
     /// the cluster world, with children and messages crossing partitions.
     pub partitions: usize,
+    /// Machines beyond the replicas, which start empty: with any, an operator moves replicas between
+    /// machines during faults, through the metadata store (ADR 0053).
+    pub spares: usize,
 }
 
 impl Default for Config {
@@ -150,6 +153,7 @@ impl Default for Config {
             workload: WorkloadKind::default(),
             replicas: 0,
             partitions: 0,
+            spares: 0,
         }
     }
 }
@@ -208,6 +212,8 @@ pub struct Report {
     pub agent_calls: u64,
     /// Partitions built by new leaders (the replicated world).
     pub failovers: u64,
+    /// Replica moves the operator asked the metadata store for (the cluster world).
+    pub replica_moves: u64,
     /// A fingerprint of the event sequence and the final chain heads. Equal for equal seeds.
     pub trace: u64,
 }
@@ -247,7 +253,7 @@ impl std::error::Error for Failure {}
 
 /// Runs one seed.
 pub fn run_seed(seed: u64, config: &Config) -> Result<Report, Failure> {
-    if config.replicas > 0 || config.partitions > 1 {
+    if config.replicas > 0 || config.partitions > 1 || config.spares > 0 {
         return cluster::run(seed, config);
     }
     world::run(seed, config)

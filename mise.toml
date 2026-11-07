@@ -113,6 +113,8 @@ cargo xtask sim --seeds 3000 --replicas 3
 cargo xtask sim --seeds 1000 --replicas 3 --workload rust
 cargo xtask sim --seeds 500 --replicas 5
 cargo xtask sim --seeds 500 --replicas 3 --partitions 4 --workload fanout
+cargo xtask sim --seeds 300 --replicas 3 --partitions 3 --spares 2 --workload fanout
+cargo xtask sim --seeds 1000 --replicas 3 --spares 2
 cargo xtask raft --seeds 20000
 cargo xtask raft --seeds 5000 --nodes 3
 """

@@ -101,6 +101,7 @@ A record says what was true and decided at its date: later records may change wh
 
 - [0051: The cluster, and Raft of our own](adr/0051-cluster-and-raft.md)
 - [0052: Many partitions, and messages between them](adr/0052-partitions.md)
+- [0053: The metadata store, and moving replicas](adr/0053-metadata-store.md)
 
 ### Observability
 
