@@ -1,36 +1,47 @@
-//! A replicated partition under faults (ADR 0051, step 4): replicas of one partition, each a
-//! [`Replica`] (a Raft node and, on the leader, the partition), with a client starting runs and a worker
-//! running their steps, both talking to whichever replica they reach and retrying.
+//! A cluster under faults (ADR 0051, 0052): partitions, each a Raft group of replicas
+//! ([`Replica`]: a Raft node and, on the leader, the partition), on a few machines. Machine `m` holds
+//! replica `m` of every partition. A client starts runs and a worker runs their steps, both talking to
+//! whichever machine they reach and retrying; partitions send each other children and messages to
+//! objects (ADR 0052).
 //!
-//! Faults: replicas crash (losing everything their driver did not persist) and restart; the network
-//! between them, and to the client and the worker, delays, reorders, drops and duplicates messages,
-//! and splits; clocks pause and run at different rates. Then faults heal, and the cluster must finish
-//! every run.
+//! Faults: machines crash (their replicas lose everything their driver did not persist) and restart; the
+//! network delays, reorders, drops and duplicates messages, and splits the machines; machines pause, and
+//! their clocks run at different rates. Then faults heal, and the cluster must finish every run.
 //!
 //! Checked after every event:
 //!
-//! - every replica's committed records are a prefix of one sequence: replicas never disagree;
-//! - the leader's partition is the fold of its journals.
+//! - in each partition, every replica's committed records are a prefix of one sequence: replicas never
+//!   disagree;
+//! - every leader's partition is the fold of its journals;
+//! - the leader of a partition's newest term holds every acknowledged start and result of its keys.
 //!
 //! And at the end:
 //!
-//! - every acknowledged start is a run, and every acknowledged step result is in its journal, once;
-//! - every run ends as the sequential reference says;
-//! - the leader's partition equals a partition rebuilt from the committed records: nothing it acted on
-//!   is missing from what a majority holds;
-//! - every replica has applied the same records.
+//! - every acknowledged step result is recorded once (or its run ended without it);
+//! - every run ends as the sequential reference says, on the partition of its home;
+//! - every message reached its object exactly once;
+//! - each leader's partition equals one rebuilt from its group's committed records: nothing it acted on is
+//!   missing from what a majority holds;
+//! - every replica of a partition has applied the same records.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aqueduct_core::{CommandIndex, Entry as Journal, Payload, Status, StepOutcome};
+use aqueduct_engine::placement::SlotTable;
 use aqueduct_engine::replica::{Replica, ReplicaPartition, Setup};
-use aqueduct_engine::{Deciders, Outbound, PartitionRun, StartOptions};
+use aqueduct_engine::{Deciders, Outbound, PartitionRun, Remote, StartOptions};
 use aqueduct_raft::{Config as RaftConfig, Entry, Envelope, HardState, NodeId, Snapshot};
 
 use crate::rng::Rng;
 use crate::workflow::{self, Workload};
 use crate::{Config, Failure, Report};
+
+/// A partition's index.
+type Group = u32;
+
+/// A replica: (partition, machine).
+type Actor = (Group, NodeId);
 
 /// What a replica's disk holds: what its Raft node asked to persist.
 #[derive(Clone, Debug, Default)]
@@ -43,12 +54,15 @@ struct Disk {
 #[derive(Clone, Debug)]
 enum Event {
     Tick {
-        replica: NodeId,
+        machine: NodeId,
         incarnation: u64,
     },
-    Raft(Envelope),
+    Raft {
+        group: Group,
+        envelope: Envelope,
+    },
     Restart {
-        replica: NodeId,
+        machine: NodeId,
     },
     Heal,
     /// The client retries what is not acknowledged.
@@ -56,7 +70,7 @@ enum Event {
     /// The worker sends again the results not acknowledged.
     WorkerResend,
     Start {
-        replica: NodeId,
+        machine: NodeId,
         key: String,
         input: Payload,
     },
@@ -64,13 +78,15 @@ enum Event {
         key: String,
     },
     Dispatch {
+        group: Group,
         key: String,
         cmd: CommandIndex,
         name: String,
         input: Payload,
     },
     Result {
-        replica: NodeId,
+        machine: NodeId,
+        group: Group,
         key: String,
         cmd: CommandIndex,
         outcome: StepOutcome,
@@ -78,6 +94,12 @@ enum Event {
     ResultAck {
         key: String,
         cmd: CommandIndex,
+    },
+    /// A message from one partition to another.
+    Remote {
+        machine: NodeId,
+        group: Group,
+        message: Remote,
     },
 }
 
@@ -90,21 +112,25 @@ struct World<'c> {
     queue: BTreeMap<(u64, u64), Event>,
     workload: Workload,
     deciders: Deciders,
-    setup: Setup,
-    ids: Vec<NodeId>,
-    replicas: BTreeMap<NodeId, Replica>,
-    disks: BTreeMap<NodeId, Disk>,
+    table: SlotTable,
+    groups: Vec<Group>,
+    setups: Vec<Setup>,
+    machines: Vec<NodeId>,
+    replicas: BTreeMap<Actor, Replica>,
+    disks: BTreeMap<Actor, Disk>,
     incarnations: BTreeMap<NodeId, u64>,
     tick_ms: BTreeMap<NodeId, u64>,
     ticks: BTreeMap<NodeId, u64>,
     paused_until: BTreeMap<NodeId, u64>,
     sides: Option<BTreeMap<NodeId, bool>>,
-    /// The longest committed record sequence any replica has applied.
-    committed: Vec<Vec<u8>>,
+    /// Per partition: the longest committed record sequence any of its replicas has applied.
+    committed: BTreeMap<Group, Vec<Vec<u8>>>,
     wanted: Vec<(String, Payload)>,
+    /// Messages each object key must receive: (object, key) and how many.
+    sends: BTreeMap<(String, String), usize>,
     acked_starts: BTreeSet<String>,
-    /// Results the worker has, not yet acknowledged.
-    results: BTreeMap<(String, CommandIndex), StepOutcome>,
+    /// Results the worker has, not yet acknowledged, with the partition that dispatched them.
+    results: BTreeMap<(String, CommandIndex), (Group, StepOutcome)>,
     acked_results: BTreeSet<(String, CommandIndex)>,
     executions: BTreeMap<(String, CommandIndex), u64>,
     builds: u64,
@@ -115,23 +141,23 @@ struct World<'c> {
 /// The node that stands for "the client" and "the worker" on the network: on no side of a split.
 const OUTSIDE: NodeId = 0;
 
-/// Runs one replicated world.
+/// Runs one cluster world.
 pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     let fail = |time, message| Failure {
         seed,
         workload: config.workload,
         time,
         message: format!(
-            "{message}\n(a replicated world: add --replicas {})",
-            config.replicas
+            "{message}\n(a cluster world: add --replicas {} --partitions {})",
+            config.replicas,
+            config.partitions.max(1)
         ),
     };
     let workload = Workload::new(config.workload).map_err(|m| fail(0, m))?;
-    if workload.signals || workload.escalations || workload.updates || !workload.others.is_empty() {
+    if workload.signals || workload.escalations || workload.updates {
         return Err(fail(
             0,
-            "the replicated world runs workloads without signals, escalations, updates, children or objects yet"
-                .into(),
+            "the cluster world runs workloads without signals, escalations or updates yet".into(),
         ));
     }
     let mut rng = Rng::new(seed);
@@ -144,29 +170,62 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     deciders
         .activate(crate::node::WORKFLOW, crate::node::VERSION)
         .map_err(|e| fail(0, e.to_string()))?;
-    let setup: Setup = Arc::new(|partition: &mut ReplicaPartition, term: u64| {
-        partition.set_default_retry_policy(crate::node::SIM_RETRY);
-        partition.set_retry_policy("classify", crate::node::SIM_AGENT_RETRY);
-        partition.set_seed(crate::node::SIM_SEED ^ term);
-    });
-    let ids: Vec<NodeId> = (1..=config.replicas.max(1) as u64).collect();
+    for (name, decider) in &workload.others {
+        deciders.insert_version(name.clone(), crate::node::VERSION, Arc::clone(decider));
+        deciders
+            .activate(name, crate::node::VERSION)
+            .map_err(|e| fail(0, e.to_string()))?;
+    }
+    for object in &workload.objects {
+        deciders.insert(
+            aqueduct_engine::objects::loop_workflow(object),
+            Arc::new(aqueduct_engine::objects::ObjectLoop::new(object)),
+        );
+    }
+    let partitions = u32::try_from(config.partitions.max(1)).map_err(|e| fail(0, e.to_string()))?;
+    let table = SlotTable::even(partitions);
+    let groups: Vec<Group> = (0..partitions).collect();
+    let setups: Vec<Setup> = groups
+        .iter()
+        .map(|group| {
+            let placement = table.placement(*group);
+            let setup: Setup = Arc::new(move |partition: &mut ReplicaPartition, term: u64| {
+                partition.set_default_retry_policy(crate::node::SIM_RETRY);
+                partition.set_retry_policy("classify", crate::node::SIM_AGENT_RETRY);
+                partition.set_seed(crate::node::SIM_SEED ^ term);
+                partition.set_placement(placement.clone());
+            });
+            setup
+        })
+        .collect();
+    let machines: Vec<NodeId> = (1..=config.replicas.max(1) as u64).collect();
     let mut replicas = BTreeMap::new();
     let mut tick_ms = BTreeMap::new();
-    for id in &ids {
-        let replica = Replica::new(
-            *id,
-            &ids,
-            RaftConfig::default(),
-            rng.next_u64(),
-            deciders.clone(),
-            setup.clone(),
-        );
-        replicas.insert(*id, replica);
-        tick_ms.insert(*id, 10 + rng.below(6));
+    for machine in &machines {
+        for group in &groups {
+            let replica = Replica::new(
+                *machine,
+                &machines,
+                RaftConfig::default(),
+                rng.next_u64(),
+                deciders.clone(),
+                setups[*group as usize].clone(),
+            );
+            replicas.insert((*group, *machine), replica);
+        }
+        tick_ms.insert(*machine, 10 + rng.below(6));
     }
-    let wanted = (0..config.runs)
+    let wanted: Vec<(String, Payload)> = (0..config.runs)
         .map(|i| (format!("run-{i}"), workload.input(&mut rng)))
         .collect();
+    let mut sends = BTreeMap::new();
+    for (_, input) in &wanted {
+        let (_, sent) = workflow::reference_with_sends(&workload, input).map_err(|m| fail(0, m))?;
+        for target in sent {
+            *sends.entry(target).or_insert(0) += 1;
+        }
+    }
+    let actors: Vec<Actor> = replicas.keys().copied().collect();
     let mut world = World {
         config,
         seed,
@@ -176,17 +235,20 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         queue: BTreeMap::new(),
         workload,
         deciders,
-        setup,
-        disks: ids.iter().map(|id| (*id, Disk::default())).collect(),
-        incarnations: ids.iter().map(|id| (*id, 0)).collect(),
-        ticks: ids.iter().map(|id| (*id, 0)).collect(),
-        ids,
+        table,
+        setups,
+        disks: actors.iter().map(|a| (*a, Disk::default())).collect(),
+        committed: groups.iter().map(|g| (*g, Vec::new())).collect(),
+        groups,
+        incarnations: machines.iter().map(|m| (*m, 0)).collect(),
+        ticks: machines.iter().map(|m| (*m, 0)).collect(),
+        machines,
         replicas,
         tick_ms,
         paused_until: BTreeMap::new(),
         sides: None,
-        committed: Vec::new(),
         wanted,
+        sends,
         acked_starts: BTreeSet::new(),
         results: BTreeMap::new(),
         acked_results: BTreeSet::new(),
@@ -201,6 +263,20 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
     world.run().map_err(|message| fail(world.now, message))
 }
 
+/// The partition a run lives on: an object's calls live with its loop (the simulator's object keys have
+/// no `/`).
+fn group_of(table: &SlotTable, key: &str) -> Group {
+    if let Some(rest) = key.strip_prefix("$call/") {
+        let mut parts = rest.splitn(3, '/');
+        if let (Some(object), Some(object_key)) = (parts.next(), parts.next()) {
+            return table.partition_of(&aqueduct_engine::objects::object_run_key(
+                object, object_key,
+            ));
+        }
+    }
+    table.partition_of(key)
+}
+
 impl World<'_> {
     fn schedule(&mut self, delay: u64, event: Event) {
         self.queue.insert((self.now + delay, self.seq), event);
@@ -208,16 +284,16 @@ impl World<'_> {
     }
 
     fn pick(&mut self) -> NodeId {
-        self.ids[self.rng.below(self.ids.len() as u64) as usize]
+        self.machines[self.rng.below(self.machines.len() as u64) as usize]
     }
 
     fn run(&mut self) -> Result<Report, String> {
-        for id in self.ids.clone() {
-            let delay = self.rng.below(self.tick_ms[&id]);
+        for machine in self.machines.clone() {
+            let delay = self.rng.below(self.tick_ms[&machine]);
             self.schedule(
                 delay,
                 Event::Tick {
-                    replica: id,
+                    machine,
                     incarnation: 0,
                 },
             );
@@ -272,18 +348,26 @@ impl World<'_> {
 
     fn summary(&self) -> String {
         let mut out = String::new();
-        for id in &self.ids {
-            match self.replicas.get(id) {
-                None => out.push_str(&format!("  replica {id}: down\n")),
-                Some(replica) => out.push_str(&format!(
-                    "  replica {id}: {:?} term {} commit {} records {} built {}\n",
-                    replica.raft().role(),
-                    replica.raft().term(),
-                    replica.raft().commit(),
-                    replica.committed().len(),
-                    replica.partition().is_some()
-                )),
+        for group in &self.groups {
+            for machine in &self.machines {
+                match self.replicas.get(&(*group, *machine)) {
+                    None => out.push_str(&format!("  partition {group} replica {machine}: down\n")),
+                    Some(replica) => out.push_str(&format!(
+                        "  partition {group} replica {machine}: {:?} term {} commit {} records {} built {}\n",
+                        replica.raft().role(),
+                        replica.raft().term(),
+                        replica.raft().commit(),
+                        replica.committed().len(),
+                        replica.partition().is_some()
+                    )),
+                }
             }
+        }
+        for ((object, key), count) in &self.sends {
+            out.push_str(&format!(
+                "  {object} {key}: {} of {count} calls done\n",
+                self.calls_done(object, key)
+            ));
         }
         out
     }
@@ -291,43 +375,46 @@ impl World<'_> {
     fn handle(&mut self, event: Event) -> Result<(), String> {
         match event {
             Event::Tick {
-                replica,
+                machine,
                 incarnation,
             } => {
-                if self.incarnations.get(&replica) != Some(&incarnation) {
+                if self.incarnations.get(&machine) != Some(&incarnation) {
                     return Ok(());
                 }
                 let paused = self
                     .paused_until
-                    .get(&replica)
+                    .get(&machine)
                     .is_some_and(|u| *u > self.now);
                 if !paused {
-                    self.housekeeping(replica)?;
+                    for group in self.groups.clone() {
+                        self.housekeeping((group, machine))?;
+                    }
+                    *self.ticks.entry(machine).or_default() += 1;
                 }
-                let delay = self.tick_ms[&replica];
+                let delay = self.tick_ms[&machine];
                 self.schedule(
                     delay,
                     Event::Tick {
-                        replica,
+                        machine,
                         incarnation,
                     },
                 );
             }
-            Event::Raft(envelope) => {
+            Event::Raft { group, envelope } => {
                 let to = envelope.to;
                 if let Some(until) = self.paused_until.get(&to).copied()
                     && until > self.now
                 {
                     let wait = until - self.now;
-                    self.schedule(wait, Event::Raft(envelope));
+                    self.schedule(wait, Event::Raft { group, envelope });
                     return Ok(());
                 }
-                if let Some(replica) = self.replicas.get_mut(&to) {
+                if let Some(replica) = self.replicas.get_mut(&(group, to)) {
                     replica.step(envelope.from, envelope.message);
-                    self.drive(to)?;
+                    self.drive((group, to))?;
                 }
             }
-            Event::Restart { replica } => self.restart(replica)?,
+            Event::Restart { machine } => self.restart(machine)?,
             Event::Heal => self.sides = None,
             Event::ClientRetry => {
                 let missing: Vec<(String, Payload)> = self
@@ -338,12 +425,12 @@ impl World<'_> {
                     .collect();
                 let more = !missing.is_empty();
                 for (key, input) in missing {
-                    let replica = self.pick();
+                    let machine = self.pick();
                     self.send(
                         OUTSIDE,
-                        replica,
+                        machine,
                         Event::Start {
-                            replica,
+                            machine,
                             key,
                             input,
                         },
@@ -355,18 +442,19 @@ impl World<'_> {
                 }
             }
             Event::WorkerResend => {
-                let unacked: Vec<((String, CommandIndex), StepOutcome)> = self
+                let unacked: Vec<((String, CommandIndex), (Group, StepOutcome))> = self
                     .results
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                for ((key, cmd), outcome) in unacked {
-                    let replica = self.pick();
+                for ((key, cmd), (group, outcome)) in unacked {
+                    let machine = self.pick();
                     self.send(
                         OUTSIDE,
-                        replica,
+                        machine,
                         Event::Result {
-                            replica,
+                            machine,
+                            group,
                             key,
                             cmd,
                             outcome,
@@ -377,7 +465,7 @@ impl World<'_> {
                 self.schedule(delay, Event::WorkerResend);
             }
             Event::Start {
-                replica,
+                machine,
                 key,
                 input,
             } => {
@@ -385,20 +473,23 @@ impl World<'_> {
                     budget_tokens: workflow::run_budget(&input),
                     ..StartOptions::default()
                 };
-                if let Some(node) = self.replicas.get_mut(&replica)
+                // The client routes by the slot table; the machine it reaches may not lead.
+                let actor = (self.table.partition_of(&key), machine);
+                if let Some(node) = self.replicas.get_mut(&actor)
                     && let Ok(partition) = node.partition_mut()
                 {
                     partition
                         .start_with(&key, crate::node::WORKFLOW, input, options)
                         .map_err(|e| e.to_string())?;
                     node.flush()?;
-                    self.drive(replica)?;
+                    self.drive(actor)?;
                 }
             }
             Event::StartAck { key } => {
                 self.acked_starts.insert(key);
             }
             Event::Dispatch {
+                group,
                 key,
                 cmd,
                 name,
@@ -408,14 +499,16 @@ impl World<'_> {
                 *self.executions.entry((key.clone(), cmd)).or_default() += 1;
                 let outcome = (self.workload.execute)(&name, &input);
                 if !self.acked_results.contains(&(key.clone(), cmd)) {
-                    self.results.insert((key.clone(), cmd), outcome.clone());
+                    self.results
+                        .insert((key.clone(), cmd), (group, outcome.clone()));
                 }
-                let replica = self.pick();
+                let machine = self.pick();
                 self.send(
                     OUTSIDE,
-                    replica,
+                    machine,
                     Event::Result {
-                        replica,
+                        machine,
+                        group,
                         key,
                         cmd,
                         outcome,
@@ -423,42 +516,52 @@ impl World<'_> {
                 );
             }
             Event::Result {
-                replica,
+                machine,
+                group,
                 key,
                 cmd,
                 outcome,
             } => {
-                if let Some(node) = self.replicas.get_mut(&replica)
+                if let Some(node) = self.replicas.get_mut(&(group, machine))
                     && let Ok(partition) = node.partition_mut()
                 {
                     partition
                         .step_result(&key, cmd, outcome)
                         .map_err(|e| e.to_string())?;
                     node.flush()?;
-                    self.drive(replica)?;
+                    self.drive((group, machine))?;
                 }
             }
             Event::ResultAck { key, cmd } => {
                 self.results.remove(&(key.clone(), cmd));
                 self.acked_results.insert((key, cmd));
             }
+            Event::Remote {
+                machine,
+                group,
+                message,
+            } => {
+                if let Some(node) = self.replicas.get_mut(&(group, machine))
+                    && let Ok(partition) = node.partition_mut()
+                {
+                    partition.receive(message).map_err(|e| e.to_string())?;
+                    node.flush()?;
+                    self.drive((group, machine))?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// A replica's clock ticked: its Raft node ticks, and a leader's partition fires timers and
-    /// re-dispatches what may have been lost.
-    fn housekeeping(&mut self, id: NodeId) -> Result<(), String> {
+    /// A machine's clock ticked: each of its replicas' Raft nodes ticks, and a leader's partition fires
+    /// timers and repeats what may have been lost.
+    fn housekeeping(&mut self, actor: Actor) -> Result<(), String> {
         let now = self.now;
-        let Some(replica) = self.replicas.get_mut(&id) else {
+        let tick = self.ticks.get(&actor.1).copied().unwrap_or(0) + 1;
+        let Some(replica) = self.replicas.get_mut(&actor) else {
             return Ok(());
         };
         replica.tick();
-        let tick = {
-            let count = self.ticks.entry(id).or_default();
-            *count += 1;
-            *count
-        };
         if let Ok(partition) = replica.partition_mut() {
             partition.set_time(now);
             partition.fire_due_timers().map_err(|e| e.to_string())?;
@@ -467,13 +570,14 @@ impl World<'_> {
             }
             replica.flush()?;
         }
-        self.drive(id)
+        self.drive(actor)
     }
 
     /// Does what the replica's readies ask: persists, sends, then delivers what it released.
-    fn drive(&mut self, id: NodeId) -> Result<(), String> {
+    fn drive(&mut self, actor: Actor) -> Result<(), String> {
+        let (group, machine) = actor;
         for _ in 0..10_000 {
-            let Some(replica) = self.replicas.get_mut(&id) else {
+            let Some(replica) = self.replicas.get_mut(&actor) else {
                 return Ok(());
             };
             if !replica.has_ready() {
@@ -481,7 +585,7 @@ impl World<'_> {
             }
             let built_before = replica.partition().is_some();
             let ready = replica.ready()?;
-            let disk = self.disks.entry(id).or_default();
+            let disk = self.disks.entry(actor).or_default();
             if let Some(snapshot) = &ready.raft.snapshot {
                 disk.log.retain(|e| e.index > snapshot.index);
                 disk.snapshot = Some(snapshot.clone());
@@ -495,39 +599,41 @@ impl World<'_> {
             disk.log.extend(ready.raft.entries.iter().cloned());
             for envelope in ready.raft.messages {
                 let (from, to) = (envelope.from, envelope.to);
-                self.send(from, to, Event::Raft(envelope));
+                self.send(from, to, Event::Raft { group, envelope });
             }
             for message in ready.released {
-                self.release(message);
+                self.release(machine, group, message);
             }
-            let replica = self.replicas.get_mut(&id).ok_or("a replica vanished")?;
+            let replica = self.replicas.get_mut(&actor).ok_or("a replica vanished")?;
             replica.advance()?;
             if !built_before && replica.partition().is_some() {
                 self.builds += 1;
             }
             let records = replica.committed().to_vec();
-            self.agree(id, &records)?;
+            self.agree(actor, &records)?;
             if self.rng.chance(50_000)
-                && let Some(replica) = self.replicas.get_mut(&id)
+                && let Some(replica) = self.replicas.get_mut(&actor)
             {
                 // The driver persists the snapshot before the node drops the log it replaces.
                 replica.compact();
                 if let Some(snapshot) = replica.raft().snapshot().cloned() {
-                    let disk = self.disks.entry(id).or_default();
+                    let disk = self.disks.entry(actor).or_default();
                     disk.log.retain(|e| e.index > snapshot.index);
                     disk.snapshot = Some(snapshot);
                 }
             }
         }
         Err(format!(
-            "replica {id} kept asking for more: 10,000 readies for one event"
+            "partition {group} replica {machine} kept asking for more: 10,000 readies for one event"
         ))
     }
 
-    /// A message the leader released, now that what it depends on is committed.
-    fn release(&mut self, message: Outbound) {
+    /// A message a leader released, now that what it depends on is committed.
+    fn release(&mut self, machine: NodeId, group: Group, message: Outbound) {
         match message {
-            Outbound::Started { key } => self.send(OUTSIDE, OUTSIDE, Event::StartAck { key }),
+            Outbound::Started { key } if !key.starts_with('$') => {
+                self.send(OUTSIDE, OUTSIDE, Event::StartAck { key });
+            }
             Outbound::Dispatch {
                 key,
                 cmd,
@@ -538,6 +644,7 @@ impl World<'_> {
                     OUTSIDE,
                     OUTSIDE,
                     Event::Dispatch {
+                        group,
                         key,
                         cmd,
                         name,
@@ -548,24 +655,40 @@ impl World<'_> {
             Outbound::ResultRecorded { key, cmd } | Outbound::AttemptRecorded { key, cmd } => {
                 self.send(OUTSIDE, OUTSIDE, Event::ResultAck { key, cmd });
             }
+            Outbound::Remote { to, message } => {
+                // Routed by the slot table, to whichever machine the network reaches.
+                let target = self.table.partition_of(&to);
+                let to = self.pick();
+                self.send(
+                    machine,
+                    to,
+                    Event::Remote {
+                        machine: to,
+                        group: target,
+                        message,
+                    },
+                );
+            }
             _ => {}
         }
     }
 
-    /// Replicas never disagree on what is committed: each one's records extend, or are extended by,
-    /// the longest any has applied.
-    fn agree(&mut self, id: NodeId, records: &[Vec<u8>]) -> Result<(), String> {
-        let shared = records.len().min(self.committed.len());
-        if records[..shared] != self.committed[..shared] {
+    /// A partition's replicas never disagree on what is committed: each one's records extend, or are
+    /// extended by, the longest any has applied.
+    fn agree(&mut self, actor: Actor, records: &[Vec<u8>]) -> Result<(), String> {
+        let longest = self.committed.entry(actor.0).or_default();
+        let shared = records.len().min(longest.len());
+        if records[..shared] != longest[..shared] {
             let at = (0..shared)
-                .find(|i| records[*i] != self.committed[*i])
+                .find(|i| records[*i] != longest[*i])
                 .unwrap_or(0);
             return Err(format!(
-                "replica {id} committed a different record at position {at} than another replica"
+                "partition {} replica {} committed a different record at position {at} than another replica",
+                actor.0, actor.1
             ));
         }
-        if records.len() > self.committed.len() {
-            self.committed = records.to_vec();
+        if records.len() > longest.len() {
+            *longest = records.to_vec();
         }
         Ok(())
     }
@@ -592,27 +715,29 @@ impl World<'_> {
         self.schedule(delay, event);
     }
 
-    fn restart(&mut self, id: NodeId) -> Result<(), String> {
-        let disk = self.disks[&id].clone();
-        let seed = self.rng.next_u64();
-        let replica = Replica::restart(
-            id,
-            &self.ids,
-            RaftConfig::default(),
-            seed,
-            disk.hard_state,
-            disk.snapshot,
-            disk.log,
-            self.deciders.clone(),
-            self.setup.clone(),
-        )?;
-        self.replicas.insert(id, replica);
-        let incarnation = self.incarnations[&id] + 1;
-        self.incarnations.insert(id, incarnation);
+    fn restart(&mut self, machine: NodeId) -> Result<(), String> {
+        for group in self.groups.clone() {
+            let disk = self.disks[&(group, machine)].clone();
+            let seed = self.rng.next_u64();
+            let replica = Replica::restart(
+                machine,
+                &self.machines,
+                RaftConfig::default(),
+                seed,
+                disk.hard_state,
+                disk.snapshot,
+                disk.log,
+                self.deciders.clone(),
+                self.setups[group as usize].clone(),
+            )?;
+            self.replicas.insert((group, machine), replica);
+        }
+        let incarnation = self.incarnations[&machine] + 1;
+        self.incarnations.insert(machine, incarnation);
         self.schedule(
             1,
             Event::Tick {
-                replica: id,
+                machine,
                 incarnation,
             },
         );
@@ -621,80 +746,111 @@ impl World<'_> {
 
     fn inject(&mut self) {
         if self.rng.chance(self.config.crash_ppm) {
-            let id = self.pick();
-            if self.replicas.remove(&id).is_some() {
+            let machine = self.pick();
+            let mut crashed = false;
+            for group in self.groups.clone() {
+                crashed |= self.replicas.remove(&(group, machine)).is_some();
+            }
+            if crashed {
                 self.report.crashes += 1;
-                let incarnation = self.incarnations[&id] + 1;
-                self.incarnations.insert(id, incarnation);
+                let incarnation = self.incarnations[&machine] + 1;
+                self.incarnations.insert(machine, incarnation);
                 let delay = 20 + self.rng.below(400);
-                self.schedule(delay, Event::Restart { replica: id });
+                self.schedule(delay, Event::Restart { machine });
             }
         }
         if self.sides.is_none() && self.rng.chance(self.config.crash_ppm / 3) {
             let sides = self
-                .ids
+                .machines
                 .iter()
-                .map(|id| (*id, self.rng.below(2) == 0))
+                .map(|m| (*m, self.rng.below(2) == 0))
                 .collect();
             self.sides = Some(sides);
             let delay = 50 + self.rng.below(600);
             self.schedule(delay, Event::Heal);
         }
         if self.rng.chance(self.config.crash_ppm / 3) {
-            let id = self.pick();
+            let machine = self.pick();
             let until = self.now + 30 + self.rng.below(200);
-            self.paused_until.insert(id, until);
+            self.paused_until.insert(machine, until);
         }
     }
 
-    fn leader(&self) -> Option<&Replica> {
-        self.replicas.values().find(|r| r.partition().is_some())
+    /// A partition's leader with its partition built, if it has one now.
+    fn leader(&self, group: Group) -> Option<&Replica> {
+        self.machines
+            .iter()
+            .filter_map(|m| self.replicas.get(&(group, *m)))
+            .find(|r| r.partition().is_some())
+    }
+
+    /// The newest term a partition's replicas know of, persisted or not.
+    fn newest_term(&self, group: Group) -> u64 {
+        self.machines
+            .iter()
+            .flat_map(|m| {
+                let live = self.replicas.get(&(group, *m)).map(|r| r.raft().term());
+                let saved = self.disks.get(&(group, *m)).map(|d| d.hard_state.term);
+                live.into_iter().chain(saved)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     fn check(&self) -> Result<(), String> {
-        for replica in self.replicas.values() {
-            let Some(partition) = replica.partition() else {
-                continue;
-            };
-            partition.check_fold()?;
-            // A deposed leader cut off from the group may not know yet, and holds what it held.
-            // Nor does one whose successor has crashed since: terms persisted count too.
-            let newest = self
-                .replicas
-                .values()
-                .map(|r| r.raft().term())
-                .chain(self.disks.values().map(|d| d.hard_state.term))
-                .max()
-                .unwrap_or(0);
-            if replica.raft().term() < newest {
+        for group in &self.groups {
+            let newest = self.newest_term(*group);
+            for machine in &self.machines {
+                let Some(replica) = self.replicas.get(&(*group, *machine)) else {
+                    continue;
+                };
+                let Some(partition) = replica.partition() else {
+                    continue;
+                };
+                partition.check_fold()?;
+                // A deposed leader cut off from the group may not know yet, and holds what it held;
+                // so may one whose successor has crashed since.
+                if replica.raft().term() < newest {
+                    continue;
+                }
+                self.check_leader(*group, replica.raft().term(), partition)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The leader of a partition's newest term holds everything acknowledged for its keys: a start,
+    /// or a result the worker stopped resending (unless its run ended without it).
+    fn check_leader(
+        &self,
+        group: Group,
+        term: u64,
+        partition: &ReplicaPartition,
+    ) -> Result<(), String> {
+        for key in &self.acked_starts {
+            if group_of(&self.table, key) == group && Self::latest(partition, key).is_none() {
+                return Err(format!(
+                    "the leader of partition {group} in term {term} lost the acknowledged start of {key}"
+                ));
+            }
+        }
+        for (key, cmd) in &self.acked_results {
+            if group_of(&self.table, key) != group {
                 continue;
             }
-            // Whoever leads holds everything acknowledged: a start, or a result the worker stopped
-            // resending (unless its run ended without it).
-            for key in &self.acked_starts {
-                if Self::latest(partition, key).is_none() {
-                    return Err(format!(
-                        "the leader in term {} lost the acknowledged start of {key}",
-                        replica.raft().term()
-                    ));
-                }
-            }
-            for (key, cmd) in &self.acked_results {
-                let index = usize::try_from(cmd.0).map_err(|e| e.to_string())?;
-                let kept = partition.runs().get(key).is_some_and(|run| {
-                    run.state().status().is_terminal()
-                        || run
-                            .state()
-                            .steps()
-                            .get(index)
-                            .is_some_and(|s| s.outcome.is_some())
-                });
-                if !kept {
-                    return Err(format!(
-                        "the leader in term {} lost the acknowledged result of {key:?} command {cmd}",
-                        replica.raft().term()
-                    ));
-                }
+            let index = usize::try_from(cmd.0).map_err(|e| e.to_string())?;
+            let kept = partition.runs().get(key).is_some_and(|run| {
+                run.state().status().is_terminal()
+                    || run
+                        .state()
+                        .steps()
+                        .get(index)
+                        .is_some_and(|s| s.outcome.is_some())
+            });
+            if !kept {
+                return Err(format!(
+                    "the leader of partition {group} in term {term} lost the acknowledged result of {key:?} command {cmd}"
+                ));
             }
         }
         Ok(())
@@ -711,73 +867,121 @@ impl World<'_> {
             .map(|(_, run)| run)
     }
 
+    /// A key's latest run, on the leader of its partition.
+    fn run_of(&self, key: &str) -> Option<&PartitionRun> {
+        let partition = self.leader(group_of(&self.table, key))?.partition()?;
+        Self::latest(partition, key)
+    }
+
+    /// How many calls of an object key's handlers have completed, on its partition's leader.
+    fn calls_done(&self, object: &str, key: &str) -> usize {
+        let home = aqueduct_engine::objects::object_run_key(object, key);
+        let Some(partition) = self
+            .leader(self.table.partition_of(&home))
+            .and_then(|leader| leader.partition())
+        else {
+            return 0;
+        };
+        let prefix = format!("$call/{object}/{key}/");
+        partition
+            .runs()
+            .iter()
+            .filter(|(id, run)| {
+                id.starts_with(&prefix) && run.state().status() == Status::Completed
+            })
+            .count()
+    }
+
     fn done(&self) -> bool {
         if self.acked_starts.len() < self.wanted.len() || !self.results.is_empty() {
             return false;
         }
-        if self.replicas.len() < self.ids.len() {
+        if self.replicas.len() < self.groups.len() * self.machines.len() {
             return false;
         }
-        let Some(leader) = self.leader() else {
-            return false;
-        };
-        let Some(partition) = leader.partition() else {
-            return false;
-        };
-        if partition.needs_flush() {
-            return false;
+        for group in &self.groups {
+            let Some(leader) = self.leader(*group) else {
+                return false;
+            };
+            let Some(partition) = leader.partition() else {
+                return false;
+            };
+            if partition.needs_flush() {
+                return false;
+            }
+            let commit = leader.raft().commit();
+            let last = leader
+                .raft()
+                .log()
+                .last()
+                .map_or(leader.raft().snapshot_index(), |e| e.index);
+            let applied_everywhere = self.machines.iter().all(|m| {
+                self.replicas
+                    .get(&(*group, *m))
+                    .is_some_and(|r| r.committed().len() == leader.committed().len())
+            });
+            if commit != last || !applied_everywhere {
+                return false;
+            }
         }
-        let commit = leader.raft().commit();
-        let last = leader
-            .raft()
-            .log()
-            .last()
-            .map_or(leader.raft().snapshot_index(), |e| e.index);
-        commit == last
-            && self
-                .replicas
-                .values()
-                .all(|r| r.committed().len() == leader.committed().len())
-            && self.wanted.iter().all(|(key, _)| {
-                Self::latest(partition, key).is_some_and(|run| run.state().status().is_terminal())
-            })
+        self.wanted.iter().all(|(key, _)| {
+            self.run_of(key)
+                .is_some_and(|run| run.state().status().is_terminal())
+        }) && self
+            .sends
+            .iter()
+            .all(|((object, key), count)| self.calls_done(object, key) >= *count)
     }
 
     fn final_checks(&mut self) -> Result<(), String> {
-        let leader = self.leader().ok_or("no leader at the end")?;
-        let partition = leader.partition().ok_or("no partition at the end")?;
-        // The leader acted on nothing a majority does not hold.
-        let rebuilt = leader.rebuild()?;
-        if rebuilt.runs().len() != partition.runs().len() {
-            return Err(format!(
-                "the leader holds {} runs, the committed records {}",
-                partition.runs().len(),
-                rebuilt.runs().len()
-            ));
-        }
-        for (key, run) in partition.runs() {
-            let Some(durable) = rebuilt.runs().get(key) else {
-                return Err(format!("run {key} is not in the committed records"));
-            };
-            if durable.journal() != run.journal() {
+        for group in self.groups.clone() {
+            let leader = self
+                .leader(group)
+                .ok_or_else(|| format!("partition {group} has no leader at the end"))?;
+            let partition = leader.partition().ok_or("no partition at the end")?;
+            // The leader acted on nothing a majority does not hold.
+            let rebuilt = leader.rebuild()?;
+            if rebuilt.runs().len() != partition.runs().len() {
                 return Err(format!(
-                    "run {key}: the leader's journal differs from the committed one"
+                    "the leader of partition {group} holds {} runs, the committed records {}",
+                    partition.runs().len(),
+                    rebuilt.runs().len()
                 ));
             }
-        }
-        for key in &self.acked_starts {
-            if Self::latest(partition, key).is_none() {
-                return Err(format!(
-                    "start of {key} was acknowledged, but there is no run"
-                ));
+            for (key, run) in partition.runs() {
+                let Some(durable) = rebuilt.runs().get(key) else {
+                    return Err(format!("run {key} is not in the committed records"));
+                };
+                if durable.journal() != run.journal() {
+                    return Err(format!(
+                        "run {key}: the leader's journal differs from the committed one"
+                    ));
+                }
+                // Every run is where its home is: a shared child too.
+                if group_of(&self.table, key) != group {
+                    return Err(format!(
+                        "run {key:?} is on partition {group}, its home on {}",
+                        group_of(&self.table, key)
+                    ));
+                }
+                let mut seen = BTreeSet::new();
+                for entry in run.journal() {
+                    if let Journal::StepCompleted { cmd, .. } | Journal::StepFailed { cmd, .. } =
+                        entry
+                        && !seen.insert(*cmd)
+                    {
+                        return Err(format!("run {key:?} recorded command {cmd} twice"));
+                    }
+                }
             }
+            self.check_leader(group, leader.raft().term(), partition)?;
         }
-        // An acknowledged result is recorded, once, unless its run ended without it (a race's loser).
-        // A dispatch names the run id: the key with its generation.
+        // An acknowledged result is recorded, unless its run ended without it (a race's loser).
         for (key, cmd) in &self.acked_results {
-            let run = partition
-                .runs()
-                .get(key)
+            let run = self
+                .leader(group_of(&self.table, key))
+                .and_then(|leader| leader.partition())
+                .and_then(|partition| partition.runs().get(key))
                 .ok_or_else(|| format!("lost run {key:?} with acknowledged results"))?;
             let index = usize::try_from(cmd.0).map_err(|e| e.to_string())?;
             let recorded = run
@@ -789,19 +993,20 @@ impl World<'_> {
                 return Err(format!("lost acknowledged result of {key:?} command {cmd}"));
             }
         }
-        for (key, run) in partition.runs() {
-            let mut seen = BTreeSet::new();
-            for entry in run.journal() {
-                if let Journal::StepCompleted { cmd, .. } | Journal::StepFailed { cmd, .. } = entry
-                    && !seen.insert(*cmd)
-                {
-                    return Err(format!("run {key:?} recorded command {cmd} twice"));
-                }
+        // Every message reached its object exactly once.
+        for ((object, key), count) in &self.sends {
+            let done = self.calls_done(object, key);
+            if done != *count {
+                return Err(format!(
+                    "{object} {key} ran {done} calls for {count} messages"
+                ));
             }
         }
         let (mut completed, mut failed) = (0, 0);
         for (key, input) in &self.wanted {
-            let run = Self::latest(partition, key).ok_or_else(|| format!("run {key} missing"))?;
+            let run = self
+                .run_of(key)
+                .ok_or_else(|| format!("run {key} missing"))?;
             let state = run.state();
             if state.status() == Status::Parked {
                 return Err(format!(
@@ -827,6 +1032,7 @@ impl World<'_> {
         }
         self.report.completed = completed;
         self.report.failed = failed;
+        self.report.messages = self.sends.values().sum::<usize>() as u64;
         Ok(())
     }
 }

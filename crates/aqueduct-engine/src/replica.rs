@@ -119,6 +119,18 @@ impl std::fmt::Debug for Replica {
     }
 }
 
+/// Whether a message may only be released once this replica is known to lead: everything but a
+/// dispatch, which is safe to repeat from a stale state.
+fn needs_leadership(message: &Outbound) -> bool {
+    !matches!(
+        message,
+        Outbound::Dispatch { .. }
+            | Outbound::DispatchAgent { .. }
+            | Outbound::Activation { .. }
+            | Outbound::Finished { .. }
+    )
+}
+
 /// Encodes a batch of records as one entry's data.
 fn encode(records: &[Vec<u8>]) -> Vec<u8> {
     let mut data = Vec::new();
@@ -248,7 +260,11 @@ impl Replica {
         let mut released = partition.take_unsynced();
         released.extend(partition.flush().map_err(|e| e.to_string())?);
         let records = partition.log_mut().take_staged();
-        let index = if records.is_empty() {
+        // What a flush releases without records rests on what the partition already holds: a result
+        // no longer needed, a start or a message already there. A deposed leader that does not know it
+        // yet holds an old state, so these wait for an entry of their own to commit, which proves this
+        // replica still leads. Dispatches need no proof: repeating one is harmless.
+        let index = if records.is_empty() && !released.iter().any(needs_leadership) {
             self.raft
                 .log()
                 .last()

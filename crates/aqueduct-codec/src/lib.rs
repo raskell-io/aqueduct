@@ -24,7 +24,10 @@
 
 #![forbid(unsafe_code)]
 
+mod slot;
 mod wire;
+
+pub use slot::{SLOTS, slot};
 
 use aqueduct_core::{CommandIndex, Entry, Payload};
 use sha2::{Digest, Sha256};

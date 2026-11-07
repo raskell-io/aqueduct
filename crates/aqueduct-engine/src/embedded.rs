@@ -1798,7 +1798,8 @@ impl Processor {
                 }
                 Outbound::ResultRecorded { .. }
                 | Outbound::AttemptRecorded { .. }
-                | Outbound::Finished { .. } => {}
+                | Outbound::Finished { .. }
+                | Outbound::Remote { .. } => {}
             }
         }
     }

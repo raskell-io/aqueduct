@@ -14,8 +14,8 @@
 > **Status: single server (phase 3 of the [build brief](BRIEF.md)).** The embedded engine, procedures, agent steps
 > and the version registry are built. So is a server with workers in Rust, Python and TypeScript, deployments,
 > priorities, tokens, TLS, an audit log, namespaces and overload protection: every item of phase 3. Work on a
-> replicated cluster has begun (phase 4, [ADR 0051](docs/adr/0051-cluster-and-raft.md)): its Raft and a replicated partition
-> run in a simulator; the server does not use them yet.
+> replicated cluster has begun (phase 4, [ADR 0051](docs/adr/0051-cluster-and-raft.md)): its Raft, replicated partitions and
+> messages between partitions run in a simulator; the server does not use them yet.
 >
 > You can try it, but do not depend on it yet: the APIs and the history format will still change, and nothing
 > is published on crates.io. See [what is not done](#what-is-not-done), the [docs](docs/README.md) and the
@@ -44,7 +44,7 @@ one journal format and one set of guarantees.
 |---|---|---|---|
 | **Embedded** | the engine, inside your program (`aqueduct` crate) | CLIs, desktop apps, single binary services, tests | built |
 | **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built |
-| **Cluster** | several servers, replicated | production platforms | started: Raft and a replicated partition, simulated |
+| **Cluster** | several servers, replicated | production platforms | started: Raft, replicated partitions and messages between them, simulated |
 
 An embedded directory and a server's are the same format, and
 `aqueduct migrate --from ./data --to https://server` moves one to a running server
@@ -314,6 +314,7 @@ cargo xtask sim --seeds 10000                    # deterministic simulation: cra
 cargo xtask sim --seeds 2000 --workload timers   # workloads: native, starlark, timers, rust, composite
 cargo xtask sim --seed 42 --workload rust        # reproduce one seed exactly
 cargo xtask sim --seeds 5000 --replicas 3       # a partition replicated by Raft, under the same faults
+cargo xtask sim --seeds 500 --replicas 3 --partitions 4 --workload fanout   # partitions sending each other children and messages
 cargo xtask raft --seeds 20000                   # Raft groups: partitions, crashes, clock skew and pauses, lossy networks
 cargo xtask crash --kills 1000                   # SIGKILL a log writer; no acknowledged record may be lost
 cargo xtask crash-engine --kills 200             # SIGKILL the engine mid-run; every acknowledged run must end correctly

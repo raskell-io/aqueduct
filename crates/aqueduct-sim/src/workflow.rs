@@ -195,6 +195,17 @@ def run(input):
     return step("validate", kid + "#" + request["value"])
 "##;
 
+/// The fanout workload: a child of its own, a child shared by every run with the same key, and a
+/// message to an object.
+pub const FANOUT: &str = r##"
+def run(input):
+    kid = call("child", input)
+    which = str(len(input) % 2)
+    shared = call("child", "s" + which, key = "shared-" + which)
+    send("counter", "c" + str(len(input) % 3), "add", 1)
+    return step("validate", kid + "#" + shared)
+"##;
+
 /// The composite workload's child run.
 pub const COMPOSITE_CHILD: &str = "def run(input):\n    return step(\"extract\", input)\n";
 
@@ -347,6 +358,22 @@ impl Workload {
                 ],
                 objects: vec![COUNTER.to_owned()],
             },
+            WorkloadKind::Fanout => Workload {
+                kind,
+                signals: false,
+                escalations: false,
+                decider: compile("fanout.star", FANOUT)?,
+                execute: execute_json,
+                updates: false,
+                others: vec![
+                    ("child".to_owned(), compile("child.star", COMPOSITE_CHILD)?),
+                    (
+                        aqueduct_engine::objects::handler_workflow(COUNTER, "add"),
+                        compile("add.star", COUNTER_ADD)?,
+                    ),
+                ],
+                objects: vec![COUNTER.to_owned()],
+            },
             WorkloadKind::StarlarkPipeline => Workload {
                 kind,
                 signals: false,
@@ -374,7 +401,8 @@ impl Workload {
             WorkloadKind::StarlarkPipeline
             | WorkloadKind::StarlarkTimers
             | WorkloadKind::RustPipeline
-            | WorkloadKind::Composite => {
+            | WorkloadKind::Composite
+            | WorkloadKind::Fanout => {
                 let text: String = (0..len)
                     .map(|_| char::from(b'a' + rng.below(26) as u8))
                     .collect();
