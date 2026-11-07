@@ -107,7 +107,7 @@ fn runs_children_and_messages_spread_over_partitions_and_survive_reopening() {
                     .as_bytes(),
             )
             .unwrap();
-            if state["n"] == Value::from(sent) {
+            if state["n"] == sent {
                 break;
             }
             assert!(state["n"].as_u64().unwrap_or(0) < sent as u64, "{state}");
