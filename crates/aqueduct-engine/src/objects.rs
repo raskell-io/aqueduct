@@ -45,6 +45,17 @@ pub fn object_run_key(object: &str, key: &str) -> String {
     format!("$object/{object}/{key}")
 }
 
+/// Whether an object name and key can be used: neither empty, and neither holding a `/` (beyond a
+/// namespace's `$ns/<namespace>/` before the key), so that a call's run key says which key's it is
+/// (ADR 0052).
+pub fn valid_object_key(object: &str, key: &str) -> bool {
+    let bare = key
+        .strip_prefix("$ns/")
+        .and_then(|scoped| scoped.split_once('/'))
+        .map_or(key, |(_, bare)| bare);
+    !object.is_empty() && !object.contains('/') && !bare.is_empty() && !bare.contains('/')
+}
+
 /// The run key of a call.
 pub fn call_key(object: &str, key: &str, id: &str) -> String {
     format!("$call/{object}/{key}/{id}")

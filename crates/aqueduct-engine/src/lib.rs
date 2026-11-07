@@ -25,6 +25,7 @@ pub mod queue;
 pub mod replay;
 pub mod replica;
 mod schema;
+pub mod shards;
 
 pub use agent::{AgentAttempt, AgentCall, AgentExecutor};
 pub use aqueduct_storage::Durability;
