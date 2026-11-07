@@ -1024,3 +1024,60 @@ fn approvals_are_signed_with_the_approvers_keys() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn archived_histories_are_listed_and_shown_after_they_verify() {
+    use aqueduct_core::Entry;
+    let base = std::env::temp_dir().join(format!("aqueduct-cli-archive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let objects = base.join("objects");
+    std::fs::create_dir_all(objects.join("runs")).unwrap();
+    let run = "$ns/acme/order 7";
+    let entries = vec![
+        Entry::Started {
+            workflow: "orders".into(),
+            input: Payload::new(*b"1"),
+            budget_tokens: None,
+            version: None,
+        },
+        Entry::RunCompleted {
+            output: Payload::new(*b"2"),
+        },
+    ];
+    let key = aqueduct_server::archive::key(run);
+    std::fs::write(
+        objects.join(
+            key.strip_prefix("runs/")
+                .map(|k| std::path::Path::new("runs").join(k))
+                .unwrap(),
+        ),
+        aqueduct_server::archive::encode(run, &entries),
+    )
+    .unwrap();
+    let store = base.join("store.json");
+    std::fs::write(
+        &store,
+        serde_json::json!({"kind": "dir", "path": objects}).to_string(),
+    )
+    .unwrap();
+    let store = store.to_str().unwrap();
+    assert_eq!(
+        cli(&["archive", "list", store]).unwrap(),
+        format!("{run}\n")
+    );
+    assert_eq!(cli(&["archive", "list", store, "$ns/other"]).unwrap(), "");
+    let shown = cli(&["archive", "show", store, run]).unwrap();
+    assert_eq!(shown.lines().count(), 2, "{shown}");
+    assert!(shown.contains("orders"), "{shown}");
+    // A damaged archive is refused, not shown.
+    let path = objects
+        .join("runs")
+        .join(key.strip_prefix("runs/").unwrap());
+    let mut data = std::fs::read(&path).unwrap();
+    let last = data.len() - 1;
+    data[last] ^= 1;
+    std::fs::write(&path, data).unwrap();
+    assert!(cli(&["archive", "show", store, run]).is_err());
+    assert!(cli(&["archive", "show", store, "missing"]).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}

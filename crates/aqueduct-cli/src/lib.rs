@@ -37,6 +37,10 @@ commands:
   journal <dir> <key>                 a run's journal, one entry per line
   verify <dir>                        verify every run's hash chain and print its head
   export <dir> <key>                  a run's journal as JSON Lines (one object per entry)
+  archive list <store.json> [<prefix>]
+                                      runs whose histories a server archived (ADR 0061); the file
+                                      is the store section of the server's archive settings
+  archive show <store.json> <run id>  an archived run's journal, verified against its hash chain
   check <procedure.star>              compile a procedure and report its lints: waits without a
                                       timeout, ignored results; recursion does not compile (ADR 0037)
   replay <dir> <key> <procedure.star> replay a run against a procedure and report divergence
@@ -159,6 +163,14 @@ pub fn run(args: &[String]) -> Result<String, String> {
         Some("journal") => journal(Path::new(arg(1, "data directory")?), arg(2, "run key")?),
         Some("verify") => verify(Path::new(arg(1, "data directory")?)),
         Some("export") => export(Path::new(arg(1, "data directory")?), arg(2, "run key")?),
+        Some("archive") => match args.get(1).map(String::as_str) {
+            Some("list") => archive_list(
+                Path::new(arg(2, "store file")?),
+                args.get(3).map_or("", String::as_str),
+            ),
+            Some("show") => archive_show(Path::new(arg(2, "store file")?), arg(3, "run id")?),
+            _ => Err(format!("archive needs list or show\n\n{USAGE}")),
+        },
         Some("replay") => replay(
             Path::new(arg(1, "data directory")?),
             arg(2, "run key")?,
@@ -1790,6 +1802,79 @@ fn short(payload: &Payload) -> String {
 }
 
 /// Entries the run's logic writes (commands and its end), as opposed to completions from outside.
+/// The object store a file describes: the `"store"` of a server's `"archive"` section.
+fn archive_store(file: &Path) -> Result<aqueduct_server::objects::Store, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let config: aqueduct_server::objects::StoreConfig =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+    aqueduct_server::objects::Store::open(&config)
+}
+
+fn block_on<T>(work: impl std::future::Future<Output = T>) -> Result<T, String> {
+    Ok(tokio::runtime::Runtime::new()
+        .map_err(|e| e.to_string())?
+        .block_on(work))
+}
+
+/// Archived runs: their run ids, decoded from the keys.
+fn archive_list(file: &Path, prefix: &str) -> Result<String, String> {
+    // The store needs a runtime from the start (its HTTP client), so it is opened inside one.
+    let keys = block_on(async {
+        let store = archive_store(file)?;
+        store.list("runs/").await
+    })??;
+    let mut out = String::new();
+    for key in keys {
+        let Some(encoded) = key
+            .strip_prefix("runs/")
+            .and_then(|k| k.strip_suffix(".history"))
+        else {
+            continue;
+        };
+        let run = percent_decode(encoded);
+        if run.starts_with(prefix) {
+            out.push_str(&format!("{}\n", run.replace('\0', "@")));
+        }
+    }
+    Ok(out)
+}
+
+/// An archived run's journal, one entry per line, after its hash chain verified.
+fn archive_show(file: &Path, run: &str) -> Result<String, String> {
+    // A run id after continue-as-new holds a NUL; `@` stands for it on the command line.
+    let run = run.replace('@', "\0");
+    let data = block_on(async {
+        let store = archive_store(file)?;
+        store.get(&aqueduct_server::archive::key(&run)).await
+    })??
+    .ok_or_else(|| format!("no archived history for {run:?}"))?;
+    let entries = aqueduct_server::archive::decode(&run, &data)?;
+    Ok(entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| format!("{i:>4}  {}\n", describe_entry(entry)))
+        .collect())
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match text.get(i + 1..i + 3).filter(|_| bytes[i] == b'%') {
+            Some(hex) if u8::from_str_radix(hex, 16).is_ok() => {
+                out.push(u8::from_str_radix(hex, 16).unwrap_or_default());
+                i += 3;
+            }
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn describe_entry(entry: &Entry) -> String {
     match entry {
         Entry::Started {

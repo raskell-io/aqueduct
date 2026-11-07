@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod audit;
 pub mod auth;
 pub mod cluster;
@@ -23,7 +24,9 @@ mod console;
 mod deployments;
 mod imports;
 mod limits;
+pub mod objects;
 mod push;
+mod sigv4;
 mod tls;
 mod workers;
 mod workflows;
@@ -116,6 +119,9 @@ pub async fn serve_shards(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     push::start(&shards, config).map_err(std::io::Error::other)?;
+    if let Some(archive) = &config.archive {
+        archive::start(Arc::clone(&shards), archive).map_err(std::io::Error::other)?;
+    }
     let connections = tls::Connections {
         places: Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections)),
         header_timeout: Duration::from_millis(config.limits.header_timeout_ms),
