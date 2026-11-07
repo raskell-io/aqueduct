@@ -485,6 +485,9 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
         eprintln!("import: {note}");
     }
     let registry = Registry::open(dir).map_err(|e| e.to_string())?;
+    // The runtime first: in cluster mode, the engine's transport runs on it.
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let entered = runtime.enter();
     // Steps run on step workers and push endpoints (ADR 0038, ADR 0040).
     let builder = aqueduct_engine::embedded::Engine::builder(dir)
         .remote_steps(std::time::Duration::from_secs(30));
@@ -532,7 +535,7 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
             "no tokens in this directory: requests are not authenticated (aqueduct tokens create)"
         );
     }
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    drop(entered);
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(address)
             .await

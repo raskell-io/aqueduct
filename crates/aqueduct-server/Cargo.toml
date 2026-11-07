@@ -17,6 +17,7 @@ workspace = true
 aqueduct-core.workspace = true
 aqueduct-engine.workspace = true
 aqueduct-protocol.workspace = true
+aqueduct-raft.workspace = true
 getrandom = "0.3"
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12", "logging"] }

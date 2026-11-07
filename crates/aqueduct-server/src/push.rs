@@ -46,6 +46,9 @@ pub struct Config {
     /// What the server accepts under load (ADR 0045).
     #[serde(default)]
     pub limits: Limits,
+    /// Cluster mode (ADR 0056): this server is one replica of a Raft group of servers.
+    #[serde(default)]
+    pub cluster: Option<crate::cluster::Cluster>,
 }
 
 /// An HTTP endpoint a queue's steps are pushed to.
@@ -94,6 +97,9 @@ impl Config {
     pub fn check(&self) -> Result<(), String> {
         self.routes()?;
         self.limits.check()?;
+        if let Some(cluster) = &self.cluster {
+            cluster.check()?;
+        }
         for endpoint in &self.push {
             if !(endpoint.url.starts_with("http://") || endpoint.url.starts_with("https://")) {
                 return Err(format!(
@@ -143,17 +149,20 @@ impl Config {
         if let Some(limit) = self.limits.max_running_runs {
             builder = builder.max_running_runs(limit);
         }
+        if let Some(cluster) = &self.cluster {
+            builder = cluster.apply(builder)?;
+        }
         Ok(builder)
     }
 }
 
-type Client = hyper_util::client::legacy::Client<
+pub(crate) type Client = hyper_util::client::legacy::Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     Full<Bytes>,
 >;
 
 /// An HTTP(S) client: rustls on ring, with the operating system's root certificates (ADR 0038).
-fn client() -> Result<Client, String> {
+pub(crate) fn client() -> Result<Client, String> {
     use hyper_rustls::ConfigBuilderExt;
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
