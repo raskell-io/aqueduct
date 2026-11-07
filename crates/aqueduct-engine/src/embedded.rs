@@ -253,7 +253,15 @@ pub struct Builder {
     namespace_running: BTreeMap<String, usize>,
     weights: BTreeMap<String, f64>,
     replication: Option<Replication>,
+    placement: Option<crate::placement::Placement>,
+    route: Option<RemoteRoute>,
+    shared_queue: Option<Arc<crate::queue::StepQueue>>,
+    shared_activations: Option<Arc<crate::activations::ActivationQueue>>,
 }
+
+/// Where an engine sends messages for other partitions (ADR 0052): the home they are for, and the
+/// message. See [`Builder::partition_of`].
+pub type RemoteRoute = Arc<dyn Fn(String, crate::Remote) + Send + Sync>;
 
 /// How a replicated engine takes part in its partition's Raft group (ADR 0055).
 #[derive(Clone)]
@@ -288,6 +296,35 @@ enum Opened {
 }
 
 impl Builder {
+    /// Makes the engine one partition of many (ADR 0052): `placement` says which homes are its own, and
+    /// messages for the others (children with chosen keys, messages to objects) go to `route`, which
+    /// must hand them to the partition they are for ([`Engine::receive`]). See [`crate::shards`].
+    pub fn partition_of(
+        mut self,
+        placement: crate::placement::Placement,
+        route: RemoteRoute,
+    ) -> Self {
+        self.placement = Some(placement);
+        self.route = Some(route);
+        self
+    }
+
+    /// Hands remote steps to this queue rather than one of the engine's own: several partitions in a
+    /// process share one, so that workers poll one queue. Implies remote steps.
+    pub fn shared_step_queue(mut self, queue: Arc<crate::queue::StepQueue>) -> Self {
+        self.shared_queue = Some(queue);
+        self
+    }
+
+    /// The same, for remote workflows' activations.
+    pub fn shared_activation_queue(
+        mut self,
+        queue: Arc<crate::activations::ActivationQueue>,
+    ) -> Self {
+        self.shared_activations = Some(queue);
+        self
+    }
+
     /// Runs the partition as a replica of a Raft group (ADR 0055): its log is the group's, kept in
     /// `raft/` under the data directory, and it takes requests only while it leads. Imports are refused.
     pub fn replicated(mut self, replication: Replication) -> Self {
@@ -503,7 +540,11 @@ impl Builder {
         let default_retry = self.default_retry;
         let policies = self.retry_policies.clone();
         let observer = self.observer.clone();
+        let placement = self.placement.clone();
         let setup: crate::replica::Setup = Arc::new(move |partition, _term| {
+            if let Some(placement) = &placement {
+                partition.set_placement(Arc::clone(placement));
+            }
             partition.set_default_retry_policy(default_retry);
             for (step, policy) in &policies {
                 partition.set_retry_policy(step, *policy);
@@ -565,6 +606,9 @@ impl Builder {
                 // Before any run acts: an import is applied whole (ADR 0047).
                 let import = crate::import::apply_pending(&mut partition, &self.dir)
                     .map_err(EngineError::Open)?;
+                if let Some(placement) = &self.placement {
+                    partition.set_placement(Arc::clone(placement));
+                }
                 partition
                     .resume()
                     .map_err(|e| EngineError::Open(e.to_string()))?;
@@ -594,12 +638,15 @@ impl Builder {
         let local: std::collections::BTreeSet<String> = self.steps.keys().cloned().collect();
         let routes = std::mem::take(&mut self.routes);
         let weights = std::mem::take(&mut self.weights);
-        let queue = self.remote.map(|lease| {
-            Arc::new(crate::queue::StepQueue::with_routes(lease, routes).with_weights(weights))
+        let queue = self.shared_queue.take().or_else(|| {
+            self.remote.map(|lease| {
+                Arc::new(crate::queue::StepQueue::with_routes(lease, routes).with_weights(weights))
+            })
         });
-        let activation_queue = self
-            .remote_workflows
-            .map(|lease| Arc::new(crate::activations::ActivationQueue::new(lease)));
+        let activation_queue = self.shared_activations.take().or_else(|| {
+            self.remote_workflows
+                .map(|lease| Arc::new(crate::activations::ActivationQueue::new(lease)))
+        });
         let steps = Arc::new(self.steps);
         let workers = (0..self.workers)
             .map(|_| {
@@ -627,6 +674,7 @@ impl Builder {
                 let processor = Processor {
                     host: $host,
                     gated: VecDeque::new(),
+                    route: self.route.clone(),
                     leading: Arc::clone(&leading),
                     jobs,
                     waiters: BTreeMap::new(),
@@ -824,6 +872,10 @@ impl Engine {
             namespace_running: BTreeMap::new(),
             weights: BTreeMap::new(),
             replication: None,
+            placement: None,
+            route: None,
+            shared_queue: None,
+            shared_activations: None,
         }
     }
 
@@ -1114,6 +1166,12 @@ impl Engine {
         EngineError::Stopped("the partition thread is no longer running".into())
     }
 
+    /// A message from another partition (ADR 0052): a child to start or its result, a message to an
+    /// object or its delivery. Repeats are harmless.
+    pub fn receive(&self, message: crate::Remote) {
+        let _ = self.requests.send(Request::Remote(message));
+    }
+
     /// A Raft message for this replica, from another (a replicated engine, ADR 0055).
     pub fn raft_message(&self, envelope: aqueduct_raft::Envelope) {
         let _ = self.requests.send(Request::Raft(envelope));
@@ -1152,6 +1210,12 @@ impl RaftInbox {
     /// Delivers a message; dropped if the engine has stopped, as the network may drop it.
     pub fn deliver(&self, envelope: aqueduct_raft::Envelope) {
         let _ = self.0.send(Request::Raft(envelope));
+    }
+
+    /// Delivers a message from another partition (ADR 0052); dropped if the engine has stopped or does
+    /// not lead its partition: its sender repeats it.
+    pub fn deliver_remote(&self, message: crate::Remote) {
+        let _ = self.0.send(Request::Remote(message));
     }
 }
 
@@ -1271,6 +1335,8 @@ enum Request {
     },
     /// A Raft message from another replica (ADR 0055).
     Raft(aqueduct_raft::Envelope),
+    /// A message from another partition (ADR 0052).
+    Remote(crate::Remote),
     Shutdown,
 }
 
@@ -1482,6 +1548,8 @@ struct Processor<H: Host> {
     host: H,
     /// Replies waiting for an index to commit (a replicated host), oldest first.
     gated: VecDeque<(u64, Vec<Reply>)>,
+    /// Where messages for other partitions go.
+    route: Option<RemoteRoute>,
     /// Whether this engine leads its partition, and who does if not: for callers turned away.
     leading: Arc<Mutex<(bool, Option<u64>)>>,
     jobs: Sender<Job>,
@@ -1897,6 +1965,9 @@ impl<H: Host> Processor<H> {
                     log_lsn: self.part()?.log().next_lsn(),
                 });
             }
+            Request::Remote(message) => {
+                self.part()?.receive(message).map_err(|e| e.to_string())?;
+            }
             Request::Shutdown | Request::Raft(_) => return Ok(false),
         }
         // Only non-empty under the injected acknowledge-before-sync bug.
@@ -2237,8 +2308,12 @@ impl<H: Host> Processor<H> {
                 }
                 Outbound::ResultRecorded { .. }
                 | Outbound::AttemptRecorded { .. }
-                | Outbound::Finished { .. }
-                | Outbound::Remote { .. } => {}
+                | Outbound::Finished { .. } => {}
+                Outbound::Remote { to, message } => {
+                    if let Some(route) = &self.route {
+                        route(to, message);
+                    }
+                }
             }
         }
     }

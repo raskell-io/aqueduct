@@ -105,6 +105,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0054: Raft on disk and on the wire](adr/0054-raft-storage-and-wire.md)
 - [0055: The engine on a replicated partition](adr/0055-engine-on-raft.md)
 - [0056: The server in a cluster](adr/0056-cluster-server.md)
+- [0057: Many partitions in one process](adr/0057-partitions-in-a-process.md)
 
 ### Observability
 

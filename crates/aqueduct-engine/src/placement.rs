@@ -8,21 +8,41 @@ use aqueduct_core::split_run_id;
 pub type Placement = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// The home of a run key or run id: where it lives. A key up to its first `#`, so a run's derived children
-/// and awakeables live with it; an object's loop and its calls at the loop's key.
+/// and awakeables live with it. An object key's loop and its calls live at `<object>/<key>`: object names
+/// and keys hold no `/` ([`crate::objects::valid_object_key`]), so a call's run key says whose it is.
 ///
 /// ```
 /// use aqueduct_engine::placement::home;
 /// assert_eq!(home("orders:7"), "orders:7");
 /// assert_eq!(home("orders:7#3#1"), "orders:7");
 /// assert_eq!(home("orders:7\u{0}2"), "orders:7");
-/// assert_eq!(home("$object/cart/a#b"), "$object/cart/a#b");
+/// assert_eq!(home("$object/cart/a#b"), "cart/a#b");
+/// assert_eq!(home("$call/cart/a#b/run-1#4"), "cart/a#b");
+/// assert_eq!(home("$object/cart/$ns/acme/a"), "cart/$ns/acme/a");
+/// assert_eq!(home("$call/cart/$ns/acme/a/$ns/acme/r#2\u{0}1"), "cart/$ns/acme/a");
 /// ```
 pub fn home(key: &str) -> &str {
     let key = split_run_id(key).0;
-    if key.starts_with("$object/") || key.starts_with("$call/") {
-        return key;
+    if let Some(object) = key.strip_prefix("$object/") {
+        return object;
+    }
+    if let Some(call) = key.strip_prefix("$call/") {
+        return loop_of_call(call).unwrap_or(call);
     }
     key.split_once('#').map_or(key, |(home, _)| home)
+}
+
+/// `<object>/<key>` of a call's `<object>/<key>/<id>`, where the key may be `$ns/<namespace>/<key>`.
+fn loop_of_call(call: &str) -> Option<&str> {
+    let object = call.find('/')?;
+    let rest = &call[object + 1..];
+    let skip = if let Some(scoped) = rest.strip_prefix("$ns/") {
+        "$ns/".len() + scoped.find('/')? + 1
+    } else {
+        0
+    };
+    let key = skip + rest[skip..].find('/')?;
+    Some(&call[..object + 1 + key])
 }
 
 /// Which partition each slot belongs to.

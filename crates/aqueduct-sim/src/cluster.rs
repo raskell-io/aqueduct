@@ -319,17 +319,8 @@ fn bootstrap(machine: NodeId, initial: &[NodeId]) -> Vec<NodeId> {
     }
 }
 
-/// The partition a run lives on: an object's calls live with its loop (the simulator's object keys have
-/// no `/`).
+/// The partition a run lives on: an object's calls live with its loop (ADR 0052).
 fn group_of(table: &SlotTable, key: &str) -> Group {
-    if let Some(rest) = key.strip_prefix("$call/") {
-        let mut parts = rest.splitn(3, '/');
-        if let (Some(object), Some(object_key)) = (parts.next(), parts.next()) {
-            return table.partition_of(&aqueduct_engine::objects::object_run_key(
-                object, object_key,
-            ));
-        }
-    }
     table.partition_of(key)
 }
 
