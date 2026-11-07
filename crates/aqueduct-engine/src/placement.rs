@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use aqueduct_core::split_run_id;
 
+pub use aqueduct_codec::SLOTS;
+
 /// Tells a partition whether a home is its own.
 pub type Placement = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 

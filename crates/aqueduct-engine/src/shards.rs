@@ -22,7 +22,7 @@ use crate::{Remote, StartOptions};
 /// One engine per partition.
 pub struct Shards {
     table: SlotTable,
-    engines: Vec<Engine>,
+    engines: Vec<Arc<Engine>>,
 }
 
 impl std::fmt::Debug for Shards {
@@ -35,20 +35,22 @@ impl std::fmt::Debug for Shards {
 
 impl Shards {
     /// One partition: the engine as it is.
-    pub fn single(engine: Engine) -> Shards {
+    pub fn single(engine: impl Into<Arc<Engine>>) -> Shards {
         Shards {
             table: SlotTable::even(1),
-            engines: vec![engine],
+            engines: vec![engine.into()],
         }
     }
 
     /// Opens `partitions` partitions, each in `dir/partitions/<index>` with the builder `build` gives
     /// for that directory and index; one partition is opened in `dir` itself. Messages between
-    /// partitions are handed over in this process.
+    /// partitions are handed over in this process. The first partition's step and activation queues are
+    /// every partition's. A directory laid out for another number of partitions is refused: moving
+    /// runs between partitions is not supported yet.
     pub fn open(
         dir: &Path,
         partitions: u32,
-        build: impl FnMut(PathBuf, u32) -> Builder,
+        build: impl FnMut(PathBuf, u32) -> Result<Builder, EngineError>,
     ) -> Result<Shards, EngineError> {
         Shards::open_routed(dir, partitions, build, |_| None)
     }
@@ -59,11 +61,12 @@ impl Shards {
     pub fn open_routed(
         dir: &Path,
         partitions: u32,
-        mut build: impl FnMut(PathBuf, u32) -> Builder,
+        mut build: impl FnMut(PathBuf, u32) -> Result<Builder, EngineError>,
         route: impl Fn(u32) -> Option<RemoteRoute>,
     ) -> Result<Shards, EngineError> {
+        check_layout(dir, partitions)?;
         if partitions <= 1 {
-            return Ok(Shards::single(build(dir.to_path_buf(), 0).open()?));
+            return Ok(Shards::single(build(dir.to_path_buf(), 0)?.open()?));
         }
         let table = SlotTable::even(partitions);
         let inboxes: Arc<RwLock<Vec<RaftInbox>>> = Arc::default();
@@ -87,15 +90,34 @@ impl Shards {
         let mut engines = Vec::new();
         for partition in 0..partitions {
             let path = dir.join("partitions").join(partition.to_string());
-            let engine = build(path, partition)
-                .partition_of(table.placement(partition), Arc::clone(&deliver))
-                .open()?;
+            let mut builder = build(path, partition)?
+                .partition_of(table.placement(partition), Arc::clone(&deliver));
+            if let Some(first) = engines.first() {
+                let first: &Arc<Engine> = first;
+                if let Some(queue) = first.step_queue() {
+                    builder = builder.shared_step_queue(Arc::clone(queue));
+                }
+                if let Some(queue) = first.activation_queue() {
+                    builder = builder.shared_activation_queue(Arc::clone(queue));
+                }
+            }
+            let engine = builder.open()?;
             if let Ok(mut inboxes) = inboxes.write() {
                 inboxes.push(engine.raft_inbox());
             }
-            engines.push(engine);
+            engines.push(Arc::new(engine));
         }
         Ok(Shards { table, engines })
+    }
+
+    /// How many partitions there are.
+    pub fn len(&self) -> usize {
+        self.engines.len()
+    }
+
+    /// Whether there are none: never, once opened.
+    pub fn is_empty(&self) -> bool {
+        self.engines.is_empty()
     }
 
     /// The slot table.
@@ -104,19 +126,19 @@ impl Shards {
     }
 
     /// The engines, by partition.
-    pub fn engines(&self) -> &[Engine] {
+    pub fn engines(&self) -> &[Arc<Engine>] {
         &self.engines
     }
 
     /// The engine of the partition a key, run id, awakeable or escalation id lives on.
-    pub fn engine_for(&self, key: &str) -> &Engine {
+    pub fn engine_for(&self, key: &str) -> &Arc<Engine> {
         let partition = self.table.partition_of(home(key)) as usize;
         &self.engines[partition.min(self.engines.len() - 1)]
     }
 
     fn all<T>(
         &self,
-        each: impl Fn(&Engine) -> Result<Vec<T>, EngineError>,
+        each: impl Fn(&Arc<Engine>) -> Result<Vec<T>, EngineError>,
     ) -> Result<Vec<T>, EngineError> {
         let mut out = Vec::new();
         for engine in &self.engines {
@@ -182,7 +204,7 @@ impl Shards {
 
     /// Every partition's runs.
     pub fn runs(&self) -> Result<Vec<RunSummary>, EngineError> {
-        self.all(Engine::runs)
+        self.all(|engine| engine.runs())
     }
 
     /// See [`Engine::call_object`].
@@ -212,7 +234,7 @@ impl Shards {
 
     /// Every partition's open escalations.
     pub fn escalations(&self) -> Result<Vec<Escalation>, EngineError> {
-        self.all(Engine::escalations)
+        self.all(|engine| engine.escalations())
     }
 
     /// See [`Engine::resolve_escalation`].
@@ -306,4 +328,28 @@ impl Shards {
         }
         Ok(total)
     }
+}
+
+/// Refuses a data directory laid out for another number of partitions.
+fn check_layout(dir: &Path, partitions: u32) -> Result<(), EngineError> {
+    let refuse = |why: String| Err(EngineError::Open(format!("{}: {why}", dir.display())));
+    let split = dir.join("partitions");
+    let existing = std::fs::read_dir(&split)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    if partitions <= 1 {
+        if existing > 0 {
+            return refuse(format!("it holds {existing} partitions, not one"));
+        }
+        return Ok(());
+    }
+    if dir.join("log").exists() {
+        return refuse(
+            "it holds one partition; moving its runs into several is not supported".into(),
+        );
+    }
+    if existing > 0 && existing != partitions as usize {
+        return refuse(format!("it holds {existing} partitions, not {partitions}"));
+    }
+    Ok(())
 }
