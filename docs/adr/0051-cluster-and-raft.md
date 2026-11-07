@@ -77,6 +77,8 @@ Raft node it pairs:
   answered from an old state: a newer leader may have dispatched the command it does not know. Such
   answers wait for an empty entry of their own to commit, which proves the replica still leads.
   Dispatches need no proof. Found by the simulator with several partitions (ADR 0052).
+- **A leader can step down on a tick** (check quorum) with nothing to persist or send: its partition is
+  dropped at once, not at its next ready. Found by the simulator moving replicas (ADR 0053).
 
 `cargo xtask sim --replicas 3` runs the simulator's workloads on such a group, with crashes, restarts from what each
 replica persisted, network splits, pauses, clock skew, and lost, duplicated and reordered messages. After every

@@ -14,6 +14,7 @@ pub mod deployments;
 pub mod drift;
 pub mod embedded;
 pub mod import;
+pub mod metadata;
 pub mod metrics;
 pub mod namespaces;
 pub mod objects;

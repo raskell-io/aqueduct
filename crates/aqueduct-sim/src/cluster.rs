@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aqueduct_core::{CommandIndex, Entry as Journal, Payload, Status, StepOutcome};
+use aqueduct_engine::metadata::{Command, Metadata, MetadataNode};
 use aqueduct_engine::placement::SlotTable;
 use aqueduct_engine::replica::{Replica, ReplicaPartition, Setup};
 use aqueduct_engine::{Deciders, Outbound, PartitionRun, Remote, StartOptions};
@@ -42,6 +43,9 @@ type Group = u32;
 
 /// A replica: (partition, machine).
 type Actor = (Group, NodeId);
+
+/// The metadata store's group, in [`Event::Raft`].
+const META: Group = Group::MAX;
 
 /// What a replica's disk holds: what its Raft node asked to persist.
 #[derive(Clone, Debug, Default)]
@@ -101,6 +105,13 @@ enum Event {
         group: Group,
         message: Remote,
     },
+    /// The operator moves a partition's replica to another machine (ADR 0053).
+    Operator,
+    /// A machine learns the metadata, as the store's leader pushes it to watchers.
+    Watch {
+        machine: NodeId,
+        data: Vec<u8>,
+    },
 }
 
 struct World<'c> {
@@ -123,6 +134,14 @@ struct World<'c> {
     ticks: BTreeMap<NodeId, u64>,
     paused_until: BTreeMap<NodeId, u64>,
     sides: Option<BTreeMap<NodeId, bool>>,
+    /// The machines each partition starts on, and the metadata store's.
+    initial: Vec<NodeId>,
+    meta: BTreeMap<NodeId, MetadataNode>,
+    meta_disks: BTreeMap<NodeId, Disk>,
+    /// The metadata as it started.
+    created: Metadata,
+    /// The newest metadata each machine has seen.
+    known: BTreeMap<NodeId, Metadata>,
     /// Per partition: the longest committed record sequence any of its replicas has applied.
     committed: BTreeMap<Group, Vec<Vec<u8>>>,
     wanted: Vec<(String, Payload)>,
@@ -148,9 +167,10 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         workload: config.workload,
         time,
         message: format!(
-            "{message}\n(a cluster world: add --replicas {} --partitions {})",
+            "{message}\n(a cluster world: add --replicas {} --partitions {} --spares {})",
             config.replicas,
-            config.partitions.max(1)
+            config.partitions.max(1),
+            config.spares
         ),
     };
     let workload = Workload::new(config.workload).map_err(|m| fail(0, m))?;
@@ -198,14 +218,28 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
             setup
         })
         .collect();
-    let machines: Vec<NodeId> = (1..=config.replicas.max(1) as u64).collect();
+    // Spare machines start with no replicas; the operator moves replicas onto them.
+    let initial: Vec<NodeId> = (1..=config.replicas.max(1) as u64).collect();
+    let machines: Vec<NodeId> = (1..=(config.replicas.max(1) + config.spares) as u64).collect();
+    let created = Metadata::new(partitions, &initial);
+    let mut meta = BTreeMap::new();
+    for machine in &initial {
+        let node = MetadataNode::new(
+            *machine,
+            &initial,
+            RaftConfig::default(),
+            rng.next_u64(),
+            created.clone(),
+        );
+        meta.insert(*machine, node);
+    }
     let mut replicas = BTreeMap::new();
     let mut tick_ms = BTreeMap::new();
     for machine in &machines {
         for group in &groups {
             let replica = Replica::new(
                 *machine,
-                &machines,
+                &bootstrap(*machine, &initial),
                 RaftConfig::default(),
                 rng.next_u64(),
                 deciders.clone(),
@@ -247,6 +281,11 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         tick_ms,
         paused_until: BTreeMap::new(),
         sides: None,
+        meta_disks: meta.keys().map(|m| (*m, Disk::default())).collect(),
+        meta,
+        known: BTreeMap::new(),
+        created,
+        initial,
         wanted,
         sends,
         acked_starts: BTreeSet::new(),
@@ -261,6 +300,16 @@ pub(crate) fn run(seed: u64, config: &Config) -> Result<Report, Failure> {
         },
     };
     world.run().map_err(|message| fail(world.now, message))
+}
+
+/// What a replica starts with: the initial group if it is in it, otherwise nothing, until a leader's
+/// log adds it.
+fn bootstrap(machine: NodeId, initial: &[NodeId]) -> Vec<NodeId> {
+    if initial.contains(&machine) {
+        initial.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 /// The partition a run lives on: an object's calls live with its loop (the simulator's object keys have
@@ -300,6 +349,9 @@ impl World<'_> {
         }
         self.schedule(1, Event::ClientRetry);
         self.schedule(1, Event::WorkerResend);
+        if self.config.spares > 0 {
+            self.schedule(200, Event::Operator);
+        }
         loop {
             let Some(((time, _), event)) = self.queue.pop_first() else {
                 return Err("the event queue ran dry".into());
@@ -386,6 +438,7 @@ impl World<'_> {
                     .get(&machine)
                     .is_some_and(|u| *u > self.now);
                 if !paused {
+                    self.meta_housekeeping(machine)?;
                     for group in self.groups.clone() {
                         self.housekeeping((group, machine))?;
                     }
@@ -399,6 +452,20 @@ impl World<'_> {
                         incarnation,
                     },
                 );
+            }
+            Event::Raft { group, envelope } if group == META => {
+                let to = envelope.to;
+                if let Some(until) = self.paused_until.get(&to).copied()
+                    && until > self.now
+                {
+                    let wait = until - self.now;
+                    self.schedule(wait, Event::Raft { group, envelope });
+                    return Ok(());
+                }
+                if let Some(node) = self.meta.get_mut(&to) {
+                    node.step(envelope.from, envelope.message);
+                    self.drive_meta(to)?;
+                }
             }
             Event::Raft { group, envelope } => {
                 let to = envelope.to;
@@ -536,6 +603,25 @@ impl World<'_> {
                 self.results.remove(&(key.clone(), cmd));
                 self.acked_results.insert((key, cmd));
             }
+            Event::Operator => {
+                if self.faults {
+                    self.operate()?;
+                    let delay = 150 + self.rng.below(400);
+                    self.schedule(delay, Event::Operator);
+                }
+            }
+            Event::Watch { machine, data } => {
+                if self.replicas.keys().any(|(_, m)| *m == machine) {
+                    let seen = Metadata::decode(&data)?;
+                    let newer = self
+                        .known
+                        .get(&machine)
+                        .is_none_or(|known| known.epoch() < seen.epoch());
+                    if newer {
+                        self.known.insert(machine, seen);
+                    }
+                }
+            }
             Event::Remote {
                 machine,
                 group,
@@ -562,6 +648,12 @@ impl World<'_> {
             return Ok(());
         };
         replica.tick();
+        // A leader moves its group towards where the metadata it has seen says it should be.
+        if tick % 8 == 4
+            && let Some(known) = self.known.get(&actor.1)
+        {
+            replica.reconcile(known.replicas(actor.0));
+        }
         if let Ok(partition) = replica.partition_mut() {
             partition.set_time(now);
             partition.fire_due_timers().map_err(|e| e.to_string())?;
@@ -626,6 +718,119 @@ impl World<'_> {
         Err(format!(
             "partition {group} replica {machine} kept asking for more: 10,000 readies for one event"
         ))
+    }
+
+    /// The metadata store's node on a machine ticks; its leader pushes the metadata to every machine.
+    fn meta_housekeeping(&mut self, machine: NodeId) -> Result<(), String> {
+        let tick = self.ticks.get(&machine).copied().unwrap_or(0) + 1;
+        let Some(node) = self.meta.get_mut(&machine) else {
+            return Ok(());
+        };
+        node.tick();
+        let leads = node.raft().role() == aqueduct_raft::Role::Leader;
+        let data = node.state().encode();
+        self.drive_meta(machine)?;
+        if leads && tick % 8 == 0 {
+            for to in self.machines.clone() {
+                self.send(
+                    machine,
+                    to,
+                    Event::Watch {
+                        machine: to,
+                        data: data.clone(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Does what a metadata node's readies ask, as for a replica.
+    fn drive_meta(&mut self, machine: NodeId) -> Result<(), String> {
+        for _ in 0..10_000 {
+            let Some(node) = self.meta.get_mut(&machine) else {
+                return Ok(());
+            };
+            if !node.has_ready() {
+                return Ok(());
+            }
+            let ready = node.ready()?;
+            let disk = self.meta_disks.entry(machine).or_default();
+            if let Some(snapshot) = &ready.snapshot {
+                disk.log.retain(|e| e.index > snapshot.index);
+                disk.snapshot = Some(snapshot.clone());
+            }
+            if let Some(hard_state) = ready.hard_state {
+                disk.hard_state = hard_state;
+            }
+            if let Some(from) = ready.truncate_from {
+                disk.log.retain(|e| e.index < from);
+            }
+            disk.log.extend(ready.entries.iter().cloned());
+            for envelope in ready.messages {
+                let (from, to) = (envelope.from, envelope.to);
+                self.send(
+                    from,
+                    to,
+                    Event::Raft {
+                        group: META,
+                        envelope,
+                    },
+                );
+            }
+            let node = self
+                .meta
+                .get_mut(&machine)
+                .ok_or("a metadata node vanished")?;
+            node.advance();
+            if self.rng.chance(50_000) {
+                node.compact();
+                if let Some(snapshot) = node.raft().snapshot().cloned() {
+                    let disk = self.meta_disks.entry(machine).or_default();
+                    disk.log.retain(|e| e.index > snapshot.index);
+                    disk.snapshot = Some(snapshot);
+                }
+            }
+        }
+        Err(format!(
+            "the metadata node on machine {machine} kept asking for more"
+        ))
+    }
+
+    /// The metadata store's leader, if there is one up.
+    fn meta_leader(&self) -> Option<&MetadataNode> {
+        self.meta
+            .values()
+            .find(|n| n.raft().role() == aqueduct_raft::Role::Leader)
+    }
+
+    /// The operator moves one replica of a partition to a machine that has none.
+    fn operate(&mut self) -> Result<(), String> {
+        let Some(leader) = self.meta_leader().map(|n| n.raft().id()) else {
+            return Ok(());
+        };
+        let group = self.groups[self.rng.below(self.groups.len() as u64) as usize];
+        let desired = self.meta[&leader].state().replicas(group).to_vec();
+        let free: Vec<NodeId> = self
+            .machines
+            .iter()
+            .copied()
+            .filter(|m| !desired.contains(m))
+            .collect();
+        if desired.is_empty() || free.is_empty() {
+            return Ok(());
+        }
+        let command = Command::Move {
+            partition: group,
+            from: desired[self.rng.below(desired.len() as u64) as usize],
+            to: free[self.rng.below(free.len() as u64) as usize],
+        };
+        if let Some(node) = self.meta.get_mut(&leader)
+            && node.propose(&command)
+        {
+            self.report.replica_moves += 1;
+        }
+        self.drive_meta(leader)
     }
 
     /// A message a leader released, now that what it depends on is committed.
@@ -721,7 +926,7 @@ impl World<'_> {
             let seed = self.rng.next_u64();
             let replica = Replica::restart(
                 machine,
-                &self.machines,
+                &bootstrap(machine, &self.initial),
                 RaftConfig::default(),
                 seed,
                 disk.hard_state,
@@ -732,6 +937,21 @@ impl World<'_> {
             )?;
             self.replicas.insert((group, machine), replica);
         }
+        if let Some(disk) = self.meta_disks.get(&machine).cloned() {
+            let node = MetadataNode::restart(
+                machine,
+                &self.initial,
+                RaftConfig::default(),
+                self.rng.next_u64(),
+                disk.hard_state,
+                disk.snapshot,
+                disk.log,
+                self.created.clone(),
+            )?;
+            self.meta.insert(machine, node);
+        }
+        // What it had seen of the metadata was in memory.
+        self.known.remove(&machine);
         let incarnation = self.incarnations[&machine] + 1;
         self.incarnations.insert(machine, incarnation);
         self.schedule(
@@ -751,6 +971,7 @@ impl World<'_> {
             for group in self.groups.clone() {
                 crashed |= self.replicas.remove(&(group, machine)).is_some();
             }
+            self.meta.remove(&machine);
             if crashed {
                 self.report.crashes += 1;
                 let incarnation = self.incarnations[&machine] + 1;
@@ -915,12 +1136,19 @@ impl World<'_> {
                 .log()
                 .last()
                 .map_or(leader.raft().snapshot_index(), |e| e.index);
-            let applied_everywhere = self.machines.iter().all(|m| {
+            let applied_everywhere = leader.raft().members().iter().all(|m| {
                 self.replicas
                     .get(&(*group, *m))
                     .is_some_and(|r| r.committed().len() == leader.committed().len())
             });
             if commit != last || !applied_everywhere {
+                return false;
+            }
+            // Every group is where the metadata says.
+            let Some(meta) = self.meta_leader() else {
+                return false;
+            };
+            if leader.raft().members() != meta.state().replicas(*group) {
                 return false;
             }
         }
@@ -975,6 +1203,14 @@ impl World<'_> {
                 }
             }
             self.check_leader(group, leader.raft().term(), partition)?;
+            let meta = self.meta_leader().ok_or("no metadata leader at the end")?;
+            if leader.raft().members() != meta.state().replicas(group) {
+                return Err(format!(
+                    "partition {group} is on {:?}, the metadata says {:?}",
+                    leader.raft().members(),
+                    meta.state().replicas(group)
+                ));
+            }
         }
         // An acknowledged result is recorded, unless its run ended without it (a race's loser).
         for (key, cmd) in &self.acked_results {

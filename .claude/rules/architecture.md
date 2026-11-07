@@ -9,7 +9,7 @@ How Aqueduct is put together, and where new code belongs. The why is in the ADRs
 | `aqueduct-core` | The pure state machine: commands, journal entries, `RunState::handle_at(event) -> (entries, effects)`. No I/O, no clock, no randomness, no async. | nothing of ours |
 | `aqueduct-codec` | The history format: canonical encoding, the SHA-256 hash chain per run, log records. | core |
 | `aqueduct-storage` | The segmented, framed file log (one writer, locked) and the redb state store for checkpoints. | codec |
-| `aqueduct-engine` | `Partition` (journals, group commit, timers, retries, checkpoints, outbound messages released only after durability) and the embedded `Engine` (threads, workers, the public API). The `Observer` hook for telemetry. `Replica`: a partition whose log is a Raft group. | core, codec, storage, raft |
+| `aqueduct-engine` | `Partition` (journals, group commit, timers, retries, checkpoints, outbound messages released only after durability) and the embedded `Engine` (threads, workers, the public API). The `Observer` hook for telemetry. `Replica`: a partition whose log is a Raft group; `placement` and `metadata` for many partitions. | core, codec, storage, raft |
 | `aqueduct-procedure` | Starlark procedures as deciders: hermetic, replayed by re-execution, budgeted. | core |
 | `aqueduct-sdk` | Rust workflows as `async fn`s: `WorkflowContext`, `join`, `select`, sagas. Each activation re-runs the function against the journal. | core |
 | `aqueduct-otel` | OpenTelemetry traces and metrics through the engine's `Observer`. | engine |
