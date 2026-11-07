@@ -488,19 +488,28 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
     // The runtime first: in cluster mode, the engine's transport runs on it.
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let entered = runtime.enter();
-    // Steps run on step workers and push endpoints (ADR 0038, ADR 0040).
-    let builder = aqueduct_engine::embedded::Engine::builder(dir)
-        .remote_steps(std::time::Duration::from_secs(30));
-    let engine = registry
-        .deploy(config.apply(builder)?)
-        .map_err(|e| e.to_string())?
-        .open()
-        .map_err(|e| e.to_string())?;
+    // Steps run on step workers and push endpoints (ADR 0038, ADR 0040), in every partition
+    // (ADR 0057).
+    let shards = aqueduct_engine::shards::Shards::open(dir, config.partition_count(), |path, _| {
+        let builder = aqueduct_engine::embedded::Engine::builder(path)
+            .remote_steps(std::time::Duration::from_secs(30));
+        let builder = config
+            .apply(builder)
+            .map_err(aqueduct_engine::embedded::EngineError::Open)?;
+        registry
+            .deploy(builder)
+            .map_err(|e| aqueduct_engine::embedded::EngineError::Open(e.to_string()))
+    })
+    .map_err(|e| e.to_string())?;
     let security = aqueduct_server::Security::for_dir(dir)?;
     for note in &notes {
         security.audit.record("server", "import", "pending", note);
     }
-    match engine.import_report() {
+    match shards
+        .engines()
+        .first()
+        .and_then(|engine| engine.import_report())
+    {
         Some(aqueduct_engine::import::ImportReport {
             rejected: Some(why),
             ..
@@ -568,13 +577,15 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
                 let _ = tokio::signal::ctrl_c().await;
             }
         };
-        let engine = std::sync::Arc::new(engine);
-        match tls {
-            Some(tls) => {
-                aqueduct_server::serve_tls(engine, listener, &config, security, tls, stop).await
-            }
-            None => aqueduct_server::serve_with(engine, listener, &config, security, stop).await,
-        }
+        aqueduct_server::serve_shards(
+            std::sync::Arc::new(shards),
+            listener,
+            &config,
+            security,
+            tls,
+            stop,
+        )
+        .await
         .map_err(|e| e.to_string())
     })?;
     Ok("stopped\n".to_owned())

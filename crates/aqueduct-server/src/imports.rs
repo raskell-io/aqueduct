@@ -156,7 +156,13 @@ impl v1::imports_server::Imports for Api {
                 "imports go into the default namespace",
             ));
         }
-        let answer = receive(Arc::clone(&self.engine), request.into_inner()).await;
+        // An import goes into one partition's log (ADR 0047): a server with many takes none.
+        let [engine] = self.engine.engines() else {
+            return Err(Status::failed_precondition(
+                "imports go into a server with one partition",
+            ));
+        };
+        let answer = receive(Arc::clone(engine), request.into_inner()).await;
         let outcome = match &answer {
             Ok(receipt) => format!(
                 "staged: {} runs, {} already here, {} sources",

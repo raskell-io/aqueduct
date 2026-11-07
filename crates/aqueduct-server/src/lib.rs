@@ -41,6 +41,7 @@ use std::time::Duration;
 use aqueduct_core::{CommandKind, Payload, RunState, Status, StepOutcome};
 use aqueduct_engine::embedded::{Engine, EngineError, RunSummary};
 use aqueduct_engine::namespaces::{self, Scope};
+use aqueduct_engine::shards::Shards;
 use aqueduct_engine::{ReusePolicy, StartOptions};
 use aqueduct_protocol::v1;
 use axum::extract::{Path, Query, State};
@@ -87,24 +88,8 @@ pub async fn serve_with(
     security: Security,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    push::start(&engine, config).map_err(std::io::Error::other)?;
-    let connections = tls::Connections {
-        places: Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections)),
-        header_timeout: Duration::from_millis(config.limits.header_timeout_ms),
-    };
-    let security = security.with_limits(config.limits.clone());
-    tls::serve(
-        with_cluster(
-            router_secured(Arc::clone(&engine), security),
-            &engine,
-            config,
-        )?,
-        listener,
-        None,
-        connections,
-        shutdown,
-    )
-    .await
+    let shards = Arc::new(Shards::single(engine));
+    serve_shards(shards, listener, config, security, None, shutdown).await
 }
 
 /// [`serve_with`], over TLS (ADR 0042).
@@ -116,7 +101,20 @@ pub async fn serve_tls(
     tls: Tls,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    push::start(&engine, config).map_err(std::io::Error::other)?;
+    let shards = Arc::new(Shards::single(engine));
+    serve_shards(shards, listener, config, security, Some(tls), shutdown).await
+}
+
+/// [`serve_with`] for many partitions (ADR 0057), over TLS if given one.
+pub async fn serve_shards(
+    shards: Arc<Shards>,
+    listener: tokio::net::TcpListener,
+    config: &Config,
+    security: Security,
+    tls: Option<Tls>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    push::start(&shards, config).map_err(std::io::Error::other)?;
     let connections = tls::Connections {
         places: Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections)),
         header_timeout: Duration::from_millis(config.limits.header_timeout_ms),
@@ -124,12 +122,12 @@ pub async fn serve_tls(
     let security = security.with_limits(config.limits.clone());
     tls::serve(
         with_cluster(
-            router_secured(Arc::clone(&engine), security),
-            &engine,
+            router_shards(Arc::clone(&shards), security),
+            &shards,
             config,
         )?,
         listener,
-        Some(tls),
+        tls,
         connections,
         shutdown,
     )
@@ -143,6 +141,11 @@ pub fn router(engine: Arc<Engine>) -> Router {
 
 /// [`router`], with authentication and an audit log (ADR 0041).
 pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
+    router_shards(Arc::new(Shards::single(engine)), security)
+}
+
+/// [`router_secured`], for many partitions (ADR 0057).
+pub fn router_shards(engine: Arc<Shards>, security: Security) -> Router {
     let api = Api {
         engine,
         security: Arc::new(security),
@@ -183,13 +186,18 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
 }
 
 /// The router, with the route other nodes send Raft messages to, in cluster mode.
-fn with_cluster(router: Router, engine: &Arc<Engine>, config: &Config) -> std::io::Result<Router> {
-    match &config.cluster {
-        Some(cluster) => Ok(cluster::forwarding(router, engine, cluster)
-            .map_err(std::io::Error::other)?
-            .merge(cluster::routes(engine, cluster))),
-        None => Ok(router),
-    }
+fn with_cluster(router: Router, shards: &Arc<Shards>, config: &Config) -> std::io::Result<Router> {
+    let Some(cluster) = &config.cluster else {
+        return Ok(router);
+    };
+    let [engine] = shards.engines() else {
+        return Err(std::io::Error::other(
+            "cluster mode runs one partition per server so far (ADR 0056)",
+        ));
+    };
+    Ok(cluster::forwarding(router, engine, cluster)
+        .map_err(std::io::Error::other)?
+        .merge(cluster::routes(engine, cluster)))
 }
 
 /// Why a call failed, in terms both transports can say.
@@ -601,7 +609,7 @@ impl IntoResponse for Failure {
 /// The calls, shared by both transports. Each runs the engine's blocking call on a blocking task.
 #[derive(Clone)]
 struct Api {
-    engine: Arc<Engine>,
+    engine: Arc<Shards>,
     security: Arc<Security>,
 }
 
@@ -644,7 +652,7 @@ impl Api {
 
     async fn call<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&Engine) -> Result<T, EngineError> + Send + 'static,
+        f: impl FnOnce(&Shards) -> Result<T, EngineError> + Send + 'static,
     ) -> Result<T, Failure> {
         let engine = Arc::clone(&self.engine);
         tokio::task::spawn_blocking(move || f(&engine))
@@ -713,7 +721,7 @@ impl Api {
 
     async fn list(&self, filter: v1::ListRunsRequest) -> Result<v1::ListRunsResponse, Failure> {
         let namespace = namespace();
-        let runs = self.call(Engine::runs).await?;
+        let runs = self.call(Shards::runs).await?;
         let limit = if filter.limit == 0 {
             usize::MAX
         } else {
@@ -879,7 +887,7 @@ impl Api {
 
     async fn escalations(&self) -> Result<v1::ListEscalationsResponse, Failure> {
         let namespace = namespace();
-        let open = self.call(Engine::escalations).await?;
+        let open = self.call(Shards::escalations).await?;
         Ok(v1::ListEscalationsResponse {
             escalations: open
                 .into_iter()

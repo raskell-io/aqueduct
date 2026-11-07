@@ -33,6 +33,11 @@ partition, calls routed by key, and the messages between partitions carried from
   child shared under a chosen key and send to counters on other partitions; every parent ends right,
   every counter counts each message once, each shared child lives only at its home, and everything is
   there after reopening. A route that delivers nothing fails it.
-- The server does not use `Shards` yet: that, and in a cluster, routing messages and requests to the
-  node that leads each partition, come next.
+- **The server runs on `Shards`:** `"partitions": N` in its configuration (default 1, at most 4,096)
+  opens N partitions under the data directory; every call is routed by key, listings are gathered,
+  push endpoints and workers share one queue. A directory laid out for another number of partitions is
+  refused. Imports need a server with one partition. Tested over HTTP with four partitions
+  (`aqueduct-server/tests/partitions.rs`).
+- Cluster mode with more than one partition is refused for now: it needs Raft messages and messages
+  between partitions addressed by partition, and requests forwarded to each partition's leader.
 - Moving slots between partitions (resharding) is still later (ADR 0053).

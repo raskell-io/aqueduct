@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use aqueduct_engine::embedded::{Attempt, Engine};
+use aqueduct_engine::embedded::Attempt;
 use aqueduct_engine::namespaces::Scope;
 use aqueduct_engine::queue::{Invocation, Serves, StepQueue};
 use aqueduct_protocol::v1;
@@ -43,7 +43,7 @@ fn serves(build: Option<&str>) -> Serves<'_> {
 
 /// Records a worker's result, if the queue still waits for it.
 pub(crate) fn record(
-    engine: &Engine,
+    engine: &aqueduct_engine::shards::Shards,
     queue: &StepQueue,
     scope: &Scope,
     id: &str,

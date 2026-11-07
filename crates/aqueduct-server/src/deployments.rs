@@ -2,8 +2,8 @@
 //! tenant's: workflow definitions are shared across namespaces (ADR 0046), so this is for the default
 //! namespace's administrators.
 
-use aqueduct_engine::embedded::Engine;
 use aqueduct_engine::namespaces;
+use aqueduct_engine::shards::Shards;
 use aqueduct_protocol::v1;
 use axum::Router;
 use axum::extract::{Path, State};
@@ -26,7 +26,7 @@ fn in_default_namespace() -> Result<(), Failure> {
 impl Api {
     async fn list_deployments(&self) -> Result<Vec<v1::Deployment>, Failure> {
         in_default_namespace()?;
-        let listed = self.call(Engine::deployments).await?;
+        let listed = self.call(Shards::deployments).await?;
         Ok(listed
             .into_iter()
             .map(|info| v1::Deployment {

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aqueduct_engine::embedded::{Attempt, Builder, Engine};
+use aqueduct_engine::embedded::{Attempt, Builder};
 use aqueduct_engine::namespaces::Scope;
 use aqueduct_engine::queue::{Invocation, StepQueue};
 use axum::body::Bytes;
@@ -49,6 +49,17 @@ pub struct Config {
     /// Cluster mode (ADR 0056): this server is one replica of a Raft group of servers.
     #[serde(default)]
     pub cluster: Option<crate::cluster::Cluster>,
+    /// How many partitions the data directory holds (ADR 0057). Default 1. Fixed once runs exist: a
+    /// directory laid out for another number is refused.
+    #[serde(default)]
+    pub partitions: Option<u32>,
+}
+
+impl Config {
+    /// How many partitions to run.
+    pub fn partition_count(&self) -> u32 {
+        self.partitions.unwrap_or(1)
+    }
 }
 
 /// An HTTP endpoint a queue's steps are pushed to.
@@ -99,6 +110,16 @@ impl Config {
         self.limits.check()?;
         if let Some(cluster) = &self.cluster {
             cluster.check()?;
+        }
+        let partitions = self.partition_count();
+        if partitions == 0 || partitions > u32::from(aqueduct_engine::placement::SLOTS) {
+            return Err(format!(
+                "partitions must be between 1 and {}",
+                aqueduct_engine::placement::SLOTS
+            ));
+        }
+        if partitions > 1 && self.cluster.is_some() {
+            return Err("cluster mode runs one partition per server so far (ADR 0056)".into());
         }
         for endpoint in &self.push {
             if !(endpoint.url.starts_with("http://") || endpoint.url.starts_with("https://")) {
@@ -185,7 +206,10 @@ pub(crate) fn client() -> Result<Client, String> {
 
 /// Starts a pusher for every configured endpoint. A pusher is a worker for its queue: it takes
 /// invocations within its concurrency, posts each, and records the outcome.
-pub(crate) fn start(engine: &Arc<Engine>, config: &Config) -> Result<(), String> {
+pub(crate) fn start(
+    engine: &Arc<aqueduct_engine::shards::Shards>,
+    config: &Config,
+) -> Result<(), String> {
     if config.push.is_empty() {
         return Ok(());
     }
@@ -206,7 +230,7 @@ pub(crate) fn start(engine: &Arc<Engine>, config: &Config) -> Result<(), String>
 }
 
 async fn pusher(
-    engine: Arc<Engine>,
+    engine: Arc<aqueduct_engine::shards::Shards>,
     queue: Arc<StepQueue>,
     client: Client,
     endpoint: PushEndpoint,

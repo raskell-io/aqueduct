@@ -32,7 +32,7 @@ const PARENTS: u32 = 24;
 
 fn open(dir: &Path) -> Shards {
     Shards::open(dir, 4, |path: PathBuf, _| {
-        Engine::builder(path)
+        Ok(Engine::builder(path)
             .workflow(
                 "parent",
                 Arc::new(Procedure::compile("parent.star", PARENT).unwrap()),
@@ -45,7 +45,7 @@ fn open(dir: &Path) -> Shards {
                 "counter",
                 "add",
                 Arc::new(Procedure::compile("add.star", ADD).unwrap()),
-            )
+            ))
     })
     .unwrap()
 }
