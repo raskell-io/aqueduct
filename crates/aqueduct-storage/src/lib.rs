@@ -8,9 +8,11 @@
 
 mod file_log;
 pub mod frame;
+mod raft_store;
 mod state;
 
 pub use file_log::{Durability, FileLog, FileLogOptions};
+pub use raft_store::{RaftStore, Recovered};
 pub use state::{Checkpoint, NoStateStore, RedbStateStore, StateStore};
 
 /// A storage failure.

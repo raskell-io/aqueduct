@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod sim;
+pub mod wire;
 
 use std::collections::{BTreeMap, BTreeSet};
 
