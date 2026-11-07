@@ -1,6 +1,6 @@
 //! Cluster mode (ADR 0056): three servers on this machine, each a replica of one partition, their Raft
-//! messages over HTTP. A client asks any of them; those that do not lead say so. The leader's server
-//! stops, and another serves what it acknowledged.
+//! messages over HTTP. A client asks any of them; those that do not lead forward to the one that does.
+//! The leader's server stops, and another serves what it acknowledged.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -18,12 +18,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const DOUBLE: &str = "def run(x):\n    return x * 2\n";
 
 async fn http(addr: SocketAddr, method: &str, path: &str, body: Value) -> (u16, Value) {
+    http_with(addr, method, path, body, "").await
+}
+
+async fn http_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Value,
+    headers: &str,
+) -> (u16, Value) {
     let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
         return (0, Value::Null);
     };
     let body = body.to_string();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     if stream.write_all(request.as_bytes()).await.is_err() {
@@ -122,13 +132,25 @@ async fn three_servers_replicate_and_survive_their_leader() {
     // Raft messages without the cluster's secret are refused.
     let (status, _) = http(nodes[&leader], "POST", "/cluster/v1/raft", Value::Null).await;
     assert_eq!(status, 401);
-    // A node that does not lead is unavailable, and says so.
+    // A node that does not lead forwards to the one that does: any node can be asked.
     let follower = *nodes.keys().find(|id| **id != leader).unwrap();
     let (status, answer) = http(
         nodes[&follower],
         "POST",
         "/v1/runs",
-        json!({"key": "b", "workflow": "double", "input": 1}),
+        json!({"key": "b", "workflow": "double", "input": 4}),
+    )
+    .await;
+    assert!((200..300).contains(&status), "{status}: {answer}");
+    let (status, answer) = http(nodes[&follower], "GET", "/v1/runs/b/result", Value::Null).await;
+    assert_eq!((status, &answer["output"]), (200, &json!(8)), "{answer}");
+    // A request already forwarded once is answered where it arrives: unavailable, never forwarded on.
+    let (status, answer) = http_with(
+        nodes[&follower],
+        "GET",
+        "/v1/runs/b/result",
+        Value::Null,
+        "aqueduct-forwarded: 1\r\n",
     )
     .await;
     assert_eq!(status, 503, "{answer}");

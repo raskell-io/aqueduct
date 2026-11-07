@@ -1128,6 +1128,14 @@ impl Engine {
     pub fn leads(&self) -> bool {
         self.leading.lock().is_ok_and(|leading| leading.0)
     }
+
+    /// The node that leads, when this replicated engine does not and knows which does.
+    pub fn leader(&self) -> Option<u64> {
+        self.leading
+            .lock()
+            .ok()
+            .and_then(|leading| if leading.0 { None } else { leading.1 })
+    }
 }
 
 /// Delivers Raft messages to a replicated engine; holds no more than its request channel.

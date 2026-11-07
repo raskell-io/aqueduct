@@ -98,7 +98,7 @@ pub async fn serve_with(
             router_secured(Arc::clone(&engine), security),
             &engine,
             config,
-        ),
+        )?,
         listener,
         None,
         connections,
@@ -127,7 +127,7 @@ pub async fn serve_tls(
             router_secured(Arc::clone(&engine), security),
             &engine,
             config,
-        ),
+        )?,
         listener,
         Some(tls),
         connections,
@@ -183,10 +183,12 @@ pub fn router_secured(engine: Arc<Engine>, security: Security) -> Router {
 }
 
 /// The router, with the route other nodes send Raft messages to, in cluster mode.
-fn with_cluster(router: Router, engine: &Engine, config: &Config) -> Router {
+fn with_cluster(router: Router, engine: &Arc<Engine>, config: &Config) -> std::io::Result<Router> {
     match &config.cluster {
-        Some(cluster) => router.merge(cluster::routes(engine, cluster)),
-        None => router,
+        Some(cluster) => Ok(cluster::forwarding(router, engine, cluster)
+            .map_err(std::io::Error::other)?
+            .merge(cluster::routes(engine, cluster))),
+        None => Ok(router),
     }
 }
 
