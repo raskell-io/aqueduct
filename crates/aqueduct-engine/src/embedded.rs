@@ -45,7 +45,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use aqueduct_core::{CommandIndex, Decider, Payload, RunState, Status, StepOutcome};
-use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore};
+use aqueduct_storage::{FileLog, FileLogOptions, LogStore, RedbStateStore, StateStore};
 
 use crate::{
     AgentAttempt, AgentCall, AgentExecutor, Deciders, Observer, Outbound, Partition,
@@ -521,9 +521,11 @@ impl Builder {
             .collect();
         let last_checkpoint = partition.log().next_lsn();
         let processor = Processor {
-            partition,
-            checkpoint_every: self.checkpoint_every,
-            last_checkpoint,
+            host: Local {
+                partition,
+                checkpoint_every: self.checkpoint_every,
+                last_checkpoint,
+            },
             jobs,
             waiters: BTreeMap::new(),
             starts: BTreeMap::new(),
@@ -1123,10 +1125,67 @@ struct Job {
     attempt: u32,
 }
 
-struct Processor {
+/// What a processor runs its partition on (ADR 0055): a local log, or (later) a Raft group.
+pub(crate) trait Host: Send + 'static {
+    /// The partition's log.
+    type Log: LogStore + Send + 'static;
+    /// Its state store.
+    type State: StateStore + Send + 'static;
+    /// The partition, where it is here to take requests.
+    fn partition(&self) -> Option<&Partition<Self::Log, Self::State>>;
+    /// The same, to change.
+    fn partition_mut(&mut self) -> Option<&mut Partition<Self::Log, Self::State>>;
+    /// Writes the batch; returns the messages released by it.
+    fn flush(&mut self) -> Result<Vec<Outbound>, String>;
+    /// Saves a checkpoint if one is due. Only called right after a flush.
+    fn checkpoint(&mut self, force: bool) -> Result<(), String>;
+    /// The workflows and builds the partition decides with.
+    fn deciders_mut(&mut self) -> &mut Deciders;
+}
+
+/// A partition on a local log: the embedded engine and the single server.
+pub(crate) struct Local {
     partition: Partition<FileLog, RedbStateStore>,
     checkpoint_every: u64,
     last_checkpoint: u64,
+}
+
+impl Host for Local {
+    type Log = FileLog;
+    type State = RedbStateStore;
+
+    fn partition(&self) -> Option<&Partition<FileLog, RedbStateStore>> {
+        Some(&self.partition)
+    }
+
+    fn partition_mut(&mut self) -> Option<&mut Partition<FileLog, RedbStateStore>> {
+        Some(&mut self.partition)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Outbound>, String> {
+        self.partition
+            .flush()
+            .map_err(|e| format!("storage failed: {e}"))
+    }
+
+    fn checkpoint(&mut self, force: bool) -> Result<(), String> {
+        if force || self.partition.log().next_lsn() - self.last_checkpoint >= self.checkpoint_every
+        {
+            self.last_checkpoint = self
+                .partition
+                .checkpoint()
+                .map_err(|e| format!("checkpoint failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn deciders_mut(&mut self) -> &mut Deciders {
+        self.partition.deciders_mut()
+    }
+}
+
+struct Processor<H: Host> {
+    host: H,
     jobs: Sender<Job>,
     waiters: BTreeMap<String, Vec<Sender<Result<RunResult, EngineError>>>>,
     starts: BTreeMap<String, Vec<Sender<Result<(), EngineError>>>>,
@@ -1158,20 +1217,28 @@ struct Processor {
 /// Where the answer to an update or a query goes.
 type AnswerSender = Sender<Result<Payload, EngineError>>;
 
-impl Processor {
+impl<H: Host> Processor<H> {
+    /// The partition, to change; only asked for where it is here.
+    fn part(&mut self) -> Result<&mut Partition<H::Log, H::State>, String> {
+        self.host
+            .partition_mut()
+            .ok_or_else(|| "the partition is not here".to_owned())
+    }
+
     fn run(mut self, inbox: &Receiver<Request>, redispatch: Duration) -> Result<(), String> {
         // Recovery may have produced entries and dispatches: make them durable and send them.
-        self.partition.set_time(now_ms());
-        self.partition
-            .fire_due_timers()
-            .map_err(|e| e.to_string())?;
+        if let Some(partition) = self.host.partition_mut() {
+            partition.set_time(now_ms());
+            partition.fire_due_timers().map_err(|e| e.to_string())?;
+        }
         self.flush()?;
         let mut next_redispatch = now_ms().saturating_add(millis(redispatch));
         loop {
             let now = now_ms();
             let wake = self
-                .partition
-                .next_timer()
+                .host
+                .partition()
+                .and_then(Partition::next_timer)
                 .map_or(next_redispatch, |t| t.min(next_redispatch));
             let first = match inbox.recv_timeout(Duration::from_millis(wake.saturating_sub(now))) {
                 Ok(request) => Some(request),
@@ -1179,36 +1246,27 @@ impl Processor {
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             };
             let now = now_ms();
-            self.partition.set_time(now);
+            if let Some(partition) = self.host.partition_mut() {
+                partition.set_time(now);
+                if now >= next_redispatch {
+                    partition.redispatch();
+                }
+                partition.fire_due_timers().map_err(|e| e.to_string())?;
+            }
             if now >= next_redispatch {
-                self.partition.redispatch();
                 next_redispatch = now.saturating_add(millis(redispatch));
             }
-            self.partition
-                .fire_due_timers()
-                .map_err(|e| e.to_string())?;
             // Group commit: take everything that is waiting, then sync once.
             for request in first.into_iter().chain(inbox.try_iter()) {
                 if !self.handle(request)? {
                     self.flush()?;
-                    self.checkpoint()?;
+                    self.host.checkpoint(true)?;
                     return Ok(());
                 }
             }
             self.flush()?;
-            if self.partition.log().next_lsn() - self.last_checkpoint >= self.checkpoint_every {
-                self.checkpoint()?;
-            }
+            self.host.checkpoint(false)?;
         }
-    }
-
-    /// Saves a checkpoint. Only called right after a flush, when everything in memory is durable.
-    fn checkpoint(&mut self) -> Result<(), String> {
-        self.last_checkpoint = self
-            .partition
-            .checkpoint()
-            .map_err(|e| format!("checkpoint failed: {e}"))?;
-        Ok(())
     }
 
     /// Applies one request; false on shutdown.
@@ -1225,7 +1283,7 @@ impl Processor {
                     let _ = reply.send(Err(overloaded()));
                     return Ok(true);
                 }
-                match self.partition.start_with(&key, &workflow, input, options) {
+                match self.part()?.start_with(&key, &workflow, input, options) {
                     Ok(()) => self.starts.entry(key).or_default().push(reply),
                     Err(PartitionError::UnknownWorkflow(name)) => {
                         let _ = reply.send(Err(EngineError::UnknownWorkflow(name)));
@@ -1247,16 +1305,16 @@ impl Processor {
             }
             Request::Wait { key, reply } => {
                 // The key's latest run; one that continues as new is followed to its successor.
-                let Some(id) = self.partition.latest(&key).map_err(|e| e.to_string())? else {
+                let Some(id) = self.part()?.latest(&key).map_err(|e| e.to_string())? else {
                     let _ = reply.send(Err(EngineError::UnknownRun(key)));
                     return Ok(true);
                 };
-                if self.partition.run(&id).is_some() {
+                if self.part()?.run(&id).is_some() {
                     // Answered after the next flush, once the run's end is durable.
                     self.waiters.entry(id).or_default().push(reply);
                 } else {
                     // Not in memory: an unloaded finished run (durable in a checkpoint).
-                    let answer = match self.partition.lookup_run(&id).map_err(|e| e.to_string())? {
+                    let answer = match self.part()?.lookup_run(&id).map_err(|e| e.to_string())? {
                         Some(state) => Ok(RunResult {
                             status: state.status(),
                             output: state.output().cloned(),
@@ -1276,9 +1334,9 @@ impl Processor {
                 exact,
                 reply,
             } => match if exact {
-                self.partition.signal_run(&key, &name, &id, payload)
+                self.part()?.signal_run(&key, &name, &id, payload)
             } else {
-                self.partition.signal(&key, &name, &id, payload)
+                self.part()?.signal(&key, &name, &id, payload)
             } {
                 Ok(()) => self.signals.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownRun(key)) => {
@@ -1291,7 +1349,7 @@ impl Processor {
                 cmd,
                 outcome,
                 reply,
-            } => match self.partition.resolve_escalation(&key, cmd, outcome) {
+            } => match self.part()?.resolve_escalation(&key, cmd, outcome) {
                 Ok(()) => self.signals.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownRun(key)) => {
                     let _ = reply.send(Err(EngineError::UnknownRun(key)));
@@ -1303,7 +1361,7 @@ impl Processor {
             },
             Request::Escalations { reply } => {
                 let open = self
-                    .partition
+                    .part()?
                     .open_escalations()
                     .into_iter()
                     .map(|(key, cmd, reason, payload)| Escalation {
@@ -1315,7 +1373,7 @@ impl Processor {
                     .collect();
                 let _ = reply.send(open);
             }
-            Request::Cancel { key, reason, reply } => match self.partition.cancel(&key, &reason) {
+            Request::Cancel { key, reason, reply } => match self.part()?.cancel(&key, &reason) {
                 Ok(()) => self.signals.entry(key).or_default().push(reply),
                 Err(PartitionError::UnknownRun(key)) => {
                     let _ = reply.send(Err(EngineError::UnknownRun(key)));
@@ -1328,7 +1386,7 @@ impl Processor {
                 id,
                 payload,
                 reply,
-            } => match self.partition.update(&key, &name, &id, payload) {
+            } => match self.part()?.update(&key, &name, &id, payload) {
                 Ok(UpdateStatus::Answered(answer)) => self
                     .answers
                     .push((reply, answer.map_err(EngineError::UpdateRejected))),
@@ -1339,7 +1397,7 @@ impl Processor {
                 Err(error) => return Err(error.to_string()),
             },
             Request::Query { key, name, reply } => {
-                let answer = match self.partition.query(&key, &name) {
+                let answer = match self.part()?.query(&key, &name) {
                     Ok(Some(answer)) => Ok(answer),
                     Ok(None) => Err(EngineError::UnknownQuery { key, name }),
                     Err(PartitionError::UnknownRun(key)) => Err(EngineError::UnknownRun(key)),
@@ -1373,16 +1431,13 @@ impl Processor {
                 args,
                 reply,
             } => match self
-                .partition
+                .part()?
                 .call_object(&object, &key, &handler, &id, &args)
             {
                 Ok(call) => {
-                    let unloaded = match self.partition.run(&call) {
+                    let unloaded = match self.part()?.run(&call) {
                         Some(_) => None,
-                        None => self
-                            .partition
-                            .lookup_run(&call)
-                            .map_err(|e| e.to_string())?,
+                        None => self.part()?.lookup_run(&call).map_err(|e| e.to_string())?,
                     };
                     match unloaded {
                         // An ended call whose run has left memory (durable in a checkpoint).
@@ -1410,13 +1465,13 @@ impl Processor {
                 Err(error) => return Err(error.to_string()),
             },
             Request::Decision { key, at, commands } => {
-                self.partition
+                self.part()?
                     .decision(&key, at, commands)
                     .map_err(|e| e.to_string())?;
             }
             Request::Describe { key, reply } => {
-                let answer = match self.partition.latest(&key).map_err(|e| e.to_string())? {
-                    Some(id) => match self.partition.lookup_run(&id).map_err(|e| e.to_string())? {
+                let answer = match self.part()?.latest(&key).map_err(|e| e.to_string())? {
+                    Some(id) => match self.part()?.lookup_run(&id).map_err(|e| e.to_string())? {
                         Some(state) => Ok((id, state)),
                         None => Err(EngineError::UnknownRun(key)),
                     },
@@ -1431,7 +1486,7 @@ impl Processor {
                 priority,
                 reply,
             } => {
-                let answer = match self.partition.set_priority(&key, priority) {
+                let answer = match self.part()?.set_priority(&key, priority) {
                     Ok(Some(run)) => {
                         // Waiting work moves at once; the answer waits until the change is durable.
                         if let Some((queue, _)) = &self.remote {
@@ -1469,17 +1524,17 @@ impl Processor {
                 let _ = reply.send(self.retire_deployment(&workflow, &build));
             }
             Request::History { run, reply } => {
-                let history = self.partition.history(&run).map_err(|e| e.to_string())?;
+                let history = self.part()?.history(&run).map_err(|e| e.to_string())?;
                 self.deferred.push(Box::new(move || {
                     let _ = reply.send(Ok(history));
                 }));
             }
             Request::Runs { reply } => {
                 let mut runs = Vec::new();
-                for id in self.partition.run_ids().map_err(|e| e.to_string())? {
-                    let state = match self.partition.run(&id) {
+                for id in self.part()?.run_ids().map_err(|e| e.to_string())? {
+                    let state = match self.part()?.run(&id) {
                         Some(run) => Some(run.state().clone()),
-                        None => self.partition.lookup_run(&id).map_err(|e| e.to_string())?,
+                        None => self.part()?.lookup_run(&id).map_err(|e| e.to_string())?,
                     };
                     if let Some(state) = state {
                         runs.push(RunSummary {
@@ -1496,31 +1551,31 @@ impl Processor {
                 }));
             }
             Request::StepResult { key, cmd, outcome } => {
-                self.partition
+                self.part()?
                     .step_result(&key, cmd, outcome)
                     .map_err(|e| e.to_string())?;
             }
             Request::AgentResult { key, cmd, outcome } => {
-                self.partition
+                self.part()?
                     .agent_result(&key, cmd, outcome)
                     .map_err(|e| e.to_string())?;
             }
             Request::AttemptFailed { key, cmd, error } => {
-                self.partition
+                self.part()?
                     .step_attempt_failed(&key, cmd, error)
                     .map_err(|e| e.to_string())?;
             }
             Request::Stats { reply } => {
                 let _ = reply.send(EngineStats {
-                    runs_in_memory: self.partition.runs().len(),
-                    pending_timers: self.partition.pending_timers(),
-                    log_lsn: self.partition.log().next_lsn(),
+                    runs_in_memory: self.part()?.runs().len(),
+                    pending_timers: self.part()?.pending_timers(),
+                    log_lsn: self.part()?.log().next_lsn(),
                 });
             }
             Request::Shutdown => return Ok(false),
         }
         // Only non-empty under the injected acknowledge-before-sync bug.
-        let early = self.partition.take_unsynced();
+        let early = self.part()?.take_unsynced();
         self.deliver(early);
         Ok(true)
     }
@@ -1546,7 +1601,12 @@ impl Processor {
             }
         }
         let mut open = Vec::new();
-        for ((workflow, build), count) in self.partition.open_builds() {
+        for ((workflow, build), count) in self
+            .host
+            .partition()
+            .map(Partition::open_builds)
+            .unwrap_or_default()
+        {
             open.push((entry(&workflow, &build), count));
         }
         let mut workers = Vec::new();
@@ -1581,7 +1641,7 @@ impl Processor {
         build: &str,
         force: bool,
     ) -> Result<(), EngineError> {
-        if !self.partition.deciders_mut().is_remote(workflow) {
+        if !self.host.deciders_mut().is_remote(workflow) {
             return Err(EngineError::UnknownWorkflow(workflow.to_owned()));
         }
         if build.is_empty() {
@@ -1601,7 +1661,7 @@ impl Processor {
         self.deployments
             .activate(&self.dir, workflow, build)
             .map_err(EngineError::Deployment)?;
-        self.partition
+        self.host
             .deciders_mut()
             .activate_build(workflow, build)
             .map_err(|_| EngineError::UnknownWorkflow(workflow.to_owned()))
@@ -1609,26 +1669,27 @@ impl Processor {
 
     fn retire_deployment(&mut self, workflow: &str, build: &str) -> Result<(), EngineError> {
         let open = self
-            .partition
-            .open_builds()
+            .host
+            .partition()
+            .map(Partition::open_builds)
+            .unwrap_or_default()
             .get(&(workflow.to_owned(), build.to_owned()))
             .copied()
             .unwrap_or(0);
         self.deployments
             .retire(&self.dir, workflow, build, open)
             .map_err(EngineError::Deployment)?;
-        self.partition.deciders_mut().forbid_build(workflow, build);
+        self.host.deciders_mut().forbid_build(workflow, build);
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), String> {
-        let outbound = self
-            .partition
-            .flush()
-            .map_err(|e| format!("storage failed: {e}"))?;
+        let outbound = self.host.flush()?;
         self.deliver(outbound);
-        if self.max_running.is_some() || !self.namespace_max.is_empty() {
-            self.namespace_count.clone_from(self.partition.running());
+        if (self.max_running.is_some() || !self.namespace_max.is_empty())
+            && let Some(partition) = self.host.partition()
+        {
+            self.namespace_count.clone_from(partition.running());
             self.running = self.namespace_count.values().sum();
         }
         self.answer_waiters();
@@ -1645,7 +1706,7 @@ impl Processor {
             return Ok(false);
         }
         if self
-            .partition
+            .part()?
             .latest(key)
             .map_err(|e| e.to_string())?
             .is_some()
@@ -1668,8 +1729,9 @@ impl Processor {
 
     /// The attempt a dispatch of `cmd` is: the run's recorded failed attempts of it, plus one.
     fn attempt(&self, key: &str, cmd: CommandIndex) -> u32 {
-        self.partition
-            .run(key)
+        self.host
+            .partition()
+            .and_then(|partition| partition.run(key))
             .and_then(|run| run.state().steps().get(cmd.0 as usize))
             .map_or(1, |step| step.failed_attempts + 1)
     }
@@ -1683,13 +1745,15 @@ impl Processor {
         for reply in self.deferred.drain(..) {
             reply();
         }
+        let Some(partition) = self.host.partition_mut() else {
+            return Ok(());
+        };
         let mut waiting = Vec::new();
         for (run, cmd, reply) in std::mem::take(&mut self.updates) {
-            let answer = match self.partition.run(&run) {
+            let answer = match partition.run(&run) {
                 Some(held) => update_answer(held.state(), cmd),
                 // Not in memory: it has ended, and its checkpoint holds it.
-                None => self
-                    .partition
+                None => partition
                     .lookup_run(&run)?
                     .and_then(|state| update_answer(&state, cmd)),
             };
@@ -1724,8 +1788,9 @@ impl Processor {
                 {
                     let attempt = self.attempt(&key, cmd);
                     if let Some((queue, _)) = &self.remote {
-                        let build = self.partition.pinned_build(&key);
-                        let priority = self.partition.priority(&key);
+                        let partition = self.host.partition();
+                        let build = partition.and_then(|p| p.pinned_build(&key));
+                        let priority = partition.map_or(0, |p| p.priority(&key));
                         let now = queue.now_ms();
                         queue.offer_pinned(&key, cmd, &name, input, attempt, build, priority, now);
                     }
@@ -1779,8 +1844,10 @@ impl Processor {
                     at,
                     env,
                 } => {
-                    let (Some(queue), Some(run)) = (&self.activations, self.partition.run(&key))
-                    else {
+                    let (Some(queue), Some(run)) = (
+                        &self.activations,
+                        self.host.partition().and_then(|p| p.run(&key)),
+                    ) else {
                         continue;
                     };
                     // The history as the remote side receives it: the records, chained to the run id.
@@ -1791,8 +1858,9 @@ impl Processor {
                         .take(at)
                         .map(|entry| chain.append(entry))
                         .collect();
-                    let build = self.partition.pinned_build(&key);
-                    let priority = self.partition.priority(&key);
+                    let partition = self.host.partition();
+                    let build = partition.and_then(|p| p.pinned_build(&key));
+                    let priority = partition.map_or(0, |p| p.priority(&key));
                     let now = queue.now_ms();
                     queue.offer_pinned(&key, &workflow, build, priority, at, history, env, now);
                 }
@@ -1813,8 +1881,9 @@ impl Processor {
                 .waiters
                 .keys()
                 .filter(|id| {
-                    self.partition
-                        .run(id)
+                    self.host
+                        .partition()
+                        .and_then(|p| p.run(id))
                         .is_some_and(|run| run.state().status() == Status::Continued)
                 })
                 .cloned()
@@ -1833,14 +1902,15 @@ impl Processor {
             .waiters
             .keys()
             .filter(|key| {
-                self.partition
-                    .run(key)
+                self.host
+                    .partition()
+                    .and_then(|p| p.run(key))
                     .is_some_and(|run| run.state().status().is_terminal())
             })
             .cloned()
             .collect();
         for key in finished {
-            let Some(run) = self.partition.run(&key) else {
+            let Some(run) = self.host.partition().and_then(|p| p.run(&key)) else {
                 continue;
             };
             let state = run.state();
