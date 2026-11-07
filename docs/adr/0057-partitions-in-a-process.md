@@ -47,8 +47,6 @@ partition, calls routed by key, and the messages between partitions carried from
 - Tested with three servers of two partitions each (`aqueduct-server/tests/cluster.rs`): parents with
   shared children and messages to counters, asked of any server, end right; after a server stops, every
   counter has counted each message once.
-- **Not covered by that test:** messages sent to another server's partition. The servers start one after
-  another and the first wins every partition's election, so all leaders are on one server; making
-  `/cluster/v1/remote` a no-op is not caught. Leadership balancing (step 7) will spread leaders, and the
-  test with them.
+- Messages sent to another server's partition: covered since leaders are balanced (ADR 0058); making
+  `/cluster/v1/remote` a no-op fails the test.
 - Moving slots between partitions (resharding) is still later (ADR 0053).

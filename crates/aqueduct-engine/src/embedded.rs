@@ -276,6 +276,9 @@ pub struct Replication {
     pub tick: Duration,
     /// Raft's timing, in ticks.
     pub config: aqueduct_raft::Config,
+    /// The node that should lead this partition when it can (ADR 0058): the leader hands over to it
+    /// once it is caught up, so that leaders spread over the nodes.
+    pub preferred_leader: Option<u64>,
 }
 
 impl std::fmt::Debug for Replication {
@@ -577,6 +580,8 @@ impl Builder {
             send: replication.transport,
             tick: replication.tick,
             released: Vec::new(),
+            preferred: replication.preferred_leader,
+            ticks: 0,
         })
     }
 
@@ -1444,10 +1449,15 @@ pub(crate) struct Replicated {
     send: Transport,
     tick: Duration,
     released: Vec<Outbound>,
+    preferred: Option<u64>,
+    ticks: u64,
 }
 
 /// How a replica sends a Raft message to another.
 pub type Transport = Arc<dyn Fn(aqueduct_raft::Envelope) + Send + Sync>;
+
+/// Ticks between a leader's checks that it is the preferred one (ADR 0058).
+const PREFER_EVERY: u64 = 40;
 
 /// Entries applied between snapshots of a replicated engine.
 const COMPACT_EVERY: u64 = 1_000;
@@ -1521,6 +1531,13 @@ impl Host for Replicated {
 
     fn tick(&mut self) {
         self.replica.tick();
+        self.ticks += 1;
+        // Now and then, the leader hands over to the preferred node, once it is caught up.
+        if let Some(preferred) = self.preferred
+            && self.ticks.is_multiple_of(PREFER_EVERY)
+        {
+            self.replica.prefer_leader(preferred);
+        }
     }
 
     fn step(&mut self, envelope: aqueduct_raft::Envelope) {
@@ -1601,6 +1618,9 @@ impl<H: Host> Processor<H> {
         let mut next_redispatch = now_ms().saturating_add(millis(redispatch));
         let tick = self.host.tick_every();
         let mut next_tick = tick.map(|t| now_ms().saturating_add(millis(t)));
+        // Messages between partitions are repeated every second when unanswered (ADR 0052).
+        let repeat = Duration::from_secs(1);
+        let mut next_repeat = now_ms().saturating_add(millis(repeat));
         loop {
             let now = now_ms();
             let wake = self
@@ -1608,7 +1628,7 @@ impl<H: Host> Processor<H> {
                 .partition()
                 .and_then(Partition::next_timer)
                 .map_or(next_redispatch, |t| t.min(next_redispatch));
-            let wake = next_tick.map_or(wake, |t| t.min(wake));
+            let wake = next_tick.map_or(wake, |t| t.min(wake)).min(next_repeat);
             let first = match inbox.recv_timeout(Duration::from_millis(wake.saturating_sub(now))) {
                 Ok(request) => Some(request),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -1625,11 +1645,16 @@ impl<H: Host> Processor<H> {
                 partition.set_time(now);
                 if now >= next_redispatch {
                     partition.redispatch();
+                } else if now >= next_repeat {
+                    partition.repeat_remote();
                 }
                 partition.fire_due_timers().map_err(|e| e.to_string())?;
             }
             if now >= next_redispatch {
                 next_redispatch = now.saturating_add(millis(redispatch));
+            }
+            if now >= next_repeat {
+                next_repeat = now.saturating_add(millis(repeat));
             }
             // Group commit: take everything that is waiting, then sync once.
             for request in first.into_iter().chain(inbox.try_iter()) {

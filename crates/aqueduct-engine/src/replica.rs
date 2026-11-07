@@ -419,6 +419,18 @@ impl Replica {
         }
     }
 
+    /// On the leader: hands leadership to `preferred` (ADR 0058) if it is another member, caught up, and
+    /// no transfer is under way. While it hands over, it takes no new batches.
+    pub fn prefer_leader(&mut self, preferred: NodeId) {
+        if self.leads()
+            && preferred != self.raft.id()
+            && self.raft.transferring().is_none()
+            && self.raft.caught_up(preferred)
+        {
+            let _ = self.raft.transfer_leadership(preferred);
+        }
+    }
+
     /// On the leader, moves the group one membership change towards `desired` (the metadata store's
     /// replicas for this partition, ADR 0053): one change at a time, adding before removing.
     pub fn reconcile(&mut self, desired: &[NodeId]) {

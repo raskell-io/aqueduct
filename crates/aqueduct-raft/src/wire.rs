@@ -266,6 +266,10 @@ pub fn encode_envelope(envelope: &Envelope) -> Vec<u8> {
             w.u64(*term);
             w.snapshot(snapshot);
         }
+        Message::TimeoutNow { term } => {
+            w.u64(5);
+            w.u64(*term);
+        }
         Message::AppendReply {
             term,
             success,
@@ -322,6 +326,7 @@ pub fn decode_envelope(data: &[u8]) -> Result<Envelope, DecodeError> {
             success: r.bool()?,
             index: r.u64()?,
         },
+        5 => Message::TimeoutNow { term: r.u64()? },
         other => return Err(DecodeError(format!("unknown message kind {other}"))),
     };
     r.end()?;
@@ -377,6 +382,7 @@ mod tests {
                 success: false,
                 index: 3,
             },
+            Message::TimeoutNow { term: 4 },
         ];
         for message in messages {
             let envelope = Envelope {

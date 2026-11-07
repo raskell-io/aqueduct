@@ -64,6 +64,7 @@ fn open(dir: &PathBuf, id: u64, router: &Router) -> Engine {
             }),
             tick: Duration::from_millis(10),
             config: aqueduct_raft::Config::default(),
+            preferred_leader: None,
         })
         .open()
         .unwrap();

@@ -114,12 +114,16 @@ impl Cluster {
                 let _ = queue.try_send(envelope);
             }
         });
+        // Leaders spread over the nodes: partition p prefers the p-th node, round robin (ADR 0058).
+        let members: Vec<u64> = self.peers.keys().copied().collect();
+        let preferred = members[partition as usize % members.len()];
         Ok(Replication {
             id: self.id,
-            members: self.peers.keys().copied().collect(),
+            members,
             transport,
             tick: Duration::from_millis(self.tick_ms),
             config: aqueduct_raft::Config::default(),
+            preferred_leader: Some(preferred),
         })
     }
 
