@@ -490,7 +490,7 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
     let entered = runtime.enter();
     // Steps run on step workers and push endpoints (ADR 0038, ADR 0040), in every partition
     // (ADR 0057).
-    let shards = aqueduct_engine::shards::Shards::open(dir, config.partition_count(), |path, _| {
+    let build = |path: std::path::PathBuf, _| {
         let builder = aqueduct_engine::embedded::Engine::builder(path)
             .remote_steps(std::time::Duration::from_secs(30));
         let builder = config
@@ -499,7 +499,13 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
         registry
             .deploy(builder)
             .map_err(|e| aqueduct_engine::embedded::EngineError::Open(e.to_string()))
-    })
+    };
+    // In a cluster, each partition is a replica of its Raft group (ADR 0056, 0057).
+    let shards = match &config.cluster {
+        Some(cluster) => cluster.open(dir, config.partition_count(), build),
+        None => aqueduct_engine::shards::Shards::open(dir, config.partition_count(), build)
+            .map(std::sync::Arc::new),
+    }
     .map_err(|e| e.to_string())?;
     let security = aqueduct_server::Security::for_dir(dir)?;
     for note in &notes {
@@ -577,16 +583,9 @@ fn server(dir: &Path, args: &[String]) -> Result<String, String> {
                 let _ = tokio::signal::ctrl_c().await;
             }
         };
-        aqueduct_server::serve_shards(
-            std::sync::Arc::new(shards),
-            listener,
-            &config,
-            security,
-            tls,
-            stop,
-        )
-        .await
-        .map_err(|e| e.to_string())
+        aqueduct_server::serve_shards(shards, listener, &config, security, tls, stop)
+            .await
+            .map_err(|e| e.to_string())
     })?;
     Ok("stopped\n".to_owned())
 }

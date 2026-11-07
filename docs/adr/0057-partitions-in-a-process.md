@@ -38,6 +38,17 @@ partition, calls routed by key, and the messages between partitions carried from
   push endpoints and workers share one queue. A directory laid out for another number of partitions is
   refused. Imports need a server with one partition. Tested over HTTP with four partitions
   (`aqueduct-server/tests/partitions.rs`).
-- Cluster mode with more than one partition is refused for now: it needs Raft messages and messages
-  between partitions addressed by partition, and requests forwarded to each partition's leader.
+- **In a cluster** (`Cluster::open`), each partition is a replica of its own Raft group across the
+  servers. Raft messages carry their partition (`POST /cluster/v1/raft`). A message for another
+  partition goes to this server's engine for it if that leads, and otherwise to the server that leads it
+  (`POST /cluster/v1/remote`, the message as JSON, authenticated by the cluster's secret). An HTTP request
+  is tried where it arrives; an *unavailable* answer naming the leader (`aqueduct-leader`) forwards it
+  there, so each partition's requests reach its own leader.
+- Tested with three servers of two partitions each (`aqueduct-server/tests/cluster.rs`): parents with
+  shared children and messages to counters, asked of any server, end right; after a server stops, every
+  counter has counted each message once.
+- **Not covered by that test:** messages sent to another server's partition. The servers start one after
+  another and the first wins every partition's election, so all leaders are on one server; making
+  `/cluster/v1/remote` a no-op is not caught. Leadership balancing (step 7) will spread leaders, and the
+  test with them.
 - Moving slots between partitions (resharding) is still later (ADR 0053).

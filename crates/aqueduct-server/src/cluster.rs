@@ -1,12 +1,20 @@
-//! Cluster mode (ADR 0056): the server's partition is a replica of a Raft group whose other replicas
-//! are other servers. Raft messages travel as `POST /cluster/v1/raft` between them, authenticated by a
-//! shared secret; a server that does not lead answers *unavailable* and names the node that does.
+//! Cluster mode (ADR 0056, 0057): each of the server's partitions is a replica of a Raft group whose
+//! other replicas are on the other servers. Between servers, authenticated by a shared secret:
+//!
+//! - Raft messages travel as `POST /cluster/v1/raft`, each tagged with its partition;
+//! - messages between partitions (ADR 0052) as `POST /cluster/v1/remote`, to the server that leads the
+//!   partition they are for;
+//! - an HTTP request that reaches a partition this server does not lead is forwarded to the server that
+//!   does.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use aqueduct_engine::embedded::{Builder, Engine, RaftInbox, Replication, Transport};
+use aqueduct_engine::Remote;
+use aqueduct_engine::embedded::{Builder, EngineError, RemoteRoute, Replication, Transport};
+use aqueduct_engine::shards::Shards;
 use aqueduct_raft::{Envelope, wire};
 use axum::Router;
 use axum::body::Bytes;
@@ -19,13 +27,16 @@ use serde::Deserialize;
 /// The header a forwarded request carries: it is answered where it arrives, never forwarded again.
 const FORWARDED_HEADER: &str = "aqueduct-forwarded";
 
+/// The header an *unavailable* answer names the leader in, when it knows it.
+pub(crate) const LEADER_HEADER: &str = "aqueduct-leader";
+
 /// The largest request body forwarded to the leader (16 MiB).
 const MOST_FORWARDED: usize = 16 << 20;
 
 /// The header that carries the cluster's secret.
 const SECRET_HEADER: &str = "aqueduct-cluster-secret";
 
-/// Messages waiting for one peer before new ones are dropped (Raft sends them again).
+/// Messages waiting for one peer before new ones are dropped (Raft, and senders, repeat them).
 const QUEUE: usize = 4096;
 
 /// Messages in one request to a peer.
@@ -39,7 +50,8 @@ pub struct Cluster {
     pub id: u64,
     /// Every node of the group, this one included: its id and base URL (`http://host:port`).
     pub peers: BTreeMap<u64, String>,
-    /// A secret every node shares, at least 16 characters: Raft messages without it are refused.
+    /// A secret every node shares, at least 16 characters: messages between servers without it are
+    /// refused.
     pub secret: String,
     /// How often Raft's clock ticks, in milliseconds. Default 50: elections after 0.5 to 1 s of silence.
     #[serde(default = "default_tick")]
@@ -73,9 +85,9 @@ impl Cluster {
         Ok(())
     }
 
-    /// Makes the engine a replica of the group, with a transport to the other nodes. Must be called
-    /// inside a tokio runtime: each peer gets a task that ships its messages.
-    pub fn apply(&self, builder: Builder) -> Result<Builder, String> {
+    /// How partition `partition` takes part in its Raft group: its transport ships messages to the
+    /// other nodes, tagged with the partition. Must be called inside a tokio runtime.
+    pub fn replication(&self, partition: u32) -> Result<Replication, String> {
         self.check()?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "cluster mode needs a running tokio runtime".to_owned())?;
@@ -85,12 +97,14 @@ impl Cluster {
             if *peer == self.id {
                 continue;
             }
-            let (sender, receiver) = tokio::sync::mpsc::channel(QUEUE);
+            let (sender, receiver) = tokio::sync::mpsc::channel::<Envelope>(QUEUE);
+            let url = format!("{}/cluster/v1/raft", url.trim_end_matches('/'));
             runtime.spawn(ship(
                 client.clone(),
-                format!("{}/cluster/v1/raft", url.trim_end_matches('/')),
+                url,
                 self.secret.clone(),
                 receiver,
+                move |batch: &[Envelope]| encode(partition, batch),
             ));
             queues.insert(*peer, sender);
         }
@@ -100,19 +114,75 @@ impl Cluster {
                 let _ = queue.try_send(envelope);
             }
         });
-        Ok(builder.replicated(Replication {
+        Ok(Replication {
             id: self.id,
             members: self.peers.keys().copied().collect(),
             transport,
             tick: Duration::from_millis(self.tick_ms),
             config: aqueduct_raft::Config::default(),
-        }))
+        })
+    }
+
+    /// Opens the server's partitions, each a replica of its Raft group (ADR 0057). Messages for another
+    /// partition go to this server's engine for it when that leads, and to the server that leads it
+    /// otherwise. Must be called inside a tokio runtime.
+    pub fn open(
+        &self,
+        dir: &Path,
+        partitions: u32,
+        mut build: impl FnMut(PathBuf, u32) -> Result<Builder, EngineError>,
+    ) -> Result<Arc<Shards>, EngineError> {
+        let shards: Arc<OnceLock<Weak<Shards>>> = Arc::default();
+        let client = crate::push::client().map_err(EngineError::Open)?;
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| EngineError::Open("cluster mode needs a running tokio runtime".into()))?;
+        let route = |partition: u32| -> Option<RemoteRoute> {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<(String, Remote)>(QUEUE);
+            runtime.spawn(ship_remote(
+                client.clone(),
+                self.secret.clone(),
+                partition,
+                receiver,
+            ));
+            let shards = Arc::clone(&shards);
+            let peers = self.peers.clone();
+            Some(Arc::new(move |_to: String, message: Remote| {
+                let Some(shards) = shards.get().and_then(Weak::upgrade) else {
+                    return;
+                };
+                let Some(engine) = shards.engines().get(partition as usize) else {
+                    return;
+                };
+                match engine.leader().and_then(|leader| peers.get(&leader)) {
+                    Some(url) => {
+                        let url = format!("{}/cluster/v1/remote", url.trim_end_matches('/'));
+                        let _ = sender.try_send((url, message));
+                    }
+                    // Here, or no leader known: this server's engine takes it, or drops it if it does
+                    // not lead, and the sender repeats it.
+                    None => engine.receive(message),
+                }
+            }))
+        };
+        let opened = Shards::open_routed(
+            dir,
+            partitions,
+            |path, partition| {
+                let replication = self.replication(partition).map_err(EngineError::Open)?;
+                Ok(build(path, partition)?.replicated(replication))
+            },
+            route,
+        )?;
+        let opened = Arc::new(opened);
+        let _ = shards.set(Arc::downgrade(&opened));
+        Ok(opened)
     }
 }
 
-/// Encodes envelopes as one request body: each a little-endian `u32` length and its bytes.
-pub fn encode(envelopes: &[Envelope]) -> Vec<u8> {
-    let mut body = Vec::new();
+/// Encodes Raft messages of one partition as one request body: the partition, then each envelope as a
+/// little-endian `u32` length and its bytes.
+pub fn encode(partition: u32, envelopes: &[Envelope]) -> Vec<u8> {
+    let mut body = partition.to_le_bytes().to_vec();
     for envelope in envelopes {
         let bytes = wire::encode_envelope(envelope);
         let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
@@ -123,7 +193,10 @@ pub fn encode(envelopes: &[Envelope]) -> Vec<u8> {
 }
 
 /// Decodes a body from [`encode`].
-pub fn decode(mut body: &[u8]) -> Result<Vec<Envelope>, String> {
+pub fn decode(body: &[u8]) -> Result<(u32, Vec<Envelope>), String> {
+    let (partition, mut body) = body
+        .split_first_chunk::<4>()
+        .ok_or("a body without its partition")?;
     let mut envelopes = Vec::new();
     while !body.is_empty() {
         let (length, rest) = body
@@ -134,15 +207,25 @@ pub fn decode(mut body: &[u8]) -> Result<Vec<Envelope>, String> {
         envelopes.push(wire::decode_envelope(bytes).map_err(|e| e.to_string())?);
         body = &rest[length..];
     }
-    Ok(envelopes)
+    Ok((u32::from_le_bytes(*partition), envelopes))
 }
 
-/// Ships one peer's messages, in batches, as they come; a failed request drops its batch.
+fn request(url: &str, secret: &str, body: Vec<u8>) -> Option<axum::http::Request<Full<Bytes>>> {
+    axum::http::Request::post(url)
+        .header("content-type", "application/octet-stream")
+        .header(SECRET_HEADER, secret)
+        .body(Full::new(Bytes::from(body)))
+        .ok()
+}
+
+/// Ships one peer's Raft messages for one partition, in batches, as they come; a failed request drops
+/// its batch.
 async fn ship(
     client: crate::push::Client,
     url: String,
     secret: String,
     mut queue: tokio::sync::mpsc::Receiver<Envelope>,
+    encode: impl Fn(&[Envelope]) -> Vec<u8>,
 ) {
     while let Some(first) = queue.recv().await {
         let mut batch = vec![first];
@@ -152,54 +235,118 @@ async fn ship(
                 Err(_) => break,
             }
         }
-        let Ok(request) = axum::http::Request::post(&url)
-            .header("content-type", "application/octet-stream")
-            .header(SECRET_HEADER, &secret)
-            .body(Full::new(Bytes::from(encode(&batch))))
-        else {
-            continue;
-        };
-        let _ = tokio::time::timeout(Duration::from_secs(1), client.request(request)).await;
+        if let Some(request) = request(&url, &secret, encode(&batch)) {
+            let _ = tokio::time::timeout(Duration::from_secs(1), client.request(request)).await;
+        }
+    }
+}
+
+/// Ships messages for one partition to the server that leads it; a failed request drops the message,
+/// and its sender repeats it.
+async fn ship_remote(
+    client: crate::push::Client,
+    secret: String,
+    partition: u32,
+    mut queue: tokio::sync::mpsc::Receiver<(String, Remote)>,
+) {
+    while let Some((url, message)) = queue.recv().await {
+        let mut body = partition.to_le_bytes().to_vec();
+        body.extend_from_slice(&message.encode());
+        if let Some(request) = request(&url, &secret, body) {
+            let _ = tokio::time::timeout(Duration::from_secs(1), client.request(request)).await;
+        }
     }
 }
 
 #[derive(Clone)]
 struct Peer {
-    inbox: RaftInbox,
-    id: u64,
+    shards: Arc<Shards>,
     secret: Arc<String>,
 }
 
-/// The route other nodes send Raft messages to. Merged outside token authentication: the cluster's
-/// secret authenticates it.
-pub(crate) fn routes(engine: &Engine, cluster: &Cluster) -> Router {
+/// The routes other servers send to. Merged outside token authentication: the cluster's secret
+/// authenticates them.
+pub(crate) fn routes(shards: &Arc<Shards>, cluster: &Cluster) -> Router {
     Router::new()
-        .route("/cluster/v1/raft", post(receive))
+        .route("/cluster/v1/raft", post(receive_raft))
+        .route("/cluster/v1/remote", post(receive_remote))
         .with_state(Peer {
-            inbox: engine.raft_inbox(),
-            id: cluster.id,
+            shards: Arc::clone(shards),
             secret: Arc::new(cluster.secret.clone()),
         })
 }
 
+/// Whether two secrets are equal, in time that does not depend on where they differ.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    let (a, b) = (Sha256::digest(a), Sha256::digest(b));
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+fn authentic(peer: &Peer, headers: &HeaderMap) -> bool {
+    let secret = headers
+        .get(SECRET_HEADER)
+        .map(|value| value.as_bytes())
+        .unwrap_or_default();
+    same(secret, peer.secret.as_bytes())
+}
+
+async fn receive_raft(State(peer): State<Peer>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    if !authentic(&peer, &headers) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Ok((partition, envelopes)) = decode(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(engine) = peer.shards.engines().get(partition as usize) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let inbox = engine.raft_inbox();
+    for envelope in envelopes {
+        inbox.deliver(envelope);
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn receive_remote(State(peer): State<Peer>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    if !authentic(&peer, &headers) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Some((partition, message)) = body.split_first_chunk::<4>() else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Ok(message) = Remote::decode(message) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    match peer
+        .shards
+        .engines()
+        .get(u32::from_le_bytes(*partition) as usize)
+    {
+        Some(engine) => {
+            engine.receive(message);
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::BAD_REQUEST,
+    }
+}
+
 #[derive(Clone)]
 struct Forward {
-    engine: Arc<Engine>,
     peers: Arc<BTreeMap<u64, String>>,
     client: crate::push::Client,
 }
 
-/// Forwards HTTP/JSON requests (`/v1/...`) that arrive at a node that does not lead to the node that
-/// does, and returns its answer: clients may ask any node. Applied outside authentication, so the
-/// leader authenticates them; every node needs the same tokens. gRPC calls are not forwarded: a node
-/// that does not lead answers `UNAVAILABLE`.
-pub(crate) fn forwarding(
-    router: Router,
-    engine: &Arc<Engine>,
-    cluster: &Cluster,
-) -> Result<Router, String> {
+/// Forwards HTTP/JSON requests (`/v1/...`) that reach a partition this server does not lead to the
+/// server that does, and returns its answer: clients may ask any server. The request is tried here
+/// first; an *unavailable* answer naming the leader ([`LEADER_HEADER`]) sends it there. Applied outside
+/// authentication, so that the leader authenticates it; every server needs the same tokens. gRPC calls
+/// are not forwarded.
+pub(crate) fn forwarding(router: Router, cluster: &Cluster) -> Result<Router, String> {
     let forward = Forward {
-        engine: Arc::clone(engine),
         peers: Arc::new(cluster.peers.clone()),
         client: crate::push::client()?,
     };
@@ -219,28 +366,34 @@ async fn forward_request(
         .headers()
         .get("content-type")
         .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
-    let target = forward
-        .engine
-        .leader()
-        .and_then(|leader| forward.peers.get(&leader).cloned());
-    let Some(target) = target.filter(|_| {
-        !grpc
-            && request.uri().path().starts_with("/v1/")
-            && !request.headers().contains_key(FORWARDED_HEADER)
-            && !forward.engine.leads()
-    }) else {
+    if grpc
+        || !request.uri().path().starts_with("/v1/")
+        || request.headers().contains_key(FORWARDED_HEADER)
+    {
         return next.run(request).await;
-    };
+    }
     let (parts, body) = request.into_parts();
-    let unavailable = |why: String| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "error": why })),
-        )
-            .into_response()
-    };
     let Ok(body) = axum::body::to_bytes(body, MOST_FORWARDED).await else {
-        return unavailable("the request is too large to forward to the leader".into());
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            axum::Json(serde_json::json!({ "error": "the request is too large" })),
+        )
+            .into_response();
+    };
+    let here = next
+        .run(axum::extract::Request::from_parts(
+            parts.clone(),
+            axum::body::Body::from(body.clone()),
+        ))
+        .await;
+    let leader = here
+        .headers()
+        .get(LEADER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let target = leader.and_then(|leader| forward.peers.get(&leader));
+    let (Some(target), StatusCode::SERVICE_UNAVAILABLE) = (target, here.status()) else {
+        return here;
     };
     let path = parts
         .uri
@@ -255,41 +408,12 @@ async fn forward_request(
         }
     }
     let Ok(outgoing) = outgoing.header(FORWARDED_HEADER, "1").body(Full::new(body)) else {
-        return unavailable("the request could not be forwarded to the leader".into());
+        return here;
     };
     match forward.client.request(outgoing).await {
         Ok(answer) => answer.map(axum::body::Body::new),
-        Err(e) => unavailable(format!("the leader at {target} did not answer: {e}")),
+        Err(_) => here,
     }
-}
-
-/// Whether two secrets are equal, in time that does not depend on where they differ.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    use sha2::{Digest, Sha256};
-    let (a, b) = (Sha256::digest(a), Sha256::digest(b));
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
-
-async fn receive(State(peer): State<Peer>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    let secret = headers
-        .get(SECRET_HEADER)
-        .map(|value| value.as_bytes())
-        .unwrap_or_default();
-    if !same(secret, peer.secret.as_bytes()) {
-        return StatusCode::UNAUTHORIZED;
-    }
-    let Ok(envelopes) = decode(&body) else {
-        return StatusCode::BAD_REQUEST;
-    };
-    for envelope in envelopes {
-        if envelope.to == peer.id {
-            peer.inbox.deliver(envelope);
-        }
-    }
-    StatusCode::NO_CONTENT
 }
 
 #[cfg(test)]
@@ -319,9 +443,10 @@ mod tests {
                 },
             },
         ];
-        let body = encode(&envelopes);
-        assert_eq!(decode(&body), Ok(envelopes));
+        let body = encode(7, &envelopes);
+        assert_eq!(decode(&body), Ok((7, envelopes)));
         assert!(decode(&body[..body.len() - 1]).is_err());
+        assert!(decode(&[1, 0]).is_err());
         assert!(same(b"a secret", b"a secret"));
         assert!(!same(b"a secret", b"a secreT"));
     }

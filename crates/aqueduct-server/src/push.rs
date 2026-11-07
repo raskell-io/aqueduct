@@ -118,9 +118,7 @@ impl Config {
                 aqueduct_engine::placement::SLOTS
             ));
         }
-        if partitions > 1 && self.cluster.is_some() {
-            return Err("cluster mode runs one partition per server so far (ADR 0056)".into());
-        }
+
         for endpoint in &self.push {
             if !(endpoint.url.starts_with("http://") || endpoint.url.starts_with("https://")) {
                 return Err(format!(
@@ -169,9 +167,6 @@ impl Config {
         }
         if let Some(limit) = self.limits.max_running_runs {
             builder = builder.max_running_runs(limit);
-        }
-        if let Some(cluster) = &self.cluster {
-            builder = cluster.apply(builder)?;
         }
         Ok(builder)
     }
