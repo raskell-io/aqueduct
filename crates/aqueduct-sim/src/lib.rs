@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cluster;
 mod disk;
 mod node;
 mod rng;
@@ -113,6 +114,9 @@ pub struct Config {
     pub bugs: Bugs,
     /// The workload.
     pub workload: WorkloadKind,
+    /// Replicas of the partition: 0 runs one node with its own disk; more run a Raft group
+    /// replicating its log.
+    pub replicas: usize,
 }
 
 impl Default for Config {
@@ -137,6 +141,7 @@ impl Default for Config {
             cancel_every: 3,
             bugs: Bugs::default(),
             workload: WorkloadKind::default(),
+            replicas: 0,
         }
     }
 }
@@ -193,6 +198,8 @@ pub struct Report {
     pub answer_escalations: u64,
     /// Agent calls executed by the simulated model, including repeats before a result was recorded.
     pub agent_calls: u64,
+    /// Partitions built by new leaders (the replicated world).
+    pub failovers: u64,
     /// A fingerprint of the event sequence and the final chain heads. Equal for equal seeds.
     pub trace: u64,
 }
@@ -231,5 +238,8 @@ impl std::error::Error for Failure {}
 
 /// Runs one seed.
 pub fn run_seed(seed: u64, config: &Config) -> Result<Report, Failure> {
+    if config.replicas > 0 {
+        return cluster::run(seed, config);
+    }
     world::run(seed, config)
 }

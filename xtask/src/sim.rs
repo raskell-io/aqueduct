@@ -9,6 +9,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut count = 1_000u64;
     let mut single = None;
     let mut workload = WorkloadKind::Pipeline;
+    let mut replicas = 0usize;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let mut value = || -> Result<u64, String> {
@@ -21,6 +22,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--seed" => single = Some(value()?),
             "--seeds" => count = value()?,
             "--from" => from = value()?,
+            "--replicas" => replicas = usize::try_from(value()?).map_err(|e| e.to_string())?,
             "--workload" => {
                 workload = match iter.next().map(String::as_str) {
                     Some("native") => WorkloadKind::Pipeline,
@@ -37,7 +39,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown argument {other}; use --seed N, or --seeds N [--from S]"
+                    "unknown argument {other}; use --seed N, or --seeds N [--from S], with --workload W and --replicas R"
                 ));
             }
         }
@@ -45,6 +47,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     let config = Config {
         workload,
+        replicas,
         ..Config::default()
     };
     if let Some(seed) = single {
@@ -78,13 +81,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.children += report.children;
         total.updates_answered += report.updates_answered;
         total.messages += report.messages;
+        total.failovers += report.failovers;
     }
     println!(
         "{count} seeds ({from}..{}, {workload:?}) passed in {:.1} s\n\
          events {}, crashes {} (of which failed syncs {}), torn tails truncated {}, checkpoints {}\n\
          messages dropped {}, duplicated {}\n\
          step executions {} (repeats {}), retries {}, runs completed {}, failed as intended {}, cancelled {}, escalations resolved {}, agent calls {}, budget escalations {} (approved {}), answers escalated {}\n\
-         child runs {}, updates answered {}, messages to objects {}",
+         child runs {}, updates answered {}, messages to objects {}, partitions built by new leaders {}",
         from + count,
         started.elapsed().as_secs_f64(),
         total.events,
@@ -108,6 +112,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         total.children,
         total.updates_answered,
         total.messages,
+        total.failovers,
     );
     Ok(())
 }

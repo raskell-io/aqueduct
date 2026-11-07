@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 aqueduct-codec.workspace = true
 aqueduct-core.workspace = true
+aqueduct-raft.workspace = true
 aqueduct-storage.workspace = true
 boon = "0.6"
 serde_json = "1"

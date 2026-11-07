@@ -9,7 +9,7 @@ How Aqueduct is put together, and where new code belongs. The why is in the ADRs
 | `aqueduct-core` | The pure state machine: commands, journal entries, `RunState::handle_at(event) -> (entries, effects)`. No I/O, no clock, no randomness, no async. | nothing of ours |
 | `aqueduct-codec` | The history format: canonical encoding, the SHA-256 hash chain per run, log records. | core |
 | `aqueduct-storage` | The segmented, framed file log (one writer, locked) and the redb state store for checkpoints. | codec |
-| `aqueduct-engine` | `Partition` (journals, group commit, timers, retries, checkpoints, outbound messages released only after durability) and the embedded `Engine` (threads, workers, the public API). The `Observer` hook for telemetry. | core, codec, storage |
+| `aqueduct-engine` | `Partition` (journals, group commit, timers, retries, checkpoints, outbound messages released only after durability) and the embedded `Engine` (threads, workers, the public API). The `Observer` hook for telemetry. `Replica`: a partition whose log is a Raft group. | core, codec, storage, raft |
 | `aqueduct-procedure` | Starlark procedures as deciders: hermetic, replayed by re-execution, budgeted. | core |
 | `aqueduct-sdk` | Rust workflows as `async fn`s: `WorkflowContext`, `join`, `select`, sagas. Each activation re-runs the function against the journal. | core |
 | `aqueduct-otel` | OpenTelemetry traces and metrics through the engine's `Observer`. | engine |
@@ -19,8 +19,8 @@ How Aqueduct is put together, and where new code belongs. The why is in the ADRs
 | `aqueduct-server` | The ingress, step and workflow workers, imports, tokens, TLS, audit, limits, namespaces. | engine, protocol |
 | `aqueduct-worker` | A Rust library for step and workflow workers. | protocol, sdk |
 | `aqueduct-cli` | The `aqueduct` command: inspect, verify, export, replay, versions, `server`, `migrate`, `tokens`, `mcp`. Most commands work on a stopped engine's directory. | all of the above |
-| `aqueduct-sim` | The deterministic simulator: the real `Partition` on a simulated disk, network, clock and workers, with crashes, torn writes, failed syncs, lost and duplicated messages. | engine, sdk, procedure |
-| `aqueduct-raft` | Raft as a pure state machine, and its own deterministic simulator (ADR 0051). Not yet used by the engine. | |
+| `aqueduct-sim` | The deterministic simulator: the real `Partition` on a simulated disk, network, clock and workers, with crashes, torn writes, failed syncs, lost and duplicated messages; with `--replicas`, a partition replicated by Raft (`aqueduct_engine::replica`). | engine, sdk, procedure, raft |
+| `aqueduct-raft` | Raft as a pure state machine, and its own deterministic simulator (ADR 0051). The engine's `replica` module pairs it with a partition; the server does not use it yet. | |
 | `aqueduct` | The facade users depend on, with the runnable examples. | all of the above |
 | `benches/*` | Storage, embedded engine and server benchmarks. Results go to `docs/measurements/`. | |
 | `conformance` | The suite every worker library passes, polling and as a push endpoint. | |
