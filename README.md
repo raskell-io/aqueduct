@@ -11,12 +11,13 @@
   Every run leaves a history you can replay and audit.
 </p>
 
-> **Status: single server (phase 3 of the [build brief](BRIEF.md)).** The embedded engine, procedures, agent steps
-> and the version registry are built. So is a server with workers in Rust, Python and TypeScript, deployments,
-> priorities, tokens, TLS, an audit log, namespaces and overload protection: every item of phase 3. Work on a
-> replicated cluster has begun (phase 4, [ADR 0051](docs/adr/0051-cluster-and-raft.md)): three or more servers can
-> replicate one partition with our own Raft and survive losing their leader ([ADR 0056](docs/adr/0056-cluster-server.md));
-> many partitions, messages between them and moving replicas run in the simulator so far.
+> **Status: cluster (phase 4 of the [build brief](BRIEF.md)), built and simulated.** The embedded engine,
+> procedures, agent steps, the version registry and the single server with its workers are done (phases 0 to 3).
+> The cluster is built: servers replicate partitions with our own Raft, route every request to its partition's
+> leader, spread leaders, move replicas, upgrade one at a time, authenticate each other with mutual TLS, archive
+> histories to object storage and forget old runs ([ADR 0051](docs/adr/0051-cluster-and-raft.md) to
+> [0066](docs/adr/0066-retention.md)). A five-machine cluster passes 100,000 simulated seeds every night. What
+> phase 4 still needs is a [failover drill and measurements on real machines](docs/failover-drill.md).
 >
 > You can try it, but do not depend on it yet: the APIs and the history format will still change, and nothing
 > is published on crates.io. See [what is not done](#what-is-not-done), the [docs](docs/README.md) and the
@@ -45,7 +46,7 @@ one journal format and one set of guarantees.
 |---|---|---|---|
 | **Embedded** | the engine, inside your program (`aqueduct` crate) | CLIs, desktop apps, single binary services, tests | built |
 | **Single server** | `aqueduct server`, with workers or push endpoints | small teams, departments, staging | built |
-| **Cluster** | several servers, replicated | production platforms | started: one replicated partition across servers; many partitions simulated |
+| **Cluster** | three or more servers, partitions replicated by Raft | production platforms | built and simulated; not yet drilled on real machines |
 
 An embedded directory and a server's are the same format, and
 `aqueduct migrate --from ./data --to https://server` moves one to a running server
@@ -227,6 +228,31 @@ deployments ([ADR 0059](docs/adr/0059-web-console.md)).
 A worker holds each step under a lease. If it crashes or its result is lost, the step goes to another worker, and the
 run records one result.
 
+### A cluster
+
+Three servers (or five), each with the same approved versions and tokens, and a `"cluster"` section in their
+configuration naming the others ([ADR 0056](docs/adr/0056-cluster-server.md)):
+
+```json
+{
+  "partitions": 8,
+  "cluster": {
+    "id": 1,
+    "peers": {"1": "https://10.0.0.1:7470", "2": "https://10.0.0.2:7470", "3": "https://10.0.0.3:7470"},
+    "secret": "<at least 16 characters, the same on every server>",
+    "tls": {"ca": "ca.pem", "cert": "server.pem", "key": "server-key.pem"}
+  }
+}
+```
+
+```sh
+aqueduct server ./data --listen 0.0.0.0:7470 --config cluster.json --tls-cert server.pem --tls-key server-key.pem
+```
+
+Clients and workers may talk to any server: requests reach each partition's leader. A server stopped with SIGTERM
+hands its partitions over first. `aqueduct drill` puts a cluster under load and checks that nothing acknowledged is
+lost while you take machines away ([the procedure](docs/failover-drill.md)).
+
 ### What the server has
 
 | | | |
@@ -241,6 +267,9 @@ run records one result.
 | **Overload protection** | rate limits, shedding, connection deadlines, a cap on running runs; refusals carry a retry hint | [ADR 0045](docs/adr/0045-overload-protection.md) |
 | **Namespaces** | a token bound to a namespace reaches only its keys, runs, objects and steps, with its own quotas and share of a shared worker pool | [ADR 0046](docs/adr/0046-namespaces.md) |
 | **Migration** | an embedded directory's runs, histories, versions and object state move to a server | [ADR 0047](docs/adr/0047-migrate.md) |
+| **Cluster** | partitions replicated by our own Raft, requests routed to their leader over HTTP and gRPC, leaders spread, replicas moved, rolling upgrades, mutual TLS between servers | [ADR 0051](docs/adr/0051-cluster-and-raft.md) to [0064](docs/adr/0064-mutual-tls-between-servers.md) |
+| **Archive and retention** | finished histories copied to a directory or any S3-compatible bucket, verifiable on their own (`aqueduct archive`); runs forgotten once old enough and archived; partition snapshots in the same store | [ADR 0061](docs/adr/0061-object-storage-and-archival.md), [0062](docs/adr/0062-snapshots-in-object-storage.md), [0066](docs/adr/0066-retention.md) |
+| **Web console** | `/console`: runs and their commands, escalations, deployments | [ADR 0059](docs/adr/0059-web-console.md) |
 
 ### How fast
 
@@ -261,7 +290,8 @@ measured.
 
 ## Guarantees
 
-What holds today, and what checks it. The simulator runs 18,000 seeds on every change; the crash harness sends real
+What holds today, and what checks it. The simulator runs about 50,000 seeds on every change, single servers and
+replicated clusters, and 200,000 every night (a five-machine cluster, and Raft alone); the crash harness sends real
 `kill -9`s to the log and to the embedded engine.
 
 | guarantee | checked by |
@@ -276,6 +306,8 @@ What holds today, and what checks it. The simulator runs 18,000 seeds on every c
 | **Histories are tamper-evident:** a SHA-256 chain per run, specified independently of the code ([history format](docs/history-format.md)). | property tests; every load verifies |
 | **A recorded model call is never made again.** Replay reads the answer, model and cost from the journal ([ADR 0023](docs/adr/0023-agent-steps.md)). | simulator, tests |
 | **An audit line is synced before its request is answered,** and a changed line breaks the chain ([ADR 0041](docs/adr/0041-authentication.md)). | tests |
+| **In a cluster, nothing acknowledged is lost when machines fail:** an answer waits until a majority holds what it reflects, and a new leader starts from what is committed ([ADR 0055](docs/adr/0055-engine-on-raft.md)). | simulator (crashes, splits, pauses, clock skew, lossy networks, replicas moved); tests with servers stopped; `aqueduct drill` |
+| **Children and messages between partitions arrive once,** and a run's end waits for its messages ([ADR 0052](docs/adr/0052-partitions.md)). | simulator (`fanout` workload); tests with partitions crashing |
 
 The simulator's `composite` workload covers child runs, updates and objects (messages arrive exactly once); it has no
 updates waited for twice, so their deduplication is checked by tests only. The crash harness runs against the embedded
@@ -299,30 +331,32 @@ engine, not the server, whose transports have tests of their own, which are narr
 
 ## What is not done
 
-- **A production cluster:** the cluster is built and simulated (ADR 0051 to 0064): servers replicate
-  partitions with our own Raft, forward requests to each partition's leader, spread leaders, move
-  replicas, upgrade one at a time and authenticate each other with mutual TLS. Not yet done: the
-  failover drill and measurements on real machines. Not production-ready.
+- **A production cluster:** built and simulated, but not yet drilled or measured on real machines
+  ([the procedure](docs/failover-drill.md)), nor tested by anyone outside the project. Not production-ready.
 - **Stable formats:** the protocol and the history format are drafts until phase 5.
 - **Packages:** nothing on crates.io, PyPI or npm. Depend on the repository.
-- **Identity beyond static tokens:** no OIDC or JWT, and no mutual TLS.
+- **Identity beyond static tokens:** no OIDC or JWT, and no client certificates (servers authenticate each other
+  with mutual TLS; clients and workers use tokens).
 - **Version management over the network:** `aqueduct versions` works on the server's data directory, and a change
   takes effect when the server next starts.
 - **Isolation of code and disk between tenants:** namespaces separate runs and data, not workflow definitions, and
-  they share one partition ([ADR 0046](docs/adr/0046-namespaces.md)).
+  they share partitions ([ADR 0046](docs/adr/0046-namespaces.md)). Retention is one policy per server, not per
+  namespace.
 - **Workflow workers** have no HTTP long polling or push, and do not answer queries.
-- **Measurements:** none on a quiet reference machine, with TLS, with real payloads, or with long runs.
+- **Measurements:** none on a quiet reference machine, with TLS, with real payloads, with long runs, or of a
+  cluster.
 
 ## Testing it yourself
 
 ```sh
 mise run ci                                      # everything CI checks, one after the other
 cargo xtask sim --seeds 10000                    # deterministic simulation: crashes, torn writes, fsync failures, lossy networks
-cargo xtask sim --seeds 2000 --workload timers   # workloads: native, starlark, timers, rust, composite
+cargo xtask sim --seeds 2000 --workload timers   # workloads: native, starlark, timers, rust, composite, fanout
 cargo xtask sim --seed 42 --workload rust        # reproduce one seed exactly
 cargo xtask sim --seeds 5000 --replicas 3       # a partition replicated by Raft, under the same faults
 cargo xtask sim --seeds 500 --replicas 3 --partitions 4 --workload fanout   # partitions sending each other children and messages
 cargo xtask sim --seeds 300 --replicas 3 --partitions 3 --spares 2 --workload fanout   # and replicas moved between machines
+cargo xtask sim --seeds 5000 --replicas 5 --partitions 4 --jobs 8   # seeds on eight threads, the same reports
 cargo xtask raft --seeds 20000                   # Raft groups: partitions, crashes, clock skew and pauses, lossy networks
 cargo xtask crash --kills 1000                   # SIGKILL a log writer; no acknowledged record may be lost
 cargo xtask crash-engine --kills 200             # SIGKILL the engine mid-run; every acknowledged run must end correctly
@@ -330,6 +364,8 @@ cargo xtask crash-engine --startup --kills 300   # SIGKILL brand-new engines whi
 mise run conformance                             # worker libraries: Rust, Python and TypeScript, polling and push
 mise run bench:server                            # the server under load
 cargo xtask fsync                                # fsync latency and group commit throughput on this machine
+aqueduct drill --server http://... --server http://... --workflow w --seconds 60 --rate 200
+                                                 # a running cluster: latency, throughput, failover, nothing lost
 ```
 
 ## Inspecting a data directory
@@ -348,6 +384,7 @@ aqueduct counterfactual ./data greet-v3.star --workflow greet
 aqueduct metrics ./data greet                     # per version: runs, escalations, timeouts, cost, replay
 aqueduct versions list ./data                     # versions: state, approvals, replay, runs on them
 aqueduct audit ./data                             # verify the audit log and print it
+aqueduct archive show store.json greet-1          # an archived history, verified first
 aqueduct drift ./data --model anthropic/claude-opus-5-5 --prompts . --max-tokens 50000
                                                   # ask past agent calls again: same answers?
 ```
