@@ -7,6 +7,7 @@ Start with the [README](../README.md). The [build brief](../BRIEF.md) is the ful
 | [FAQ](faq.md) | Library or server, whether it is ready, how fast it is, what "exactly once" means here |
 | [Service protocol](protocol.md) | The draft protocol: ingress, step workers, workflow workers, imports, deployments. The protobuf in [`proto/`](../proto/aqueduct/v1) is the source of truth |
 | [History format](history-format.md) | The journal, specified independently of the code, so that anyone can implement it (CC-BY-4.0) |
+| [Failover drill](failover-drill.md) | The cluster's drill and measurements on real machines: the procedure |
 | [Measurements](#measurements) | What was measured, on what, and how far to trust it |
 | [Decision records](#decision-records) | Why it is the way it is |
 | [Brand](brand/README.md) | The mark, the palette and the rules for using them |

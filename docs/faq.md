@@ -51,8 +51,16 @@ published. Those formats freeze in phase 5 of the [build brief](../BRIEF.md). Th
 
 No. An embedded engine has the same journal, the same guarantees and the same history format. You need a server when
 steps should run in other processes or languages, when several clients share one engine, or when you need tokens, an
-audit log or namespaces. A server is one process with one disk: it does not survive losing that disk, because the
-cluster is not built.
+audit log or namespaces. A single server is one process with one disk: it does not survive losing that disk.
+
+## Do I need a cluster?
+
+When the engine must keep going through a machine's loss. Three or five servers replicate every partition with Raft:
+anything acknowledged is held by a majority, and when a leader's machine goes, another server takes over within about
+a second, with nothing lost ([ADR 0051](adr/0051-cluster-and-raft.md), [0056](adr/0056-cluster-server.md)). Clients
+and workers can talk to any server. The cluster is built and passes 100,000 simulated seeds every night, but it has
+not been drilled on real machines yet ([the procedure](failover-drill.md)); a single server is the safer choice until
+it has.
 
 ## How do I move from embedded to a server?
 
