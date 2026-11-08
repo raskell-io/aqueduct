@@ -99,6 +99,7 @@ A record says what was true and decided at its date: later records may change wh
 
 ### Cluster
 
+- [The failover drill and cluster measurements](failover-drill.md): the procedure on real machines
 - [0051: The cluster, and Raft of our own](adr/0051-cluster-and-raft.md)
 - [0052: Many partitions, and messages between them](adr/0052-partitions.md)
 - [0053: The metadata store, and moving replicas](adr/0053-metadata-store.md)
@@ -113,6 +114,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0062: Snapshots in object storage](adr/0062-snapshots-in-object-storage.md)
 - [0063: Moving replicas between servers](adr/0063-moving-replicas-between-servers.md)
 - [0064: Mutual TLS between servers](adr/0064-mutual-tls-between-servers.md)
+- [0065: The drill tool](adr/0065-drill.md)
 
 ### Observability
 
