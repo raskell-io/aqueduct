@@ -71,6 +71,7 @@ record = version:u8  kind:u8  prev:hash  fields
 | 33 | `UpdateRejected` | `cmd:cmd`, `update:cmd`, `error:string` |
 | 34 | `MessageSent` | `cmd:cmd`, `object:string`, `key:string`, `handler:string`, `args:bytes` |
 | 35 | `PrioritySet` | `priority:varint` (fits 32 bits) |
+| 36 | `Forgotten` | `reason:bytes` (UTF-8) |
 
 Times (`wake_at`) are milliseconds since the Unix epoch by the engine's clock when the command was first
 issued; `timeout_ms` and `wake_at` are 0 when a signal or update wait has no timeout. A signal's `id` is
@@ -158,7 +159,9 @@ A decoded history is a valid journal if:
    retry; `attempt` counts 1, 2, 3, ... per step. The next `TimerFired` for that step dispatches it again
    and gives it no outcome. A step's outcome may still arrive while a retry is pending (a late attempt).
 5. Nothing follows `RunCompleted`, `RunFailed`, `Parked` or `ContinuedAsNew` (in version 0; operator
-   resume of parked runs is specified in a later version). After `ContinuedAsNew`, the key's next
+   resume of parked runs is specified in a later version), except one `Forgotten` after `RunCompleted`,
+   `RunFailed` or `ContinuedAsNew`: retention has removed the run (ADR 0066), and nothing follows it. A
+   reader treats a run whose journal ends with `Forgotten` as absent. After `ContinuedAsNew`, the key's next
    generation starts with `Started`, for the same workflow and with `input` as its input.
 
 The order of completions may differ from the order of commands; it is the order in which the outcomes

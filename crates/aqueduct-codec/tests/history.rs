@@ -158,6 +158,7 @@ fn entry() -> impl Strategy<Value = Entry> {
         ".{0,12}".prop_map(|reason| Entry::Parked { reason }),
         ".{0,12}".prop_map(|reason| Entry::CancelRequested { reason }),
         any::<u32>().prop_map(|priority| Entry::PrioritySet { priority }),
+        ".{0,12}".prop_map(|reason| Entry::Forgotten { reason }),
         (any::<u32>(), ".{0,12}", payload()).prop_map(|(cmd, reason, payload)| {
             Entry::Escalated {
                 cmd: CommandIndex(cmd),

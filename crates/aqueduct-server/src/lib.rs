@@ -26,6 +26,7 @@ mod imports;
 mod limits;
 pub mod objects;
 mod push;
+pub mod retention;
 mod sigv4;
 mod tls;
 mod workers;
@@ -121,6 +122,10 @@ pub async fn serve_shards(
     push::start(&shards, config).map_err(std::io::Error::other)?;
     if let Some(archive) = &config.archive {
         archive::start(Arc::clone(&shards), archive).map_err(std::io::Error::other)?;
+    }
+    if let Some(retention) = &config.retention {
+        retention::start(Arc::clone(&shards), retention, config.archive.as_ref())
+            .map_err(std::io::Error::other)?;
     }
     let connections = tls::Connections {
         places: Arc::new(tokio::sync::Semaphore::new(config.limits.max_connections)),

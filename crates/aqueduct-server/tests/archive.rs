@@ -99,3 +99,62 @@ async fn finished_runs_are_archived_and_verify() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ended_runs_are_archived_then_forgotten() {
+    let base = std::env::temp_dir().join(format!("aqueduct-retention-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (dir, objects) = (base.join("data"), base.join("objects"));
+    let config: Config = serde_json::from_value(json!({
+        "archive": {"store": {"kind": "dir", "path": objects}, "every_ms": 100},
+        "retention": {"after_ms": 300, "every_ms": 100}
+    }))
+    .unwrap();
+    config.check().unwrap();
+    // Without an archive, retention that waits for one is refused.
+    let refused: Config = serde_json::from_value(json!({"retention": {"after_ms": 1}})).unwrap();
+    assert!(refused.check().is_err());
+    let engine = Engine::builder(&dir)
+        .workflow(
+            "double",
+            Arc::new(Procedure::compile("d.star", "def run(x):\n    return x * 2\n").unwrap()),
+        )
+        .workflow(
+            "waits",
+            Arc::new(
+                Procedure::compile(
+                    "w.star",
+                    "def run(x):\n    return wait(signal(\"go\"), timeout = 600)\n",
+                )
+                .unwrap(),
+            ),
+        )
+        .open()
+        .unwrap();
+    engine.start("done", "double", Payload::new(*b"4")).unwrap();
+    engine.wait("done", Duration::from_secs(10)).unwrap();
+    engine.start("going", "waits", Payload::new(*b"1")).unwrap();
+    let engine = Arc::new(engine);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let served = Arc::clone(&engine);
+    let security = Security::for_dir(&dir).unwrap();
+    let serving = config.clone();
+    tokio::spawn(async move {
+        aqueduct_server::serve_with(served, listener, &serving, security, std::future::pending())
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine.history("done").unwrap().is_some() {
+        assert!(Instant::now() < deadline, "the ended run was not forgotten");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Forgotten here, kept in the archive; the run still going is untouched.
+    let store = Store::open(&StoreConfig::Dir {
+        path: objects.clone(),
+    })
+    .unwrap();
+    let archived = store.get(&archive::key("done")).await.unwrap().unwrap();
+    assert_eq!(archive::decode("done", &archived).unwrap().len(), 2);
+    assert!(engine.describe("going").is_ok());
+    let _ = std::fs::remove_dir_all(&base);
+}
