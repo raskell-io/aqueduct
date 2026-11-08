@@ -87,7 +87,7 @@ checksum = "e149dc73cd30538307e7ffa2acd3d2221148eaeed4871f246657b1c3eaa1cbd2"
 
 [[package]]
 name = "aqueduct"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-cli",
  "aqueduct-core",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-ai"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-bench-engine"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-bench-server"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-bench-storage"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-storage",
  "fjall",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-cli"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-ai",
  "aqueduct-codec",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-codec"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "proptest",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-conformance"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-core"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "serde_json",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-engine"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-codec",
  "aqueduct-core",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-otel"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-procedure"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aqueduct-core",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-protocol"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "prost",
@@ -255,11 +255,11 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-raft"
-version = "0.0.0"
+version = "0.4.0"
 
 [[package]]
 name = "aqueduct-registry"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-engine",
  "aqueduct-procedure",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-sdk"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-server"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-codec",
  "aqueduct-core",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-sim"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-codec",
  "aqueduct-core",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-storage"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-raft",
  "crc32fast",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "aqueduct-worker"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-codec",
  "aqueduct-core",
@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "aqueduct-core",
  "aqueduct-engine",
