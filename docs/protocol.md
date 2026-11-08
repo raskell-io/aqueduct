@@ -24,14 +24,17 @@ gives the HTTP/JSON form of each call.
   - `INVALID_ARGUMENT` / 400: a payload is not JSON, or a key is invalid;
   - `DEADLINE_EXCEEDED` / 504: a wait or an update timed out;
   - `FAILED_PRECONDITION` / 422: an update was rejected, or a resolution does not match its schema;
-  - `UNAVAILABLE` / 503: the server is at a limit or stopping; retry later (`retry-after`);
+  - `UNAVAILABLE` / 503: the server is at a limit or stopping, or (in a cluster) does not lead the key's partition;
+    retry later (`retry-after`). A server that does not lead names the one that does in `aqueduct-leader` (a header,
+    or gRPC metadata), and forwards HTTP/JSON requests and unary `Ingress` calls there itself (ADR 0056, 0057), so a
+    client sees this only while a partition has no leader;
   - `RESOURCE_EXHAUSTED` / 429: the caller or its namespace is over its rate limit; retry after `retry-after` seconds;
   - `UNAUTHENTICATED` / 401: no token, or one the server does not know;
   - `PERMISSION_DENIED` / 403: the token lacks the permission, or a namespace is not one it may name.
 - **Authentication** (ADR 0041). If the server's data directory has tokens, every request carries one:
   `authorization: Bearer <token>`, as an HTTP header or gRPC metadata. The permissions are `read` (wait,
   describe, list, query, list escalations), `start`, `signal` (signals, awakeables, updates), `cancel`,
-  `resolve`, `work` (step and workflow workers) and `admin` (everything, and imports). Calling an object's handler
+  `resolve`, `work` (step and workflow workers) and `admin` (everything, imports, and cluster administration). Calling an object's handler
   needs `signal`; reading its state, `read`. Every refusal, and every change, is in the audit log.
 - **Namespaces** (ADR 0046). A token is bound to a namespace, or to `*`. Keys, run ids and escalation ids are
   in the caller's namespace: another's are `NOT_FOUND`. A request may name its namespace in an
@@ -181,10 +184,24 @@ the build was retired, it is active, or it has open runs. `NOT_FOUND` / 404 if t
 A step worker may announce a build too, `deployment` in its `Hello` or poll. It then takes steps of runs pinned to that
 build and of runs not pinned. Without one, it takes any step.
 
-## 7. Not in this draft yet
+## 7. Cluster administration (ADR 0063)
 
-- **OIDC/JWT and mTLS.** The server has static tokens (ADR 0041) and TLS (ADR 0042). It binds to loopback by default;
-  beyond loopback it needs tokens and a certificate.
+HTTP/JSON only; needs `admin`. Any server answers, and forwards a change to the partition's leader.
+
+| route | body | answer |
+|---|---|---|
+| `GET /v1/admin/partitions` | | `{"partitions": [{"partition", "members", "leads_here", "leader"}]}`, as the asked server knows them |
+| `POST /v1/admin/partitions/{partition}/members` | `{"add": <node>}` or `{"remove": <node>}` | `{}`; 422 while another change of that group is not committed |
+
+Servers talk to each other on `/cluster/v1/raft` and `/cluster/v1/remote` (ADR 0056, 0057): not for clients, they
+need the cluster's secret, a compatible version (ADR 0060) and, with mutual TLS, a certificate from the cluster's CA
+(ADR 0064). The web console's page is `GET /console` (ADR 0059).
+
+## 8. Not in this draft yet
+
+- **OIDC/JWT, and client certificates.** The server has static tokens (ADR 0041) and TLS (ADR 0042); servers of a
+  cluster authenticate each other with mutual TLS (ADR 0064). It binds to loopback by default; beyond loopback it
+  needs tokens and a certificate.
 - **Version management** over the network (register, propose, prove, approve): for now through `aqueduct versions` on
   the server's data directory and the MCP server. A change takes effect when the server next starts.
 - **For workflow workers:** HTTP long polling, push endpoints, and queries.
