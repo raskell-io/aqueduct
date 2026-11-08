@@ -1081,3 +1081,11 @@ fn archived_histories_are_listed_and_shown_after_they_verify() {
     assert!(cli(&["archive", "show", store, "missing"]).is_err());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn version_prints_the_crate_version() {
+    let expected = format!("aqueduct {}\n", env!("CARGO_PKG_VERSION"));
+    for flag in ["version", "--version", "-V"] {
+        assert_eq!(cli(&[flag]).unwrap(), expected);
+    }
+}
