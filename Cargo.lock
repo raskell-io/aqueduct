@@ -299,6 +299,7 @@ dependencies = [
  "http-body-util",
  "hyper-rustls",
  "hyper-util",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",

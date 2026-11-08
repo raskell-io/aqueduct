@@ -472,6 +472,21 @@ fn server_options(
         (None, None) => None,
         _ => return Err("--tls-cert and --tls-key go together".to_owned()),
     };
+    // Mutual TLS between servers (ADR 0064): the listener asks for certificates the cluster's CA issued.
+    let tls = match (tls, config.cluster.as_ref().and_then(|c| c.tls.as_ref())) {
+        (Some(tls), Some(mutual)) => {
+            let ca = std::fs::read_to_string(&mutual.ca)
+                .map_err(|e| format!("{}: {e}", mutual.ca.display()))?;
+            Some(tls.with_client_ca(&ca)?)
+        }
+        (None, Some(_)) => {
+            return Err(
+                "mutual TLS between servers needs this server to serve TLS (--tls-cert, --tls-key)"
+                    .to_owned(),
+            );
+        }
+        (tls, None) => tls,
+    };
     if !aqueduct_server::is_loopback(&address) && !anywhere {
         let has_tokens = aqueduct_server::auth::tokens_path(dir).exists();
         if !has_tokens {

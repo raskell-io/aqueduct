@@ -35,5 +35,6 @@ tokio-stream = { version = "0.1", default-features = false }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "channel"] }
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 aqueduct-codec.workspace = true
 aqueduct-procedure.workspace = true
