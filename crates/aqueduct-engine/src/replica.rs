@@ -450,6 +450,14 @@ impl Replica {
         target.is_some_and(|to| self.raft.transfer_leadership(to).is_ok())
     }
 
+    /// On the leader: proposes a change to the group, one server at a time (ADR 0063).
+    pub fn propose_change(
+        &mut self,
+        change: aqueduct_raft::Change,
+    ) -> Result<u64, aqueduct_raft::ChangeError> {
+        self.raft.propose_change(change)
+    }
+
     /// On the leader, moves the group one membership change towards `desired` (the metadata store's
     /// replicas for this partition, ADR 0053): one change at a time, adding before removing.
     pub fn reconcile(&mut self, desired: &[NodeId]) {

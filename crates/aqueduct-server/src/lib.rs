@@ -178,6 +178,11 @@ pub fn router_shards(engine: Arc<Shards>, security: Security) -> Router {
         .route("/v1/runs/{key}/queries/{name}", get(http_query))
         .route("/v1/runs/{key}/updates/{name}", post(http_update))
         .route("/v1/awakeables/{id}", post(http_complete_awakeable))
+        .route("/v1/admin/partitions", get(http_partitions))
+        .route(
+            "/v1/admin/partitions/{partition}/members",
+            post(http_change_members),
+        )
         .route("/v1/escalations", get(http_escalations))
         .route("/v1/escalations/{id}", post(http_resolve))
         .route("/v1/objects/{object}/{key}", get(http_object_state))
@@ -378,6 +383,9 @@ fn required(method: &axum::http::Method, path: &str) -> (Permission, &'static st
     }
     if path.starts_with("/v1/workers/") {
         return (Permission::Work, "work");
+    }
+    if path.starts_with("/v1/admin/") {
+        return (Permission::Admin, "cluster admin");
     }
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
@@ -1459,6 +1467,69 @@ async fn http_escalations(State(api): State<Api>) -> Result<Json<Value>, Failure
 struct OutcomeBody {
     #[serde(default)]
     outcome: Value,
+}
+
+/// Every partition: its group and its leader, as this server knows them (ADR 0063).
+async fn http_partitions(State(api): State<Api>) -> Result<Json<Value>, Failure> {
+    let partitions = api
+        .call(|shards| {
+            shards
+                .engines()
+                .iter()
+                .enumerate()
+                .map(|(index, engine)| {
+                    let (members, leader) = engine.members()?;
+                    let leader = if engine.leads() { None } else { leader };
+                    Ok(json!({
+                        "partition": index,
+                        "members": members,
+                        "leads_here": engine.leads(),
+                        "leader": leader,
+                    }))
+                })
+                .collect::<Result<Vec<Value>, EngineError>>()
+        })
+        .await?;
+    Ok(Json(json!({ "partitions": partitions })))
+}
+
+#[derive(Deserialize)]
+struct MembersBody {
+    #[serde(default)]
+    add: Option<u64>,
+    #[serde(default)]
+    remove: Option<u64>,
+}
+
+/// Adds a node to a partition's group or removes one (ADR 0063), on its leader; another server forwards
+/// it there.
+async fn http_change_members(
+    State(api): State<Api>,
+    Path(partition): Path<usize>,
+    Body(body): Body<MembersBody>,
+) -> Result<Json<Value>, Failure> {
+    let change = match (body.add, body.remove) {
+        (Some(node), None) => aqueduct_raft::Change::Add(node),
+        (None, Some(node)) => aqueduct_raft::Change::Remove(node),
+        _ => {
+            return Err(Failure {
+                kind: Kind::Invalid,
+                message: "give one of add or remove".into(),
+            });
+        }
+    };
+    let target = format!("partition {partition}: {change:?}");
+    let result = api
+        .call(move |shards| match shards.engines().get(partition) {
+            Some(engine) => engine.change_members(change),
+            None => Err(EngineError::Unsupported(format!(
+                "there is no partition {partition}"
+            ))),
+        })
+        .await;
+    api.audited("change members", target, result)
+        .await
+        .map(|()| Json(json!({})))
 }
 
 async fn http_resolve(

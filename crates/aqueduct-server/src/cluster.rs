@@ -84,6 +84,23 @@ pub struct Cluster {
     /// Entries applied between a partition's snapshots. Default 1,000.
     #[serde(default)]
     pub snapshot_every: Option<u64>,
+    /// The group each partition starts with (ADR 0063): by default every peer. A peer outside it starts
+    /// empty and waits to be added (`POST /v1/admin/partitions/<p>/members`).
+    #[serde(default)]
+    pub members: Option<Vec<u64>>,
+}
+
+impl Cluster {
+    /// The group each partition starts with.
+    pub fn initial_members(&self) -> Vec<u64> {
+        let mut members = self
+            .members
+            .clone()
+            .unwrap_or_else(|| self.peers.keys().copied().collect());
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
 }
 
 /// Where a partition's latest snapshot is kept in the store.
@@ -132,8 +149,12 @@ impl Cluster {
         if !self.peers.contains_key(&self.id) {
             return Err(format!("cluster: node {} is not among its peers", self.id));
         }
-        if self.peers.len() < 3 || self.peers.len().is_multiple_of(2) {
-            return Err("cluster: an odd number of nodes, at least 3".into());
+        let members = self.initial_members();
+        if members.len() < 3 || members.len().is_multiple_of(2) {
+            return Err("cluster: an odd number of members, at least 3".into());
+        }
+        if let Some(stranger) = members.iter().find(|m| !self.peers.contains_key(m)) {
+            return Err(format!("cluster: member {stranger} is not among the peers"));
         }
         if self.secret.chars().count() < 16 {
             return Err("cluster: the secret needs at least 16 characters".into());
@@ -178,9 +199,15 @@ impl Cluster {
                 let _ = queue.try_send(envelope);
             }
         });
-        // Leaders spread over the nodes: partition p prefers the p-th node, round robin (ADR 0058).
-        let members: Vec<u64> = self.peers.keys().copied().collect();
-        let preferred = members[partition as usize % members.len()];
+        // Leaders spread over the nodes: partition p prefers the p-th member, round robin (ADR 0058).
+        let initial = self.initial_members();
+        let preferred = initial[partition as usize % initial.len()];
+        // A node outside the initial group knows no group: it waits for a leader to add it.
+        let members = if initial.contains(&self.id) {
+            initial
+        } else {
+            Vec::new()
+        };
         // Snapshots are copied to the store as they are taken; a newer one replaces the last.
         let on_snapshot = match &self.snapshots {
             None => None,
@@ -599,6 +626,7 @@ mod tests {
             tick_ms: 50,
             snapshots: None,
             snapshot_every: None,
+            members: None,
         };
         assert_eq!(cluster.check(), Ok(()));
         let two = Cluster {
