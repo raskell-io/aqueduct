@@ -108,8 +108,13 @@ async fn servers(name: &str, partitions: u32) -> Servers {
 
 /// [`servers`], with more settings in each one's cluster section.
 async fn servers_with(name: &str, partitions: u32, more: Value) -> Servers {
+    servers_n(name, partitions, 3, more).await
+}
+
+/// `count` servers, with more settings in each one's cluster section.
+async fn servers_n(name: &str, partitions: u32, count: u64, more: Value) -> Servers {
     let mut listeners = BTreeMap::new();
-    for id in 1..=3u64 {
+    for id in 1..=count {
         listeners.insert(
             id,
             tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
@@ -505,4 +510,107 @@ async fn partitions_copy_their_snapshots_to_object_storage() {
         let _ = std::fs::remove_dir_all(dir);
     }
     let _ = std::fs::remove_dir_all(&objects);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_moves_to_a_new_server_and_the_old_one_can_go() {
+    let Servers {
+        addrs,
+        shards,
+        mut stops,
+        dirs,
+    } = servers_n("move", 1, 4, json!({"members": [1, 2, 3]})).await;
+    let mut nodes = addrs.clone();
+    ask(
+        &nodes,
+        "POST",
+        "/v1/runs",
+        json!({"key": "m", "workflow": "double", "input": 21}),
+    )
+    .await;
+    // Server 4 is a peer, not a member: it holds nothing yet.
+    assert!(!shards[&4].engines()[0].members().unwrap().0.contains(&4));
+    // A change goes to the leader; one at a time, so it is asked again while another is pending.
+    let change = |body: Value| {
+        let nodes = nodes.clone();
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let mut done = false;
+                for addr in nodes.values() {
+                    let (status, answer) = http(
+                        *addr,
+                        "POST",
+                        "/v1/admin/partitions/0/members",
+                        body.clone(),
+                    )
+                    .await;
+                    if (200..300).contains(&status) {
+                        done = true;
+                        break;
+                    }
+                    assert!(
+                        status == 503 || status == 422 || status == 0,
+                        "{status}: {answer}"
+                    );
+                }
+                if done {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the change {body} was never taken"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    let members_seen_by = |id: u64| shards[&id].engines()[0].members().unwrap().0;
+    change(json!({"add": 4})).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while members_seen_by(4) != vec![1, 2, 3, 4] {
+        assert!(
+            Instant::now() < deadline,
+            "server 4 sees {:?}",
+            members_seen_by(4)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    change(json!({"remove": 1})).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while members_seen_by(2) != vec![2, 3, 4] || members_seen_by(4) != vec![2, 3, 4] {
+        assert!(
+            Instant::now() < deadline,
+            "server 2 sees {:?}",
+            members_seen_by(2)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, listed) = http(nodes[&2], "GET", "/v1/admin/partitions", Value::Null).await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(
+        listed["partitions"][0]["members"],
+        json!([2, 3, 4]),
+        "{listed}"
+    );
+    // Server 1 goes: the partition, now on 2, 3 and 4, still has the run and takes new ones.
+    let _ = stops.remove(&1).unwrap().send(());
+    nodes.remove(&1);
+    let (_, result) = ask(&nodes, "GET", "/v1/runs/m/result", Value::Null).await;
+    assert_eq!(result["output"], json!(42), "{result}");
+    ask(
+        &nodes,
+        "POST",
+        "/v1/runs",
+        json!({"key": "n", "workflow": "double", "input": 5}),
+    )
+    .await;
+    let (_, result) = ask(&nodes, "GET", "/v1/runs/n/result", Value::Null).await;
+    assert_eq!(result["output"], json!(10), "{result}");
+    for stop in stops.into_values() {
+        let _ = stop.send(());
+    }
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -1204,6 +1204,22 @@ impl Engine {
         let _ = self.requests.send(Request::StepDown);
     }
 
+    /// Proposes a change to the partition's group, on the leader (ADR 0063): add or remove one node. It
+    /// takes effect once committed; another change waits until then.
+    pub fn change_members(&self, change: aqueduct_raft::Change) -> Result<(), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::ChangeMembers { change, reply })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
+    /// The partition's group and its leader, as this replica knows them: an empty group if it is not
+    /// replicated; no leader if it leads, or knows none.
+    pub fn members(&self) -> Result<(Vec<u64>, Option<u64>), EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Members { reply })?;
+        answer.recv().map_err(|_| self.stopped())
+    }
+
     /// Whether this engine has its partition here: it leads, or is not replicated.
     pub fn leads(&self) -> bool {
         self.leading.lock().is_ok_and(|leading| leading.0)
@@ -1361,6 +1377,15 @@ enum Request {
     Remote(crate::Remote),
     /// Hand leadership over before stopping (ADR 0060).
     StepDown,
+    /// Change the partition's group (ADR 0063).
+    ChangeMembers {
+        change: aqueduct_raft::Change,
+        reply: Sender<Result<(), EngineError>>,
+    },
+    /// The group, and who leads it, as this replica knows them.
+    Members {
+        reply: Sender<(Vec<u64>, Option<u64>)>,
+    },
     Shutdown,
 }
 
@@ -1417,6 +1442,17 @@ pub(crate) trait Host: Send + 'static {
     }
     /// Hands leadership to a caught-up replica, before stopping.
     fn step_down(&mut self) {}
+    /// Proposes a change to the group: `None` if the partition is not replicated.
+    fn change_members(
+        &mut self,
+        _change: aqueduct_raft::Change,
+    ) -> Option<Result<u64, aqueduct_raft::ChangeError>> {
+        None
+    }
+    /// The group as this replica knows it: empty if the partition is not replicated.
+    fn members(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// A partition on a local log: the embedded engine and the single server.
@@ -1587,6 +1623,17 @@ impl Host for Replicated {
         self.preferred = None;
         self.replica.step_down();
     }
+
+    fn change_members(
+        &mut self,
+        change: aqueduct_raft::Change,
+    ) -> Option<Result<u64, aqueduct_raft::ChangeError>> {
+        Some(self.replica.propose_change(change))
+    }
+
+    fn members(&self) -> Vec<u64> {
+        self.replica.raft().members().to_vec()
+    }
 }
 
 /// A reply to send once what it reflects is committed.
@@ -1710,6 +1757,15 @@ impl<H: Host> Processor<H> {
             Request::Shutdown => return Ok(false),
             Request::StepDown => {
                 self.host.step_down();
+                return Ok(true);
+            }
+            Request::Members { reply } => {
+                let leader = if self.host.partition().is_some() {
+                    None
+                } else {
+                    self.host.leader()
+                };
+                let _ = reply.send((self.host.members(), leader));
                 return Ok(true);
             }
             Request::Stats { reply } if self.host.partition().is_none() => {
@@ -2028,7 +2084,31 @@ impl<H: Host> Processor<H> {
             Request::Remote(message) => {
                 self.part()?.receive(message).map_err(|e| e.to_string())?;
             }
-            Request::Shutdown | Request::Raft(_) | Request::StepDown => return Ok(false),
+            Request::ChangeMembers { change, reply } => {
+                use aqueduct_raft::ChangeError;
+                let answer = match self.host.change_members(change) {
+                    None => Err(EngineError::Unsupported(
+                        "this engine's partition is not replicated".into(),
+                    )),
+                    Some(Ok(_)) => Ok(()),
+                    Some(Err(ChangeError::NotLeader(not))) => {
+                        Err(EngineError::NotLeader(not.leader))
+                    }
+                    Some(Err(ChangeError::Pending)) => Err(EngineError::Unsupported(
+                        "another change of the group is not committed yet: one at a time".into(),
+                    )),
+                    Some(Err(ChangeError::NotReady)) => Err(EngineError::Unsupported(
+                        "the leader is new: try again in a moment".into(),
+                    )),
+                    Some(Err(ChangeError::Pointless)) => Err(EngineError::Unsupported(
+                        "that change would change nothing, or leave no one".into(),
+                    )),
+                };
+                let _ = reply.send(answer);
+            }
+            Request::Shutdown | Request::Raft(_) | Request::StepDown | Request::Members { .. } => {
+                return Ok(false);
+            }
         }
         // Only non-empty under the injected acknowledge-before-sync bug.
         let early = self.part()?.take_unsynced();
