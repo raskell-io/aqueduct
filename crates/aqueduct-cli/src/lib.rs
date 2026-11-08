@@ -27,6 +27,7 @@ use aqueduct_registry::{
 use aqueduct_storage::{FileLog, FileLogOptions, RedbStateStore};
 
 mod deployments;
+mod drill;
 mod migrate;
 
 const USAGE: &str = "usage: aqueduct <command> <data-dir> [arguments]
@@ -37,6 +38,11 @@ commands:
   journal <dir> <key>                 a run's journal, one entry per line
   verify <dir>                        verify every run's hash chain and print its head
   export <dir> <key>                  a run's journal as JSON Lines (one object per entry)
+  drill --server <url> [--server <url>...] --workflow <name> [--input <json>]
+        [--seconds <n>] [--rate <n>] [--token-file <file>] [--ca <file>]
+                                      start runs on a cluster at a steady rate and wait for each:
+                                      latencies, throughput, the longest time no start was taken,
+                                      and whether any acknowledged run was lost (ADR 0065)
   archive list <store.json> [<prefix>]
                                       runs whose histories a server archived (ADR 0061); the file
                                       is the store section of the server's archive settings
@@ -197,6 +203,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         }
         Some("migrate") => migrate::migrate(&args[1..]),
         Some("deployments") => deployments::deployments(&args[1..]),
+        Some("drill") => drill::drill(&args[1..]),
         Some("versions") => versions(&args[1..]),
         Some("keys") => keys(&args[1..]),
         Some("mcp") => {
