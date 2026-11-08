@@ -345,6 +345,12 @@ pub enum Entry {
         /// What diverged.
         reason: String,
     },
+    /// The run, ended, is forgotten (retention, ADR 0066): the engine no longer holds it. Only after
+    /// `RunCompleted`, `RunFailed` or `ContinuedAsNew`, and last.
+    Forgotten {
+        /// Why: for example, the retention policy that removed it.
+        reason: String,
+    },
 }
 
 /// A stable idempotency key for a step command: `run_key/epoch/cmd`.

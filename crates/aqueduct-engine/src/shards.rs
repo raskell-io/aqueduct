@@ -252,6 +252,11 @@ impl Shards {
         self.engine_for(key).set_priority(key, priority)
     }
 
+    /// See [`Engine::forget`].
+    pub fn forget(&self, run: &str, reason: &str) -> Result<bool, EngineError> {
+        self.engine_for(run).forget(run, reason)
+    }
+
     /// See [`Engine::history`].
     pub fn history(&self, run: &str) -> Result<Option<Vec<aqueduct_core::Entry>>, EngineError> {
         self.engine_for(run).history(run)

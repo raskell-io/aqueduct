@@ -29,6 +29,20 @@ pub trait StateStore {
         Ok(self.load()?.runs.remove(key))
     }
 
+    /// Removes runs that retention forgot (ADR 0066). Called after the [`StateStore::save`] that saved
+    /// their records ending in `Forgotten`, so a store that cannot remove keeps runs that read as
+    /// forgotten.
+    fn remove(&mut self, keys: &[String]) -> Result<(), StorageError> {
+        let _ = keys;
+        Ok(())
+    }
+
+    /// Whether it keeps anything: a store that does not (recovery replays the whole log) needs no
+    /// forgotten run saved.
+    fn durable(&self) -> bool {
+        true
+    }
+
     /// The run ids of every run saved in the last checkpoint, in order.
     fn run_ids(&mut self) -> Result<Vec<String>, StorageError> {
         Ok(self.load()?.runs.into_keys().collect())
@@ -59,6 +73,10 @@ fn generation_of(id: &str, key: &str) -> Option<u32> {
 pub struct NoStateStore;
 
 impl StateStore for NoStateStore {
+    fn durable(&self) -> bool {
+        false
+    }
+
     fn load(&mut self) -> Result<Checkpoint, StorageError> {
         Ok(Checkpoint::default())
     }
@@ -157,6 +175,24 @@ impl StateStore for RedbStateStore {
             }
             let mut meta = txn.open_table(META).map_err(io)?;
             meta.insert(CHECKPOINT, lsn).map_err(io)?;
+        }
+        txn.commit()
+            .map_err(|e| StorageError::SyncFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove(&mut self, keys: &[String]) -> Result<(), StorageError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self.db.begin_write().map_err(io)?;
+        txn.set_durability(redb::Durability::Immediate)
+            .map_err(io)?;
+        {
+            let mut table = txn.open_table(RUNS).map_err(io)?;
+            for key in keys {
+                table.remove(key.as_str()).map_err(io)?;
+            }
         }
         txn.commit()
             .map_err(|e| StorageError::SyncFailed(e.to_string()))?;

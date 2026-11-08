@@ -56,6 +56,9 @@ pub struct Config {
     /// History archival to object storage (ADR 0061).
     #[serde(default)]
     pub archive: Option<crate::archive::ArchiveConfig>,
+    /// Forgetting runs that ended long enough ago (ADR 0066).
+    #[serde(default)]
+    pub retention: Option<crate::retention::RetentionConfig>,
 }
 
 impl Config {
@@ -113,6 +116,15 @@ impl Config {
         self.limits.check()?;
         if let Some(cluster) = &self.cluster {
             cluster.check()?;
+        }
+        if let Some(retention) = &self.retention
+            && retention.archive_first
+            && self.archive.is_none()
+        {
+            return Err(
+                "retention forgets only archived runs unless archive_first is false: configure \"archive\""
+                    .into(),
+            );
         }
         let partitions = self.partition_count();
         if partitions == 0 || partitions > u32::from(aqueduct_engine::placement::SLOTS) {

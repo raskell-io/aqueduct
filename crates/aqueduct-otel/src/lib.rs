@@ -372,6 +372,11 @@ impl Observer for OtelObserver {
                 vec![KeyValue::new("aqueduct.priority", i64::from(*priority))],
                 None,
             ),
+            Entry::Forgotten { reason } => point(
+                "forgotten".into(),
+                vec![KeyValue::new("aqueduct.reason", reason.clone())],
+                None,
+            ),
             Entry::CancelRequested { reason } => point(
                 "cancel requested".into(),
                 vec![KeyValue::new("aqueduct.reason", reason.clone())],

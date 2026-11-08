@@ -1989,6 +1989,7 @@ fn describe_entry(entry: &Entry) -> String {
         Entry::Parked { reason } => format!("run parked: {reason}"),
         Entry::CancelRequested { reason } => format!("cancel requested: {reason}"),
         Entry::PrioritySet { priority } => format!("priority set: {priority}"),
+        Entry::Forgotten { reason } => format!("forgotten: {reason}"),
         Entry::Escalated {
             cmd,
             reason,
@@ -2160,6 +2161,7 @@ fn entry_json(entry: &Entry) -> serde_json::Value {
         Entry::Parked { reason } => json!({"kind": "Parked", "reason": reason}),
         Entry::CancelRequested { reason } => json!({"kind": "CancelRequested", "reason": reason}),
         Entry::PrioritySet { priority } => json!({"kind": "PrioritySet", "priority": priority}),
+        Entry::Forgotten { reason } => json!({"kind": "Forgotten", "reason": reason}),
         Entry::Escalated {
             cmd: c,
             reason,

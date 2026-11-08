@@ -256,6 +256,15 @@ pub struct PartitionRun {
 }
 
 impl PartitionRun {
+    /// The run's records, as its hash chain has them.
+    fn records(&self, key: &str) -> Vec<Vec<u8>> {
+        let mut chain = ChainWriter::new(key);
+        self.journal
+            .iter()
+            .map(|entry| chain.append(entry))
+            .collect()
+    }
+
     /// The run's state.
     pub fn state(&self) -> &RunState {
         &self.state
@@ -706,6 +715,12 @@ pub struct Partition<L: LogStore, S: StateStore = NoStateStore> {
     /// Parents elsewhere waiting for this partition's runs, by the child's run key. In memory only:
     /// parents ask again.
     remote_waiters: BTreeMap<String, BTreeSet<(String, CommandIndex)>>,
+    /// Runs forgotten since the last checkpoint (ADR 0066), with their records ending in `Forgotten`:
+    /// the checkpoint saves them, then removes them where the store can.
+    forgotten: BTreeMap<String, Vec<Vec<u8>>>,
+    /// Run ids forgotten whose records may still be in the log or the store: treated as absent, and a
+    /// new start of their key takes a later generation, so that no two chains share a run id.
+    forgotten_ids: BTreeSet<String>,
 }
 
 impl<L: LogStore, S: StateStore> std::fmt::Debug for Partition<L, S> {
@@ -835,8 +850,28 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             remote_sends: BTreeMap::new(),
             held_activations: BTreeSet::new(),
             remote_waiters: BTreeMap::new(),
+            forgotten: BTreeMap::new(),
+            forgotten_ids: BTreeSet::new(),
         })
         .map(|mut partition| {
+            // A forgotten run is not loaded (ADR 0066); one forgotten after the last checkpoint is saved
+            // at the next, which removes it.
+            let forgotten: Vec<String> = partition
+                .runs
+                .iter()
+                .filter(|(_, run)| run.state.forgotten())
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in forgotten {
+                partition.forgotten_ids.insert(key.clone());
+                if let Some(run) = partition.runs.remove(&key) {
+                    partition.dirty.remove(&key);
+                    if partition.state.durable() {
+                        let records = run.records(&key);
+                        partition.forgotten.insert(key, records);
+                    }
+                }
+            }
             let keys: Vec<String> = partition.runs.keys().cloned().collect();
             for key in keys {
                 partition.refresh_timers(&key);
@@ -924,9 +959,18 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         if !valid_key(key) {
             return Err(PartitionError::InvalidKey(key.to_owned()));
         }
+        // A forgotten generation is never reused while its records may remain (ADR 0066).
+        let prefix = format!("{key}\0");
+        let floor = self
+            .forgotten_ids
+            .iter()
+            .filter(|id| id.as_str() == key || id.starts_with(&prefix))
+            .map(|id| split_run_id(id).1 + 1)
+            .max()
+            .unwrap_or(0);
         // A finished run may have been unloaded; it still exists.
         let next = match self.latest(key)? {
-            None => Some(0),
+            None => Some(floor),
             Some(latest) => {
                 let state = self
                     .lookup_run(&latest)?
@@ -936,7 +980,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                         return Err(PartitionError::AlreadyStarted(key.to_owned()));
                     }
                     ReusePolicy::AllowAfterCompletion if state.status().is_terminal() => {
-                        Some(split_run_id(&latest).1 + 1)
+                        Some((split_run_id(&latest).1 + 1).max(floor))
                     }
                     _ => {
                         // A retried start: the run its first attempt started heads the latest chain of
@@ -1254,7 +1298,12 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         if let Some((generation, false)) = best {
             return Ok(Some(run_id(key, generation)));
         }
-        let saved = self.state.generations(key)?.into_iter().max();
+        let saved = self
+            .state
+            .generations(key)?
+            .into_iter()
+            .filter(|generation| !self.forgotten_ids.contains(&run_id(key, *generation)))
+            .max();
         let latest = best.map(|(g, _)| g).max(saved);
         Ok(latest.map(|generation| run_id(key, generation)))
     }
@@ -1725,7 +1774,10 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
     pub fn run_ids(&mut self) -> Result<Vec<String>, PartitionError> {
         let mut ids: BTreeSet<String> = self.runs.keys().cloned().collect();
         ids.extend(self.state.run_ids()?);
-        Ok(ids.into_iter().collect())
+        Ok(ids
+            .into_iter()
+            .filter(|id| !self.forgotten_ids.contains(id))
+            .collect())
     }
 
     /// The state of a key's latest run, from memory or, for an unloaded finished run, from the state
@@ -1742,6 +1794,9 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         if let Some(run) = self.runs.get(key) {
             return Ok(Some(run.state.clone()));
         }
+        if self.forgotten_ids.contains(key) {
+            return Ok(None);
+        }
         let Some(records) = self.state.load_run(key)? else {
             return Ok(None);
         };
@@ -1750,7 +1805,8 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         })?;
         let state = RunState::from_journal(&verified.entries)
             .map_err(|e| PartitionError::Corrupt(format!("run {key}: journal is invalid: {e}")))?;
-        Ok(Some(state))
+        // Kept by a store that could not remove it: forgotten all the same.
+        Ok((!state.forgotten()).then_some(state))
     }
 
     fn evict(&mut self) {
@@ -2080,13 +2136,79 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
         if let Some(run) = self.runs.get(key) {
             return Ok(Some(run.journal.clone()));
         }
+        if self.forgotten_ids.contains(key) {
+            return Ok(None);
+        }
         let Some(records) = self.state.load_run(key)? else {
             return Ok(None);
         };
         let verified = verify_chain(key, records.iter().map(Vec::as_slice)).map_err(|e| {
             PartitionError::Corrupt(format!("run {key}: hash chain does not verify: {e}"))
         })?;
+        if matches!(verified.entries.last(), Some(Entry::Forgotten { .. })) {
+            return Ok(None);
+        }
         Ok(Some(verified.entries))
+    }
+
+    /// Forgets an ended run (retention, ADR 0066): `Forgotten` is appended to its journal, and the
+    /// partition no longer holds it; the next checkpoint removes it from the state store, and a replica's
+    /// next snapshot leaves its records out. Only a run that completed, failed or continued as new.
+    /// Whether there was such a run to forget.
+    pub fn forget(&mut self, id: &str, reason: &str) -> Result<bool, PartitionError> {
+        if self.forgotten_ids.contains(id) {
+            return Ok(false);
+        }
+        if !self.runs.contains_key(id) {
+            let Some(records) = self.state.load_run(id)? else {
+                return Ok(false);
+            };
+            let verified = verify_chain(id, records.iter().map(Vec::as_slice)).map_err(|e| {
+                PartitionError::Corrupt(format!("run {id}: hash chain does not verify: {e}"))
+            })?;
+            let state = RunState::from_journal(&verified.entries).map_err(|e| {
+                PartitionError::Corrupt(format!("run {id}: journal is invalid: {e}"))
+            })?;
+            if state.forgotten() {
+                return Ok(false);
+            }
+            self.runs.insert(
+                id.to_owned(),
+                PartitionRun {
+                    state,
+                    journal: verified.entries,
+                    chain: ChainWriter::resume(verified.head),
+                },
+            );
+        }
+        let entry = Entry::Forgotten {
+            reason: reason.to_owned(),
+        };
+        let Some(run) = self.runs.get_mut(id) else {
+            return Ok(false);
+        };
+        if !matches!(
+            run.state.status(),
+            Status::Completed | Status::Failed | Status::Continued
+        ) {
+            return Err(PartitionError::Unsupported(format!(
+                "run `{id}` has not ended: only a run that completed, failed or continued as new is forgotten"
+            )));
+        }
+        run.state
+            .apply(&entry)
+            .map_err(|e| PartitionError::Internal(e.to_string()))?;
+        self.log_entry(id, &entry)?;
+        self.forgotten_ids.insert(id.to_owned());
+        if let Some(run) = self.runs.remove(id) {
+            self.dirty.remove(id);
+            self.refresh_timers(id);
+            if self.state.durable() {
+                let records = run.records(id);
+                self.forgotten.insert(id.to_owned(), records);
+            }
+        }
+        Ok(true)
     }
 
     /// Adds a run's history from an import (ADR 0047), or the part of it this partition does not have.
@@ -2185,7 +2307,7 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
             ));
         }
         let lsn = self.log.next_lsn();
-        let runs: Vec<(String, Vec<Vec<u8>>)> = self
+        let mut runs: Vec<(String, Vec<Vec<u8>>)> = self
             .dirty
             .iter()
             .filter_map(|key| self.runs.get(key).map(|run| (key, run)))
@@ -2201,7 +2323,16 @@ impl<L: LogStore, S: StateStore> Partition<L, S> {
                 )
             })
             .collect();
+        // Forgotten runs are saved as forgotten, then removed: a crash between leaves them forgotten.
+        let forgotten = std::mem::take(&mut self.forgotten);
+        let removed: Vec<String> = forgotten.keys().cloned().collect();
+        runs.extend(forgotten);
         self.state.save(lsn, &runs)?;
+        self.state.remove(&removed)?;
+        // Their records are gone from the store, and the log is trimmed past them: their ids are free.
+        if self.state.durable() {
+            self.forgotten_ids.clear();
+        }
         self.dirty.clear();
         self.log.trim(lsn)?;
         self.evict();

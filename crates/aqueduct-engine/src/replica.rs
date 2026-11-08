@@ -131,6 +131,27 @@ fn needs_leadership(message: &Outbound) -> bool {
     )
 }
 
+/// The records of every run but those whose journal holds `Forgotten` (ADR 0066).
+fn without_forgotten(records: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use aqueduct_codec::{decode_log_record, decode_record};
+    let forgotten: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter_map(|bytes| {
+            let (key, record) = decode_log_record(bytes).ok()?;
+            let record = decode_record(record).ok()?;
+            matches!(record.entry, aqueduct_core::Entry::Forgotten { .. }).then_some(key)
+        })
+        .collect();
+    if forgotten.is_empty() {
+        return records.to_vec();
+    }
+    records
+        .iter()
+        .filter(|bytes| decode_log_record(bytes).map_or(true, |(key, _)| !forgotten.contains(key)))
+        .cloned()
+        .collect()
+}
+
 /// Encodes a batch of records as one entry's data.
 fn encode(records: &[Vec<u8>]) -> Vec<u8> {
     let mut data = Vec::new();
@@ -470,8 +491,10 @@ impl Replica {
         }
     }
 
-    /// Replaces the log up to what is applied with a snapshot of the committed records.
+    /// Replaces the log up to what is applied with a snapshot of the committed records, without the
+    /// records of runs retention forgot (ADR 0066): the partition is the same, and the space comes back.
     pub fn compact(&mut self) {
+        self.committed = without_forgotten(&self.committed);
         let data = encode(&self.committed);
         self.raft.compact(self.applied, data);
     }
@@ -487,5 +510,42 @@ mod tests {
         assert_eq!(decode(&encode(&records)), Ok(records));
         assert!(decode(&[1, 0, 0]).is_err());
         assert!(decode(&[5, 0, 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn a_snapshot_leaves_out_the_records_of_forgotten_runs() {
+        use aqueduct_codec::{ChainWriter, encode_log_record};
+        use aqueduct_core::{Entry, Payload};
+        let records = |key: &str, entries: &[Entry]| -> Vec<Vec<u8>> {
+            let mut chain = ChainWriter::new(key);
+            entries
+                .iter()
+                .map(|entry| encode_log_record(key, &chain.append(entry)))
+                .collect()
+        };
+        let started = Entry::Started {
+            workflow: "w".into(),
+            input: Payload::new(*b"1"),
+            budget_tokens: None,
+            version: None,
+        };
+        let done = Entry::RunCompleted {
+            output: Payload::new(*b"2"),
+        };
+        let forgotten = Entry::Forgotten {
+            reason: "retention".into(),
+        };
+        let kept = records("kept", &[started.clone(), done.clone()]);
+        let gone = records("gone", &[started, done, forgotten]);
+        // Interleaved, as a partition writes them.
+        let all = vec![
+            gone[0].clone(),
+            kept[0].clone(),
+            gone[1].clone(),
+            kept[1].clone(),
+            gone[2].clone(),
+        ];
+        assert_eq!(without_forgotten(&all), kept);
+        assert_eq!(without_forgotten(&kept), kept);
     }
 }

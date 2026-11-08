@@ -115,6 +115,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0063: Moving replicas between servers](adr/0063-moving-replicas-between-servers.md)
 - [0064: Mutual TLS between servers](adr/0064-mutual-tls-between-servers.md)
 - [0065: The drill tool](adr/0065-drill.md)
+- [0066: Retention: forgetting ended runs](adr/0066-retention.md)
 
 ### Observability
 

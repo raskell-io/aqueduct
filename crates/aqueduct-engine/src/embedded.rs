@@ -1204,6 +1204,18 @@ impl Engine {
         let _ = self.requests.send(Request::StepDown);
     }
 
+    /// Forgets an ended run (retention, ADR 0066): appends `Forgotten` to its journal and no longer holds
+    /// it. Returns once that is durable; whether there was such a run. A run still going is refused.
+    pub fn forget(&self, run: &str, reason: &str) -> Result<bool, EngineError> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Request::Forget {
+            run: run.to_owned(),
+            reason: reason.to_owned(),
+            reply,
+        })?;
+        answer.recv().map_err(|_| self.stopped())?
+    }
+
     /// Proposes a change to the partition's group, on the leader (ADR 0063): add or remove one node. It
     /// takes effect once committed; another change waits until then.
     pub fn change_members(&self, change: aqueduct_raft::Change) -> Result<(), EngineError> {
@@ -1377,6 +1389,12 @@ enum Request {
     Remote(crate::Remote),
     /// Hand leadership over before stopping (ADR 0060).
     StepDown,
+    /// Forget an ended run (retention, ADR 0066).
+    Forget {
+        run: String,
+        reason: String,
+        reply: Sender<Result<bool, EngineError>>,
+    },
     /// Change the partition's group (ADR 0063).
     ChangeMembers {
         change: aqueduct_raft::Change,
@@ -2083,6 +2101,17 @@ impl<H: Host> Processor<H> {
             }
             Request::Remote(message) => {
                 self.part()?.receive(message).map_err(|e| e.to_string())?;
+            }
+            Request::Forget { run, reason, reply } => {
+                let answer = match self.part()?.forget(&run, &reason) {
+                    Ok(forgotten) => Ok(forgotten),
+                    Err(PartitionError::Unsupported(why)) => Err(EngineError::Unsupported(why)),
+                    Err(error) => return Err(error.to_string()),
+                };
+                // Answered once `Forgotten` is durable (committed, on a replica).
+                self.deferred.push(Box::new(move || {
+                    let _ = reply.send(answer);
+                }));
             }
             Request::ChangeMembers { change, reply } => {
                 use aqueduct_raft::ChangeError;

@@ -77,6 +77,7 @@ mod kind {
     pub const UPDATE_REJECTED: u8 = 33;
     pub const MESSAGE_SENT: u8 = 34;
     pub const PRIORITY_SET: u8 = 35;
+    pub const FORGOTTEN: u8 = 36;
 }
 
 /// Bytes that are not a valid record or log record.
@@ -205,6 +206,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
         Entry::UpdateRejected { .. } => kind::UPDATE_REJECTED,
         Entry::MessageSent { .. } => kind::MESSAGE_SENT,
         Entry::PrioritySet { .. } => kind::PRIORITY_SET,
+        Entry::Forgotten { .. } => kind::FORGOTTEN,
     };
     out.push(kind);
     out.extend_from_slice(prev);
@@ -341,6 +343,7 @@ pub fn encode_record(entry: &Entry, prev: &Hash) -> Vec<u8> {
             put_varint(&mut out, response.output_tokens);
         }
         Entry::PrioritySet { priority } => put_varint(&mut out, u64::from(*priority)),
+        Entry::Forgotten { reason } => put_bytes(&mut out, reason.as_bytes()),
         Entry::RunFailed { error } => put_bytes(&mut out, error.as_bytes()),
         Entry::Parked { reason } | Entry::CancelRequested { reason } => {
             put_bytes(&mut out, reason.as_bytes());
@@ -467,6 +470,9 @@ pub fn decode_record(bytes: &[u8]) -> Result<Record, DecodeError> {
             error: reader.string()?,
         },
         kind::PARKED => Entry::Parked {
+            reason: reader.string()?,
+        },
+        kind::FORGOTTEN => Entry::Forgotten {
             reason: reader.string()?,
         },
         kind::TIMER_STARTED => Entry::TimerStarted {

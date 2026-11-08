@@ -492,6 +492,9 @@ pub enum JournalError {
     /// An entry follows a terminal entry.
     #[error("an entry follows the end of the run")]
     EntryAfterEnd,
+    /// `Forgotten` before the run completed, failed or continued as new.
+    #[error("a run is forgotten only after it completed, failed or continued as new")]
+    ForgottenBeforeEnd,
     /// A step was scheduled out of order.
     #[error("step scheduled with command {found}, expected {expected}")]
     CommandOutOfOrder {
@@ -531,6 +534,8 @@ pub enum JournalError {
 pub struct RunState {
     workflow: String,
     status: Status,
+    /// Whether retention has forgotten the run (ADR 0066).
+    forgotten: bool,
     input: Payload,
     steps: Vec<ScheduledStep>,
     completion_order: Vec<CommandIndex>,
@@ -574,6 +579,7 @@ impl RunState {
         let mut state = RunState {
             workflow: workflow.clone(),
             status: Status::Running,
+            forgotten: false,
             input: input.clone(),
             steps: Vec::new(),
             completion_order: Vec::new(),
@@ -603,11 +609,27 @@ impl RunState {
         if matches!(entry, Entry::Started { .. }) {
             return Err(JournalError::DuplicateStart);
         }
+        // Retention (ADR 0066): once, after the run ended other than parked; nothing follows it.
+        if self.forgotten {
+            return Err(JournalError::EntryAfterEnd);
+        }
+        if let Entry::Forgotten { .. } = entry {
+            if !matches!(
+                self.status,
+                Status::Completed | Status::Failed | Status::Continued
+            ) {
+                return Err(JournalError::ForgottenBeforeEnd);
+            }
+            self.forgotten = true;
+            return Ok(());
+        }
         if self.status.is_terminal() {
             return Err(JournalError::EntryAfterEnd);
         }
         match entry {
             Entry::Started { .. } => return Err(JournalError::DuplicateStart),
+            // Handled above.
+            Entry::Forgotten { .. } => return Err(JournalError::EntryAfterEnd),
             Entry::StepScheduled { cmd, name, input } => {
                 self.push_command(*cmd, name, input.clone(), CommandKind::Step)?;
             }
@@ -1100,6 +1122,11 @@ impl RunState {
     /// for a run started on an unversioned workflow.
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
+    }
+
+    /// Whether the run, ended, is forgotten (retention, ADR 0066): an engine no longer holds it.
+    pub fn forgotten(&self) -> bool {
+        self.forgotten
     }
 
     /// The run's status.
