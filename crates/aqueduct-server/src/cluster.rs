@@ -88,6 +88,23 @@ pub struct Cluster {
     /// empty and waits to be added (`POST /v1/admin/partitions/<p>/members`).
     #[serde(default)]
     pub members: Option<Vec<u64>>,
+    /// Mutual TLS between the servers (ADR 0064): every server presents a certificate the cluster's CA
+    /// issued, and the routes between servers take only such connections. The server must itself
+    /// serve TLS, and every peer's URL be `https://`.
+    #[serde(default)]
+    pub tls: Option<ClusterTls>,
+}
+
+/// The files of a cluster's mutual TLS.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTls {
+    /// The cluster's CA certificate (PEM): it issued every server's certificate.
+    pub ca: PathBuf,
+    /// This server's certificate (PEM), which it presents to the others.
+    pub cert: PathBuf,
+    /// Its private key (PEM).
+    pub key: PathBuf,
 }
 
 impl Cluster {
@@ -166,6 +183,11 @@ impl Cluster {
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 return Err(format!("cluster: a peer's URL must be http(s): {url}"));
             }
+            if self.tls.is_some() && !url.starts_with("https://") {
+                return Err(format!(
+                    "cluster: with mutual TLS, a peer's URL must be https: {url}"
+                ));
+            }
         }
         Ok(())
     }
@@ -176,7 +198,7 @@ impl Cluster {
         self.check()?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "cluster mode needs a running tokio runtime".to_owned())?;
-        let client = crate::push::client()?;
+        let client = crate::push::client_with(self.tls.as_ref())?;
         let mut queues = BTreeMap::new();
         for (peer, url) in &self.peers {
             if *peer == self.id {
@@ -250,7 +272,7 @@ impl Cluster {
         mut build: impl FnMut(PathBuf, u32) -> Result<Builder, EngineError>,
     ) -> Result<Arc<Shards>, EngineError> {
         let shards: Arc<OnceLock<Weak<Shards>>> = Arc::default();
-        let client = crate::push::client().map_err(EngineError::Open)?;
+        let client = crate::push::client_with(self.tls.as_ref()).map_err(EngineError::Open)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| EngineError::Open("cluster mode needs a running tokio runtime".into()))?;
         let route = |partition: u32| -> Option<RemoteRoute> {
@@ -383,6 +405,8 @@ async fn ship_remote(
 struct Peer {
     shards: Arc<Shards>,
     secret: Arc<String>,
+    /// With mutual TLS: only connections whose certificate the cluster's CA verified.
+    certified: bool,
 }
 
 /// The routes other servers send to. Merged outside token authentication: the cluster's secret
@@ -394,6 +418,7 @@ pub(crate) fn routes(shards: &Arc<Shards>, cluster: &Cluster) -> Router {
         .with_state(Peer {
             shards: Arc::clone(shards),
             secret: Arc::new(cluster.secret.clone()),
+            certified: cluster.tls.is_some(),
         })
 }
 
@@ -409,7 +434,14 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 /// Whether a message from another server may be taken: it has the secret, and the sender's version is
 /// compatible with this one.
-fn admit(peer: &Peer, headers: &HeaderMap) -> Result<(), StatusCode> {
+fn admit(
+    peer: &Peer,
+    certificate: Option<&crate::tls::PeerCertificate>,
+    headers: &HeaderMap,
+) -> Result<(), StatusCode> {
+    if peer.certified && !certificate.is_some_and(|c| c.0) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let secret = headers
         .get(SECRET_HEADER)
         .map(|value| value.as_bytes())
@@ -427,8 +459,13 @@ fn admit(peer: &Peer, headers: &HeaderMap) -> Result<(), StatusCode> {
     Ok(())
 }
 
-async fn receive_raft(State(peer): State<Peer>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    if let Err(refused) = admit(&peer, &headers) {
+async fn receive_raft(
+    State(peer): State<Peer>,
+    certificate: Option<axum::Extension<crate::tls::PeerCertificate>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    if let Err(refused) = admit(&peer, certificate.as_deref(), &headers) {
         return refused;
     }
     let Ok((partition, envelopes)) = decode(&body) else {
@@ -444,8 +481,13 @@ async fn receive_raft(State(peer): State<Peer>, headers: HeaderMap, body: Bytes)
     StatusCode::NO_CONTENT
 }
 
-async fn receive_remote(State(peer): State<Peer>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    if let Err(refused) = admit(&peer, &headers) {
+async fn receive_remote(
+    State(peer): State<Peer>,
+    certificate: Option<axum::Extension<crate::tls::PeerCertificate>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    if let Err(refused) = admit(&peer, certificate.as_deref(), &headers) {
         return refused;
     }
     let Some((partition, message)) = body.split_first_chunk::<4>() else {
@@ -486,8 +528,8 @@ const FORWARDED_SERVICE: &str = "/aqueduct.v1.Ingress/";
 pub(crate) fn forwarding(router: Router, cluster: &Cluster) -> Result<Router, String> {
     let forward = Forward {
         peers: Arc::new(cluster.peers.clone()),
-        client: crate::push::client()?,
-        grpc: crate::push::grpc_client()?,
+        client: crate::push::client_with(cluster.tls.as_ref())?,
+        grpc: crate::push::grpc_client(cluster.tls.as_ref())?,
     };
     Ok(router.layer(axum::middleware::from_fn_with_state(
         forward,
@@ -627,6 +669,7 @@ mod tests {
             snapshots: None,
             snapshot_every: None,
             members: None,
+            tls: None,
         };
         assert_eq!(cluster.check(), Ok(()));
         let two = Cluster {

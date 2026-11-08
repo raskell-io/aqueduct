@@ -180,50 +180,75 @@ pub(crate) type Client = hyper_util::client::legacy::Client<
     Full<Bytes>,
 >;
 
-/// An HTTP(S) client: rustls on ring, with the operating system's root certificates (ADR 0038).
-/// An HTTP/2 client, for gRPC calls forwarded to another server: TLS by ALPN, or HTTP/2 without TLS by
-/// prior knowledge.
-pub(crate) fn grpc_client() -> Result<Client, String> {
+/// The TLS a client speaks: the operating system's roots and no certificate of its own, or, between the
+/// servers of a cluster with mutual TLS (ADR 0064), only the cluster's CA and this server's certificate.
+pub(crate) fn client_tls(
+    identity: Option<&crate::cluster::ClusterTls>,
+) -> Result<rustls::ClientConfig, String> {
     use hyper_rustls::ConfigBuilderExt;
-    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
-    .map_err(|e| e.to_string())?
-    .with_native_roots()
-    .map_err(|e| e.to_string())?
-    .with_no_client_auth();
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http()
-        .enable_http2()
-        .build();
-    Ok(
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .http2_only(true)
-            .build(connector),
-    )
+    .map_err(|e| e.to_string())?;
+    let Some(identity) = identity else {
+        return Ok(builder
+            .with_native_roots()
+            .map_err(|e| e.to_string())?
+            .with_no_client_auth());
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in CertificateDer::pem_file_iter(&identity.ca)
+        .map_err(|e| format!("{}: {e}", identity.ca.display()))?
+    {
+        roots
+            .add(certificate.map_err(|e| format!("{}: {e}", identity.ca.display()))?)
+            .map_err(|e| format!("{}: {e}", identity.ca.display()))?;
+    }
+    let certificates: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&identity.cert)
+        .and_then(Iterator::collect)
+        .map_err(|e| format!("{}: {e}", identity.cert.display()))?;
+    let key = PrivateKeyDer::from_pem_file(&identity.key)
+        .map_err(|e| format!("{}: {e}", identity.key.display()))?;
+    builder
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certificates, key)
+        .map_err(|e| format!("this server's certificate and key: {e}"))
 }
 
-pub(crate) fn client() -> Result<Client, String> {
-    use hyper_rustls::ConfigBuilderExt;
-    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| e.to_string())?
-    .with_native_roots()
-    .map_err(|e| e.to_string())?
-    .with_no_client_auth();
+fn build(tls: rustls::ClientConfig, http2: bool) -> Client {
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls)
-        .https_or_http()
-        .enable_http1()
-        .build();
-    Ok(
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(connector),
-    )
+        .https_or_http();
+    let connector = if http2 {
+        connector.enable_http2().build()
+    } else {
+        connector.enable_http1().build()
+    };
+    let mut builder =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
+    if http2 {
+        builder.http2_only(true);
+    }
+    builder.build(connector)
+}
+
+/// An HTTP/2 client, for gRPC calls forwarded to another server: TLS by ALPN, or HTTP/2 without TLS by
+/// prior knowledge.
+pub(crate) fn grpc_client(identity: Option<&crate::cluster::ClusterTls>) -> Result<Client, String> {
+    Ok(build(client_tls(identity)?, true))
+}
+
+/// An HTTP(S) client; between servers, with the cluster's TLS if it has any.
+pub(crate) fn client_with(identity: Option<&crate::cluster::ClusterTls>) -> Result<Client, String> {
+    Ok(build(client_tls(identity)?, false))
+}
+
+/// An HTTP(S) client: rustls on ring, with the operating system's root certificates (ADR 0038).
+pub(crate) fn client() -> Result<Client, String> {
+    client_with(None)
 }
 
 /// Starts a pusher for every configured endpoint. A pusher is a worker for its queue: it takes

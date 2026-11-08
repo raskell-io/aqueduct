@@ -112,6 +112,7 @@ A record says what was true and decided at its date: later records may change wh
 - [0061: Object storage and history archival](adr/0061-object-storage-and-archival.md)
 - [0062: Snapshots in object storage](adr/0062-snapshots-in-object-storage.md)
 - [0063: Moving replicas between servers](adr/0063-moving-replicas-between-servers.md)
+- [0064: Mutual TLS between servers](adr/0064-mutual-tls-between-servers.md)
 
 ### Observability
 

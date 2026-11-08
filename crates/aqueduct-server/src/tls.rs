@@ -20,7 +20,14 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct Tls {
     config: Arc<rustls::ServerConfig>,
+    certificates: Vec<CertificateDer<'static>>,
+    key: Arc<PrivateKeyDer<'static>>,
 }
+
+/// Whether the connection a request came on presented a client certificate that the configured
+/// client CA verified (ADR 0064): servers of the cluster do, clients need not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PeerCertificate(pub(crate) bool);
 
 impl std::fmt::Debug for Tls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,21 +62,58 @@ impl Tls {
         certificates: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Tls, String> {
+        Tls::build(certificates, key, None)
+    }
+
+    fn build(
+        certificates: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        clients: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    ) -> Result<Tls, String> {
         if certificates.is_empty() {
             return Err("no certificate found".into());
         }
-        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .map_err(|e| format!("the certificate and key: {e}"))?;
+        .map_err(|e| e.to_string())?;
+        let builder = match clients {
+            Some(verifier) => builder.with_client_cert_verifier(verifier),
+            None => builder.with_no_client_auth(),
+        };
+        let mut config = builder
+            .with_single_cert(certificates.clone(), key.clone_key())
+            .map_err(|e| format!("the certificate and key: {e}"))?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Tls {
             config: Arc::new(config),
+            certificates,
+            key: Arc::new(key),
         })
+    }
+
+    /// Asks every client for a certificate, and verifies one that is presented against the CA in
+    /// `ca_pem` (ADR 0064). A client without one is still served: only the routes between servers
+    /// require it.
+    pub fn with_client_ca(self, ca_pem: &str) -> Result<Tls, String> {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+            roots
+                .add(certificate.map_err(|e| format!("the client CA: {e}"))?)
+                .map_err(|e| format!("the client CA: {e}"))?;
+        }
+        if roots.is_empty() {
+            return Err("the client CA holds no certificate".into());
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| format!("the client CA: {e}"))?;
+        Tls::build(self.certificates, self.key.clone_key(), Some(verifier))
     }
 }
 
@@ -128,9 +172,19 @@ pub(crate) async fn serve(
                     else {
                         return;
                     };
+                    // A certificate here was verified by the client CA during the handshake.
+                    let verified = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .is_some_and(|certificates| !certificates.is_empty());
+                    let router = router.layer(axum::Extension(PeerCertificate(verified)));
                     connection(stream, router, watcher, timeout).await;
                 }
-                None => connection(stream, router, watcher, timeout).await,
+                None => {
+                    let router = router.layer(axum::Extension(PeerCertificate(false)));
+                    connection(stream, router, watcher, timeout).await;
+                }
             }
         });
     }
