@@ -1,6 +1,6 @@
 [project]
 name = "aqueduct-worker"
-version = "0.0.0"
+version = "0.4.0"
 description = "A step worker for Aqueduct: implement steps in Python and serve them to a server"
 readme = "README.md"
 requires-python = ">=3.9"

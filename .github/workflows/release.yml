@@ -1,0 +1,91 @@
+name: Release
+
+# A tag `v<version>` matching the workspace version builds the `aqueduct` binary for each platform and
+# publishes a GitHub release with them, their checksums, and the notes in `docs/releases/v<version>.md`
+# (RELEASING.md).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: tag, version and notes agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$tag" != "$version" ]; then
+            echo "the tag says $tag, Cargo.toml says $version" >&2
+            exit 1
+          fi
+          test -f "docs/releases/v$version.md" || { echo "no docs/releases/v$version.md" >&2; exit 1; }
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo build --release --locked --package aqueduct-cli --bin aqueduct --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          name="aqueduct-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/aqueduct" "$name/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: aqueduct-*.tar.gz*
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Before 1.0 every release is a pre-release: the formats are drafts (BRIEF.md, phase 5).
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Aqueduct $GITHUB_REF_NAME" \
+            --notes-file "docs/releases/v$version.md" \
+            --prerelease \
+            --verify-tag
