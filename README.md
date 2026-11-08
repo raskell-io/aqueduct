@@ -299,10 +299,11 @@ engine, not the server, whose transports have tests of their own, which are narr
 
 ## What is not done
 
-- **A production cluster:** servers replicate one partition (ADR 0056) and forward HTTP requests to the
-  leader, with many partitions per server (ADR 0057), spread partitions' leaders over servers (ADR 0058), and upgrade one server at a time (ADR 0060), move replicas between servers (ADR 0063), with
-  mutual TLS between them (ADR 0064), but not yet the
-  failover drill and measurements on real machines. Not production-ready.
+- **A production cluster:** the cluster is built and simulated (ADR 0051 to 0064): servers replicate
+  partitions with our own Raft, forward requests to each partition's leader, spread leaders, move
+  replicas, upgrade one at a time and authenticate each other with mutual TLS. Not yet done: the
+  failover drill and measurements on real machines, and deleting old runs (retention). Not
+  production-ready.
 - **Stable formats:** the protocol and the history format are drafts until phase 5.
 - **Packages:** nothing on crates.io, PyPI or npm. Depend on the repository.
 - **Identity beyond static tokens:** no OIDC or JWT, and no mutual TLS.
