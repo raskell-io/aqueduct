@@ -33,6 +33,7 @@ mod migrate;
 const USAGE: &str = "usage: aqueduct <command> <data-dir> [arguments]
 
 commands:
+  version                             the version of this binary (also --version, -V)
   runs <dir>                          list runs: key, workflow, status, journal length
   describe <dir> <key>                a run's status, input, output and commands
   journal <dir> <key>                 a run's journal, one entry per line
@@ -164,6 +165,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
     };
     match args.first().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => Ok(USAGE.to_owned()),
+        Some("version" | "--version" | "-V") => {
+            Ok(format!("aqueduct {}\n", env!("CARGO_PKG_VERSION")))
+        }
         Some("runs") => runs(Path::new(arg(1, "data directory")?)),
         Some("describe") => describe(Path::new(arg(1, "data directory")?), arg(2, "run key")?),
         Some("journal") => journal(Path::new(arg(1, "data directory")?), arg(2, "run key")?),
